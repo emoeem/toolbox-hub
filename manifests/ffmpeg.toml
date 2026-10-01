@@ -1,0 +1,726 @@
+# ffmpeg / ffprobe 的常用操作。
+#
+# 这个文件里有一条**必须遵守的形状**（实测出来的）：
+#
+#   ffmpeg <输入> <选项…> <输出>
+#
+# 编码选项放在 `-i` **之前**会被当成输入的解码器选项，直接报
+# `Unknown decoder 'libx264'`。所以：
+#
+# * 输入用 `placement = "leading"` 排到最前；
+# * 编码/滤镜选项做成带默认值的字段（落中间段），**不要**放 `base_argv`
+#   —— `base_argv` 永远在最前面，会踩上面那个坑；
+# * 输出是位置参数，默认落最后。
+#
+# 只有两种例外可以放 `base_argv`：全局选项（如 ffprobe 的 `-v error`），
+# 以及本来就该在 `-i` 之前的输入选项（如无损裁剪的 `-ss`，这里用它自己的
+# `placement = "leading"` 表达，且要声明在输入**之前**）。
+#
+# 编码一律指定 `-c:v libx264`：这台机器的 ffmpeg 默认走硬件编码器（rkmpp），
+# 实测初始化失败；软件编码结果也更可预测。
+
+# ── 看文件是什么 ────────────────────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-probe"
+name = "ffprobe 查看媒体信息"
+summary = "看清一个文件到底是什么：容器、流、编码、时长、分辨率、码率"
+domain = "媒体"
+tags = ["分析"]
+program = "ffprobe"
+mode = "capture"
+base_argv = ["-v", "error"]
+install = "sudo pacman -S ffmpeg"
+input = "媒体文件"
+output = "格式与流的信息"
+features = "JSON / 原始 / CSV 输出；可选章节"
+
+[[action.argument]]
+key = "streams"
+label = "流信息"
+kind = "toggle"
+flag = "-show_streams"
+default = "true"
+help = "每个流（视频/音频/字幕）的编码、分辨率、采样率"
+
+[[action.argument]]
+key = "format"
+label = "容器信息"
+kind = "toggle"
+flag = "-show_format"
+default = "true"
+help = "容器格式、总时长、总码率、标签"
+
+[[action.argument]]
+key = "chapters"
+label = "章节"
+kind = "toggle"
+flag = "-show_chapters"
+default = "false"
+help = "章节标记（一部分 mkv 里才有）"
+
+[[action.argument]]
+key = "output_format"
+label = "输出格式"
+kind = "choice"
+flag = "-of"
+default = "json"
+help = "json 最好读；原始格式信息更全但更乱"
+choices = [
+  { label = "JSON（推荐）", value = "json" },
+  { label = "原始格式", value = "default" },
+  { label = "CSV", value = "csv" },
+]
+
+[[action.argument]]
+key = "input"
+label = "文件"
+kind = "path"
+required = true
+repeatable = true
+help = "要查看的文件；多个用逗号隔开"
+
+# ── 裁剪 ────────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-trim-fast"
+name = "裁剪片段（快速无损）"
+summary = "切一段出来，不重编码：很快，但切点会对齐到最近的关键帧"
+domain = "媒体"
+tags = ["编辑"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+# 裁剪/GIF 的输出时长不等于输入时长，按 -t 算百分比。
+limit_from = "duration"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件 + 起止时间"
+output = "切出来的片段"
+features = "秒切；不损失画质；切点不精确"
+
+[[action.argument]]
+key = "start"
+label = "开始时间"
+kind = "text"
+flag = "-ss"
+required = true
+placement = "leading"
+default = "00:00:00"
+help = "HH:MM:SS 或秒数；放在输入之前，所以是快速定位"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "要裁剪的视频"
+
+[[action.argument]]
+key = "duration"
+label = "持续时长"
+kind = "text"
+flag = "-t"
+help = "留空 = 一直切到结尾"
+
+[[action.argument]]
+key = "codec"
+label = "编码方式"
+kind = "choice"
+flag = "-c"
+help = "无损拷贝最快；想精确切点请用「精确重编码」那个动作"
+choices = [
+  { label = "直接拷贝（无损）", value = "copy" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/clip.mp4"
+
+[[action]]
+id = "ffmpeg-trim-exact"
+name = "裁剪片段（精确重编码）"
+summary = "切点精确到帧：慢一些，画质会重编码一次"
+domain = "媒体"
+tags = ["编辑"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+# 裁剪/GIF 的输出时长不等于输入时长，按 -t 算百分比。
+limit_from = "duration"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件 + 起止时间"
+output = "切出来的片段"
+features = "帧级精确；可指定编码器与预设"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "要裁剪的视频"
+
+[[action.argument]]
+key = "start"
+label = "开始时间"
+kind = "text"
+flag = "-ss"
+required = true
+default = "00:00:00"
+help = "HH:MM:SS 或秒数；放在输入之后，所以是精确定位"
+
+[[action.argument]]
+key = "duration"
+label = "持续时长"
+kind = "text"
+flag = "-t"
+help = "留空 = 一直切到结尾"
+
+[[action.argument]]
+key = "video_codec"
+label = "视频编码"
+kind = "text"
+flag = "-c:v"
+default = "libx264"
+help = "libx264 通用；想用硬件编码就自己换（例如 h264_nvenc）"
+
+[[action.argument]]
+key = "audio_codec"
+label = "音频编码"
+kind = "text"
+flag = "-c:a"
+default = "aac"
+help = "aac 通用；copy 可以不动音频"
+
+[[action.argument]]
+key = "preset"
+label = "预设"
+kind = "choice"
+flag = "-preset"
+default = "medium"
+help = "越慢压得越好、体积越小"
+choices = [
+  { label = "很快（ultrafast）", value = "ultrafast" },
+  { label = "中等（medium）", value = "medium" },
+  { label = "慢（slow）", value = "slow" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/clip.mp4"
+
+# ── 转码 / 压缩 / 缩放 ───────────────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-compress"
+name = "压缩视频体积"
+summary = "H.264 + CRF 重编码：体积小很多，画质损失可控"
+domain = "媒体"
+tags = ["转码"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "压缩后的视频"
+features = "CRF 画质档；预设速度档；可选缩放"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "要压缩的视频"
+
+[[action.argument]]
+key = "video_codec"
+label = "视频编码"
+kind = "text"
+flag = "-c:v"
+default = "libx264"
+help = "libx264 通用（这台机器默认的硬件编码器实测初始化失败）"
+
+[[action.argument]]
+key = "crf"
+label = "画质（CRF）"
+kind = "choice"
+flag = "-crf"
+default = "23"
+help = "数字越小越清晰、体积越大；23 通常看不出差别"
+choices = [
+  { label = "几乎无损（18）", value = "18" },
+  { label = "默认（23）", value = "23" },
+  { label = "小一点（28）", value = "28" },
+  { label = "很小（32）", value = "32" },
+]
+
+[[action.argument]]
+key = "preset"
+label = "预设"
+kind = "choice"
+flag = "-preset"
+default = "medium"
+help = "越慢压得越好"
+choices = [
+  { label = "很快（ultrafast）", value = "ultrafast" },
+  { label = "中等（medium）", value = "medium" },
+  { label = "慢（slow）", value = "slow" },
+]
+
+[[action.argument]]
+key = "audio_codec"
+label = "音频编码"
+kind = "text"
+flag = "-c:a"
+default = "aac"
+help = "aac 通用；copy 表示音频原样不动"
+
+[[action.argument]]
+key = "scale"
+label = "缩放"
+kind = "choice"
+flag = "-vf"
+help = "按宽度等比缩放；-2 表示高度自动取偶数"
+choices = [
+  { label = "不缩放", value = "" },
+  { label = "1080p", value = "scale=-2:1080" },
+  { label = "720p", value = "scale=-2:720" },
+  { label = "480p", value = "scale=-2:480" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/small.mp4"
+
+[[action]]
+id = "ffmpeg-resize"
+name = "改分辨率"
+summary = "只把画面缩到指定高度，音频尽量不动"
+domain = "媒体"
+tags = ["转码"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "缩放后的视频"
+features = "按宽度等比；音频可原样拷贝"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "要缩放的视频"
+
+[[action.argument]]
+key = "scale"
+label = "目标分辨率"
+kind = "choice"
+flag = "-vf"
+required = true
+default = "scale=-2:720"
+help = "按宽度等比缩放，高度取偶数"
+choices = [
+  { label = "1080p", value = "scale=-2:1080" },
+  { label = "720p", value = "scale=-2:720" },
+  { label = "480p", value = "scale=-2:480" },
+  { label = "360p", value = "scale=-2:360" },
+]
+
+[[action.argument]]
+key = "crf"
+label = "画质（CRF）"
+kind = "choice"
+flag = "-crf"
+default = "20"
+help = "重编码才有画质档；20 比默认 23 更清晰"
+choices = [
+  { label = "清晰（18）", value = "18" },
+  { label = "较好（20）", value = "20" },
+  { label = "默认（23）", value = "23" },
+]
+
+[[action.argument]]
+key = "audio_codec"
+label = "音频"
+kind = "text"
+flag = "-c:a"
+default = "copy"
+help = "copy = 音频原样拷贝，不重新编码"
+
+[[action.argument]]
+key = "video_codec"
+label = "视频编码"
+kind = "text"
+flag = "-c:v"
+default = "libx264"
+help = "libx264 通用"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/720p.mp4"
+
+[[action]]
+id = "ffmpeg-extract-audio"
+name = "提取音频"
+summary = "把视频里的声音单独存成一个音频文件"
+domain = "媒体"
+tags = ["转码"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "音频文件"
+features = "MP3 / AAC / FLAC；可选码率；丢掉画面"
+
+[[action.argument]]
+key = "input"
+label = "输入文件"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "必须有音轨，否则 ffmpeg 会报「Output file does not contain any stream」"
+
+[[action.argument]]
+key = "audio_codec"
+label = "音频格式"
+kind = "choice"
+flag = "-c:a"
+required = true
+default = "libmp3lame"
+help = "输出文件的扩展名要和它一致（.mp3 / .m4a / .flac）"
+choices = [
+  { label = "MP3", value = "libmp3lame" },
+  { label = "AAC（.m4a）", value = "aac" },
+  { label = "FLAC（无损）", value = "flac" },
+  { label = "直接拷贝（不重编码）", value = "copy" },
+]
+
+[[action.argument]]
+key = "bitrate"
+label = "码率"
+kind = "choice"
+flag = "-b:a"
+help = "FLAC 与「直接拷贝」下这项没有意义"
+choices = [
+  { label = "128k", value = "128k" },
+  { label = "192k（推荐）", value = "192k" },
+  { label = "320k", value = "320k" },
+]
+
+[[action.argument]]
+key = "no_video"
+label = "丢掉画面"
+kind = "toggle"
+flag = "-vn"
+default = "true"
+help = "提取音频就应该是开着的"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/audio.mp3"
+
+# ── 其它常用动作 ────────────────────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-to-gif"
+name = "转成 GIF"
+summary = "把一段视频转成 GIF，自带调色板所以颜色不会发灰"
+domain = "媒体"
+tags = ["转码"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+# 裁剪/GIF 的输出时长不等于输入时长，按 -t 算百分比。
+limit_from = "duration"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "GIF 动图"
+features = "三档尺寸/帧率；单遍调色板；可选截取长度"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "要转的视频"
+
+[[action.argument]]
+key = "start"
+label = "从哪开始"
+kind = "text"
+flag = "-ss"
+help = "留空 = 从头；GIF 通常只截几秒"
+
+[[action.argument]]
+key = "duration"
+label = "持续时长"
+kind = "text"
+flag = "-t"
+help = "留空 = 整段都转（小心文件变大）"
+
+[[action.argument]]
+key = "preset"
+label = "尺寸与帧率"
+kind = "choice"
+flag = "-filter_complex"
+required = true
+default = "[0:v] fps=12,scale=480:-1:flags=lanczos,split [a][b];[a] palettegen [p];[b][p] paletteuse"
+help = "用的是单遍调色板法，比直接转 GIF 颜色好得多"
+choices = [
+  { label = "小（480px / 12fps）", value = "[0:v] fps=12,scale=480:-1:flags=lanczos,split [a][b];[a] palettegen [p];[b][p] paletteuse" },
+  { label = "中（640px / 15fps）", value = "[0:v] fps=15,scale=640:-1:flags=lanczos,split [a][b];[a] palettegen [p];[b][p] paletteuse" },
+  { label = "大（800px / 20fps）", value = "[0:v] fps=20,scale=800:-1:flags=lanczos,split [a][b];[a] palettegen [p];[b][p] paletteuse" },
+]
+
+[[action.argument]]
+key = "no_audio"
+label = "不要音轨"
+kind = "toggle"
+flag = "-an"
+default = "true"
+help = "GIF 本来就没有声音，关掉它只会多一条警告"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/out.gif"
+
+[[action]]
+id = "ffmpeg-mute"
+name = "去掉声音"
+summary = "保留画面、丢掉音轨，视频流不重编码（很快）"
+domain = "媒体"
+tags = ["编辑"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "无声视频"
+features = "画面原样拷贝；去掉音轨"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "要去掉声音的视频"
+
+[[action.argument]]
+key = "no_audio"
+label = "去掉音轨"
+kind = "toggle"
+flag = "-an"
+default = "true"
+help = "关掉它这个动作就没意义了"
+
+[[action.argument]]
+key = "video_codec"
+label = "视频流"
+kind = "choice"
+flag = "-c:v"
+default = "copy"
+help = "copy = 画面原样拷贝，不重编码"
+choices = [
+  { label = "直接拷贝（快）", value = "copy" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/mute.mp4"
+
+[[action]]
+id = "ffmpeg-merge-av"
+name = "合并画面与声音"
+summary = "把一个视频和一个音频合成一个文件（例如给无声视频配乐）"
+domain = "媒体"
+tags = ["编辑"]
+program = "ffmpeg"
+# 把进度吐到 stdout（结构化 key=value），工具箱解析它画实时进度；
+# -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 进度条的总时长从哪儿来：探这个参数的媒体文件。
+duration_from = "video"
+install = "sudo pacman -S ffmpeg"
+input = "一个视频 + 一个音频"
+output = "合起来的文件"
+features = "流直接拷贝；可指定取哪条流"
+
+[[action.argument]]
+key = "video"
+label = "视频（画面）"
+kind = "path"
+flag = "-i"
+required = true
+help = "取它的画面"
+
+[[action.argument]]
+key = "audio"
+label = "音频（声音）"
+kind = "path"
+flag = "-i"
+required = true
+help = "取它的声音"
+
+[[action.argument]]
+key = "map_video"
+label = "取哪条画面流"
+kind = "text"
+flag = "-map"
+default = "0:v:0"
+help = "0 表示第一个输入（视频）；0:v:0 = 它的第一条视频流"
+
+[[action.argument]]
+key = "map_audio"
+label = "取哪条音频流"
+kind = "text"
+flag = "-map"
+default = "1:a:0"
+help = "1 表示第二个输入（音频）；1:a:0 = 它的第一条音频流"
+
+[[action.argument]]
+key = "codec"
+label = "编码方式"
+kind = "choice"
+flag = "-c"
+required = true
+default = "copy"
+help = "拷贝不重编码，最快也无损"
+choices = [
+  { label = "直接拷贝（无损）", value = "copy" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会自己问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "例如 /tmp/merged.mp4"

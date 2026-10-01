@@ -1,0 +1,48 @@
+# jq 的动作：查询 / 整形 JSON。
+#
+# 表单里「表达式」排在「文件」前面 —— 这不是排错了：jq 的命令行是
+# `jq [选项] 表达式 [文件...]`，表达式必须在前。表单顺序就是 argv 顺序。
+
+[[action]]
+id = "jq-query"
+name = "jq 查询 JSON"
+summary = "用一个表达式把 JSON 挑出来、整形、汇总，不用记 jq 的选项"
+domain = "开发"
+tags = ["JSON"]
+program = "jq"
+install = "sudo pacman -S jq"
+input = "JSON 文件"
+output = "查询结果"
+features = "自定表达式；紧凑输出；原始字符串"
+
+[[action.argument]]
+key = "filter"
+label = "表达式"
+kind = "text"
+required = true
+default = "."
+help = "例如 .items[].name 或 {name: .title, n: (.files | length)}"
+
+[[action.argument]]
+key = "file"
+label = "JSON 文件"
+kind = "path"
+required = true
+help = "要查询的文件；多个用逗号隔开，按顺序输出"
+repeatable = true
+
+[[action.argument]]
+key = "compact"
+label = "紧凑输出"
+kind = "toggle"
+flag = "-c"
+default = "false"
+help = "每个结果压成一行，方便再喂给别的命令"
+
+[[action.argument]]
+key = "raw"
+label = "去掉引号"
+kind = "toggle"
+flag = "-r"
+default = "false"
+help = "输出裸字符串而不是 JSON 字符串"

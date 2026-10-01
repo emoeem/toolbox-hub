@@ -1,0 +1,57 @@
+# aria2c 的动作：多线程下载单文件。
+
+[[action]]
+id = "aria2c-download"
+name = "aria2c 多线程下载"
+summary = "把一个文件切多线程下下来，支持断点续传"
+domain = "网络"
+tags = ["下载"]
+program = "aria2c"
+mode = "interactive"   # 想看进度条
+install = "sudo pacman -S aria2"
+input = "下载直链"
+output = "下载好的文件"
+features = "多线程；断点续传；自选目录与文件名"
+
+[[action.argument]]
+key = "url"
+label = "下载链接"
+kind = "text"
+required = true
+help = "http / https / ftp 直链；多条用逗号隔开，会一起排队下载"
+repeatable = true
+
+[[action.argument]]
+key = "dir"
+label = "保存目录"
+kind = "path"
+flag = "-d"
+dir_only = true
+help = "留空 = Toolbox 启动时所在目录"
+
+[[action.argument]]
+key = "name"
+label = "保存为"
+kind = "text"
+flag = "-o"
+help = "留空就用链接里的文件名"
+
+[[action.argument]]
+key = "connections"
+label = "线程数"
+kind = "choice"
+flag = "-x"
+help = "对同一服务器的连接数；开太大反而容易被限速"
+choices = [
+  { label = "4", value = "4" },
+  { label = "8", value = "8" },
+  { label = "16", value = "16" },
+]
+
+[[action.argument]]
+key = "resume"
+label = "断点续传"
+kind = "toggle"
+flag = "-c"
+default = "true"
+help = "中断后再跑会接着下，不会从头开始"

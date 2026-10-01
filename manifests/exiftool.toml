@@ -1,0 +1,76 @@
+# exiftool 的动作：查看元数据 / 清除元数据。
+#
+# 注意：清除元数据这个动作**写新文件、不动原图** —— 现在还没有「危险动作二次确认」
+# 机制，所以这里刻意不做原地改写。
+
+[[action]]
+id = "exif-read"
+name = "exiftool 查看元数据"
+summary = "读出照片/视频的 EXIF、拍摄参数、GPS 等信息"
+domain = "图像"
+tags = ["元数据"]
+program = "exiftool"
+install = "sudo pacman -S perl-image-exiftool"
+input = "图片 / 视频文件"
+output = "元数据列表"
+features = "按来源分组；短标签名；包含重复项"
+
+[[action.argument]]
+key = "file"
+label = "文件"
+kind = "path"
+required = true
+help = "要查看的文件；多个用逗号隔开"
+repeatable = true
+
+[[action.argument]]
+key = "grouped"
+label = "按来源分组"
+kind = "toggle"
+flag = "-G"
+default = "true"
+help = "区分 EXIF / XMP / ICC_Profile 等来源，信息多时更好读"
+
+[[action.argument]]
+key = "short"
+label = "用标签名"
+kind = "toggle"
+flag = "-s"
+default = "false"
+help = "显示 ExifImageWidth，而不是「Image Width」这种描述"
+
+[[action.argument]]
+key = "all"
+label = "包含重复项"
+kind = "toggle"
+flag = "-a"
+default = "false"
+help = "默认会合并同义标签，打开后全部列出"
+
+[[action]]
+id = "exif-strip"
+name = "exiftool 清除元数据"
+summary = "把元数据全部清掉并写成新文件，原图保持不动"
+domain = "图像"
+tags = ["元数据"]
+program = "exiftool"
+base_argv = ["-all="]
+install = "sudo pacman -S perl-image-exiftool"
+input = "图片文件"
+output = "干净的副本"
+features = "清空全部元数据；另存为新文件，不覆盖原图"
+
+[[action.argument]]
+key = "input"
+label = "输入图片"
+kind = "path"
+required = true
+help = "原图不会被改动"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+flag = "-o"
+required = true
+help = "写到这里，例如 /tmp/clean.jpg"

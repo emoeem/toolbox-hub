@@ -1,0 +1,140 @@
+# yt-dlp 的动作：下载视频 / 只取音频。
+#
+# 这是随程序发布的默认动作。想改成自己的口味，把同名文件放到
+# ~/.config/toolbox-hub/tools.d/ 下，同 id 的动作会以你那份为准。
+#
+# 字段说明：
+#   key/label    必填：取值用的键、表单里显示的标签
+#   kind         必填：text / path / choice / toggle
+#   flag         开关名；不写就是位置参数（位置参数统一排在最后）
+#   flag_join    开关和值是否贴成一个元素（7z 那种 -mx9 的风格）
+#   placement    排哪一段：leading / middle / trailing；不写就是「带 flag 的落中间、
+#                位置参数落最后」。ImageMagick 那种「输入 → 操作 → 输出」要用 leading
+#   repeatable   多值：填多条、每条各占一个 argv 元素（只支持位置参数）。
+#                默认逗号分隔，可用 separator 换一个
+#   sensitive    敏感值，记录历史前会被换成 ***
+#   choices      kind = "choice" 时必填，{ label = "显示文字", value = "实际传的值" }
+#   required     必填项为空时不执行
+#   default      toggle 用 "true"/"false"；choice 不写就取第一个
+
+[[action]]
+id = "yt-dlp-video"
+name = "yt-dlp 下载视频"
+summary = "下载视频：选画质、要不要字幕、存到哪儿，都可以填，不用记 yt-dlp 的选项"
+domain = "媒体"
+tags = ["下载"]
+program = "yt-dlp"
+base_argv = ["--no-mtime"]
+mode = "interactive"   # 下载想看进度条，所以接管终端
+install = "sudo pacman -S yt-dlp"
+input = "视频链接"
+output = "视频文件（落在输出目录）"
+features = "画质选择；下载字幕；只下单个视频；自选输出目录"
+
+[[action.argument]]
+key = "url"
+label = "视频链接"
+kind = "text"
+required = true
+help = "yt-dlp 认得的一切链接；多个用逗号隔开"
+repeatable = true
+
+[[action.argument]]
+key = "quality"
+label = "画质"
+kind = "choice"
+flag = "-f"
+help = "「单文件最好」不合并音视频，适合老播放器"
+choices = [
+  { label = "最好", value = "bestvideo*+bestaudio/best" },
+  { label = "1080p", value = "bestvideo[height<=1080]+bestaudio/best[height<=1080]" },
+  { label = "720p", value = "bestvideo[height<=720]+bestaudio/best[height<=720]" },
+  { label = "480p", value = "bestvideo[height<=480]+bestaudio/best[height<=480]" },
+  { label = "单文件最好", value = "best" },
+]
+
+[[action.argument]]
+key = "subtitles"
+label = "下载字幕"
+kind = "toggle"
+flag = "--write-subs"
+default = "false"
+help = "有字幕轨就一并下下来"
+
+[[action.argument]]
+key = "single"
+label = "只下这一个视频"
+kind = "toggle"
+flag = "--no-playlist"
+default = "true"
+help = "关掉之后，链接如果是播放列表会整列表下载"
+
+[[action.argument]]
+key = "output"
+label = "输出目录"
+kind = "path"
+flag = "-P"
+help = "留空 = Toolbox 启动时所在目录"
+
+[[action]]
+id = "yt-dlp-audio"
+name = "yt-dlp 提取音频"
+summary = "只取音轨并存成 mp3 / m4a / opus / flac，可嵌入封面与元数据"
+domain = "媒体"
+tags = ["下载"]
+program = "yt-dlp"
+base_argv = ["--extract-audio", "--embed-metadata"]
+mode = "interactive"   # 下载想看进度条
+install = "sudo pacman -S yt-dlp"
+input = "视频或音频链接"
+output = "音频文件（带元数据与封面）"
+features = "只取音轨；格式与音质选择；嵌入封面"
+
+[[action.argument]]
+key = "url"
+label = "链接"
+kind = "text"
+required = true
+help = "视频或音频都行；多个用逗号隔开"
+repeatable = true
+
+[[action.argument]]
+key = "format"
+label = "音频格式"
+kind = "choice"
+flag = "--audio-format"
+help = "需要 ffmpeg 做转码（已装）"
+choices = [
+  { label = "mp3", value = "mp3" },
+  { label = "m4a", value = "m4a" },
+  { label = "opus", value = "opus" },
+  { label = "flac（无损）", value = "flac" },
+]
+
+[[action.argument]]
+key = "quality"
+label = "音质"
+kind = "choice"
+flag = "--audio-quality"
+help = "无损格式下这项没有意义"
+choices = [
+  { label = "最好", value = "0" },
+  { label = "192k", value = "192K" },
+  { label = "128k", value = "128K" },
+  { label = "96k", value = "96K" },
+]
+
+[[action.argument]]
+key = "thumbnail"
+label = "嵌入封面"
+kind = "toggle"
+flag = "--embed-thumbnail"
+default = "true"
+help = "把封面图写进音频文件"
+
+[[action.argument]]
+key = "output"
+label = "输出目录"
+kind = "path"
+flag = "-P"
+help = "留空 = Toolbox 启动时所在目录"

@@ -1,0 +1,67 @@
+# ImageMagick 的动作：格式转换 / 缩放 / 压缩。
+#
+# ImageMagick 是老牌图像处理 CLI，参数组合极多；这里只放最常用的几件事，
+# 输出格式由输出文件的扩展名决定（out.webp / out.jpg / out.png …）。
+
+[[action]]
+id = "magick-convert"
+name = "ImageMagick 转换图片"
+summary = "转格式、缩放、调质量、去元数据；输出格式由扩展名决定"
+domain = "图像"
+tags = ["转换"]
+program = "magick"
+install = "sudo pacman -S imagemagick"
+input = "图片文件"
+output = "处理后的图片"
+features = "格式转换；按宽度缩放；质量调节；去掉元数据"
+
+[[action.argument]]
+key = "input"
+label = "输入图片"
+kind = "path"
+required = true
+placement = "leading"
+help = "要处理的原图；多个用逗号隔开（ImageMagick 要求它排在操作之前）"
+repeatable = true
+
+[[action.argument]]
+key = "resize"
+label = "缩放"
+kind = "choice"
+flag = "-resize"
+help = "按宽度等比缩放，高度自动"
+choices = [
+  { label = "不改尺寸", value = "" },
+  { label = "宽 1920", value = "1920x" },
+  { label = "宽 1280", value = "1280x" },
+  { label = "一半", value = "50%" },
+  { label = "四分之一", value = "25%" },
+]
+
+[[action.argument]]
+key = "quality"
+label = "质量"
+kind = "choice"
+flag = "-quality"
+help = "数值越高质量越好、文件越大；对 png 影响较小"
+choices = [
+  { label = "默认", value = "" },
+  { label = "92", value = "92" },
+  { label = "85", value = "85" },
+  { label = "75", value = "75" },
+]
+
+[[action.argument]]
+key = "strip"
+label = "去掉元数据"
+kind = "toggle"
+flag = "-strip"
+default = "false"
+help = "清掉 EXIF/ICC 等信息，通常能显著减小体积"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+help = "扩展名决定格式，例如 /tmp/out.webp"

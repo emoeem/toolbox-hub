@@ -1,0 +1,59 @@
+# pandoc 的动作：文档格式互转。
+
+[[action]]
+id = "pandoc-convert"
+name = "pandoc 文档转换"
+summary = "Markdown / HTML / docx / EPUB 之间互相转换，可自动生成目录"
+domain = "开发"
+tags = ["文档"]
+program = "pandoc"
+install = "sudo pacman -S pandoc"
+input = "源文档"
+output = "转换后的文档"
+features = "格式互转；独立文档；自动目录"
+
+[[action.argument]]
+key = "input"
+label = "源文件"
+kind = "path"
+required = true
+help = "例如 笔记.md；多个用逗号隔开，会按顺序拼接"
+repeatable = true
+
+[[action.argument]]
+key = "to"
+label = "目标格式"
+kind = "choice"
+flag = "--to"
+help = "要和输出文件的扩展名一致"
+choices = [
+  { label = "HTML", value = "html" },
+  { label = "Markdown", value = "markdown" },
+  { label = "Word docx", value = "docx" },
+  { label = "EPUB 电子书", value = "epub" },
+  { label = "纯文本", value = "plain" },
+]
+
+[[action.argument]]
+key = "standalone"
+label = "生成独立文档"
+kind = "toggle"
+flag = "--standalone"
+default = "true"
+help = "输出 HTML / EPUB 时几乎总是需要，否则只有正文片段"
+
+[[action.argument]]
+key = "toc"
+label = "加目录"
+kind = "toggle"
+flag = "--toc"
+default = "false"
+help = "按标题层级生成目录"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+flag = "-o"
+required = true
+help = "例如 /tmp/out.html"

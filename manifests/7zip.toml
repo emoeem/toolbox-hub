@@ -1,0 +1,84 @@
+# 7-Zip 的动作：解压 / 打包。
+#
+# 这个文件是 `flag_join` 的活例子：7z 只认贴在一起的开关（`-mx9`），
+# 写成 `-mx 9` 它不认，所以那几项必须 flag_join = true。
+
+[[action]]
+id = "7z-extract"
+name = "7z 解压"
+summary = "解压 zip / 7z / tar 等压缩包（解到 Toolbox 启动时所在的目录）"
+domain = "工具"
+tags = ["压缩"]
+program = "7z"
+base_argv = ["x"]
+danger = "caution"   # 解压会覆盖当前目录里的同名文件
+install = "sudo pacman -S 7zip"
+input = "压缩包"
+output = "解压出来的文件"
+features = "覆盖确认；保留包内目录结构"
+
+[[action.argument]]
+key = "archive"
+label = "压缩包"
+kind = "path"
+required = true
+help = "例如 backup.7z；解压到 Toolbox 启动时所在目录"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "true"
+help = "关掉之后遇到同名文件会逐个问你"
+
+[[action]]
+id = "7z-create"
+name = "7z 创建压缩包"
+summary = "把文件或目录打成压缩包，可选压缩级别"
+domain = "工具"
+tags = ["压缩"]
+program = "7z"
+base_argv = ["a"]
+danger = "caution"   # 目标是已有压缩包时会往里追加
+install = "sudo pacman -S 7zip"
+input = "要压缩的路径"
+output = "压缩包"
+features = "压缩级别；递归子目录"
+
+[[action.argument]]
+key = "archive"
+label = "压缩包"
+kind = "path"
+required = true
+help = "要生成的包，例如 /tmp/backup.7z（已存在则会追加内容）"
+
+[[action.argument]]
+key = "source"
+label = "要压缩的路径"
+kind = "path"
+required = true
+help = "文件或目录；多个用逗号隔开，一起打包"
+repeatable = true
+
+[[action.argument]]
+key = "level"
+label = "压缩级别"
+kind = "choice"
+flag = "-mx"
+flag_join = true
+help = "0 只打包不压缩；9 压得最小但最慢"
+choices = [
+  { label = "只打包", value = "0" },
+  { label = "快速", value = "1" },
+  { label = "默认", value = "5" },
+  { label = "最大", value = "9" },
+]
+
+[[action.argument]]
+key = "recursive"
+label = "包含子目录"
+kind = "toggle"
+flag = "-r"
+default = "true"
+help = "目录里的子目录也一起打包"
