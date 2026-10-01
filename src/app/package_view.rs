@@ -10,13 +10,13 @@ use std::{
     thread,
 };
 
-use crate::packages::{self, NewsItem, PackageHit, QueuedPackage, probe};
+use crate::packages::{self, NewsItem, PackageHit, QueuedPackage, SortMode, fuzzy_score, probe};
 
 /// 一次包信息面板能显示的字段上限（再多也放不下）。
 const INFO_FIELDS_MAX: usize = 24;
 
 /// 新闻线程回来的东西：条目 + 未读条数，或者一句错误。
-type NewsResult = Result<(Vec<NewsItem>, Option<usize>), String>;
+type NewsResult = Result<(Vec<NewsItem>, Option<usize>, Option<usize>), String>;
 
 pub struct PackageView {
     /// 搜索框里的词。
@@ -29,6 +29,8 @@ pub struct PackageView {
     pub visible: Vec<usize>,
     /// 仓库标签（名字 + 是否启用），按结果里出现的顺序。
     pub repos: Vec<(String, bool)>,
+    /// 结果排序方式（`s` 键轮换）。
+    pub sort: SortMode,
     pub selected: usize,
     /// 信息面板：包名 + 字段。
     pub info: Option<(String, Vec<(String, String)>)>,
@@ -49,6 +51,8 @@ pub struct PackageView {
     /// Arch 新闻与未读条数。
     pub news: Vec<NewsItem>,
     pub news_unread: Option<usize>,
+    /// 有多少个包可以更新（Arch 状态块）。
+    pub pending_updates: Option<usize>,
     /// 安装确认：第一次 Enter 只是问一声，第二次才真装（危险动作的老规矩）。
     pub install_armed: bool,
     /// 在搜索框里翻历史的位置。
@@ -68,6 +72,7 @@ impl PackageView {
             hits: Vec::new(),
             visible: Vec::new(),
             repos: Vec::new(),
+            sort: SortMode::Relevance,
             selected: 0,
             info: None,
             info_error: None,
@@ -81,6 +86,7 @@ impl PackageView {
             history,
             news: Vec::new(),
             news_unread: None,
+            pending_updates: None,
             install_armed: false,
             history_index: None,
             message: String::new(),
@@ -144,10 +150,13 @@ impl PackageView {
         let spawned = thread::Builder::new()
             .name(String::from("pkg-news"))
             .spawn(move || {
-                let result = probe::news().map(|items| {
-                    let unread = packages::unread_news(&items, probe::last_upgrade());
-                    (items, Some(unread))
-                });
+                let updates = probe::pending_updates();
+                let result = probe::news()
+                    .map(|items| {
+                        let unread = packages::unread_news(&items, probe::last_upgrade());
+                        (items, Some(unread))
+                    })
+                    .map(|(items, unread)| (items, unread, updates));
                 let _ = tx.send(result);
             });
         match spawned {
@@ -208,7 +217,8 @@ impl PackageView {
 
         if let Some(rx) = &self.news_rx {
             match rx.try_recv() {
-                Ok(Ok((items, unread))) => {
+                Ok(Ok((items, unread, updates))) => {
+                    self.pending_updates = updates;
                     self.news_unread = unread;
                     self.message = match unread {
                         Some(0) => format!("Arch 新闻 {} 条，都读过了", items.len()),
@@ -285,23 +295,82 @@ impl PackageView {
         self.repos = repos;
     }
 
+    /// 重新算可见列表：**仓库标签 + 本地模糊过滤 + 排序**。
+    ///
+    /// 搜索词同时干两件事：`Enter` 拿去问官方源与 AUR（远端），打字则**本地**
+    /// 模糊过滤已有结果 —— 这就是 pac（fzf 那一层）的手感：键入即筛、回车才上网找。
     pub fn apply_filter(&mut self) {
-        self.visible = self
-            .hits
-            .iter()
-            .enumerate()
-            .filter(|(_, hit)| {
-                self.repos
-                    .iter()
-                    .find(|(name, _)| name == &hit.repo)
-                    .map(|(_, enabled)| *enabled)
-                    .unwrap_or(true)
-            })
-            .map(|(index, _)| index)
-            .collect();
+        let needle = self.query.trim().to_string();
+        let mut rows: Vec<(usize, i32)> = Vec::new();
+
+        for (index, hit) in self.hits.iter().enumerate() {
+            let repo_on = self
+                .repos
+                .iter()
+                .find(|(name, _)| name == &hit.repo)
+                .map(|(_, enabled)| *enabled)
+                .unwrap_or(true);
+            if !repo_on {
+                continue;
+            }
+
+            if needle.is_empty() {
+                rows.push((index, 0));
+                continue;
+            }
+
+            // 名字优先，其次描述与仓库名（各降一档）
+            let mut best = fuzzy_score(&needle, &hit.name);
+            if let Some(score) = fuzzy_score(&needle, &hit.description) {
+                let score = score - 2;
+                best = Some(best.map_or(score, |current: i32| current.max(score)));
+            }
+            if let Some(score) = fuzzy_score(&needle, &hit.repo) {
+                let score = score - 4;
+                best = Some(best.map_or(score, |current: i32| current.max(score)));
+            }
+            if let Some(score) = best {
+                rows.push((index, score));
+            }
+        }
+
+        match self.sort {
+            SortMode::Relevance if !needle.is_empty() => {
+                rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            }
+            SortMode::Relevance => {}
+            SortMode::Name => rows.sort_by(|a, b| {
+                self.hits[a.0]
+                    .name
+                    .cmp(&self.hits[b.0].name)
+                    .then(a.0.cmp(&b.0))
+            }),
+            SortMode::Repo => rows.sort_by(|a, b| {
+                self.hits[a.0]
+                    .repo
+                    .cmp(&self.hits[b.0].repo)
+                    .then(self.hits[a.0].name.cmp(&self.hits[b.0].name))
+            }),
+            SortMode::Votes => rows.sort_by(|a, b| {
+                self.hits[b.0]
+                    .votes
+                    .unwrap_or(0)
+                    .cmp(&self.hits[a.0].votes.unwrap_or(0))
+                    .then(a.0.cmp(&b.0))
+            }),
+        }
+
+        self.visible = rows.into_iter().map(|(index, _)| index).collect();
         if self.selected >= self.visible.len() {
             self.selected = self.visible.len().saturating_sub(1);
         }
+    }
+
+    /// `s`：轮换排序方式。
+    pub fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.message = format!("排序：{}", self.sort.label());
+        self.apply_filter();
     }
 
     pub fn visible_len(&self) -> usize {
@@ -479,4 +548,135 @@ impl PackageView {
 /// 队列导出/导入用的默认路径。
 pub fn default_queue_path() -> PathBuf {
     packages::queue_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packages::PackageHit;
+
+    fn hit(repo: &str, name: &str, votes: Option<u64>) -> PackageHit {
+        PackageHit {
+            repo: repo.to_string(),
+            name: name.to_string(),
+            version: String::from("1.0-1"),
+            description: format!("{name} 的说明"),
+            installed: false,
+            installed_version: None,
+            votes,
+            popularity: None,
+            maintainer: None,
+            out_of_date: false,
+        }
+    }
+
+    fn view_with(hits: Vec<PackageHit>) -> PackageView {
+        let mut view = PackageView::new(Vec::new());
+        view.hits = hits;
+        view.rebuild_repos();
+        view.apply_filter();
+        view
+    }
+
+    /// 打字就是**本地模糊过滤**（pac 的手感），回车才上网搜。
+    #[test]
+    fn typing_filters_locally_with_fuzzy_matching() {
+        let mut view = view_with(vec![
+            hit("extra", "fzf", None),
+            hit("aur", "sysz", Some(23)),
+            hit("aur", "dotbare", Some(4)),
+        ]);
+        assert_eq!(view.visible_len(), 3, "一开始全都在");
+
+        view.query = String::from("fzf");
+        view.apply_filter();
+        assert_eq!(view.visible_len(), 1);
+        assert_eq!(
+            view.selected_hit().map(|hit| hit.name.as_str()),
+            Some("fzf")
+        );
+
+        // 子序列也命中（`sz` → sysz），但顺序上真前缀更靠前
+        view.query = String::from("sz");
+        view.apply_filter();
+        assert!(view.visible_len() >= 1);
+        assert!(
+            view.visible
+                .iter()
+                .any(|&index| view.hits[index].name == "sysz")
+        );
+
+        // 描述里命中也能找到
+        view.query = String::from("dotbare 的说明");
+        view.apply_filter();
+        assert_eq!(view.visible_len(), 1);
+
+        view.query = String::from("zzzz");
+        view.apply_filter();
+        assert_eq!(view.visible_len(), 0);
+    }
+
+    /// 仓库标签与排序都作用在同一份结果上。
+    #[test]
+    fn repo_chips_and_sort_modes_control_the_list() {
+        let mut view = view_with(vec![
+            hit("extra", "zsh", None),
+            hit("core", "bash", None),
+            hit("aur", "popular-thing", Some(99)),
+        ]);
+
+        // 关掉 aur
+        let aur = view
+            .repos
+            .iter()
+            .position(|(name, _)| name == "aur")
+            .expect("有 aur 标签");
+        view.toggle_repo(aur);
+        assert_eq!(view.visible_len(), 2, "AUR 被筛掉");
+
+        // 排序：名字
+        view.cycle_sort();
+        assert_eq!(view.sort, SortMode::Name);
+        assert_eq!(
+            view.selected_hit().map(|hit| hit.name.as_str()),
+            Some("bash")
+        );
+
+        // 排序：得票（AUR 被关掉了，官方源都没票，顺序保持稳定）
+        view.cycle_sort();
+        view.cycle_sort();
+        assert_eq!(view.sort, SortMode::Votes);
+
+        // 再把 aur 打开：票最高的应该冒到前面
+        view.toggle_repo(aur);
+        assert_eq!(
+            view.selected_hit().map(|hit| hit.name.as_str()),
+            Some("popular-thing"),
+            "按得票排，AUR 那个 99 票的该在最前"
+        );
+    }
+
+    /// 队列：加入、去重、导出导入、清空。
+    #[test]
+    fn the_install_queue_keeps_unique_names() {
+        let mut view = view_with(vec![hit("aur", "sysz", Some(23))]);
+        view.toggle_queue();
+        assert_eq!(view.queue.len(), 1);
+        view.toggle_queue();
+        assert_eq!(view.queue.len(), 0, "再按一次移出");
+
+        let path = std::env::temp_dir().join(format!("toolbox-hub-qv-{}.txt", std::process::id()));
+        view.toggle_queue();
+        view.export_queue(&path);
+        assert!(path.exists());
+
+        let mut other = PackageView::new(Vec::new());
+        other.import_queue(&path);
+        assert_eq!(other.queue, view.queue, "导出再导入要一样");
+
+        other.clear_queue();
+        assert!(other.queue.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

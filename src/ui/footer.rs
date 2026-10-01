@@ -21,7 +21,7 @@ const MESSAGE_WIDTH: u16 = 48;
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let keys = if app.packages.is_some() {
-        "打字+Enter 搜索 · Space 排队 · Enter 安装(两次) · Tab 队列 · Ctrl+X PKGBUILD · Ctrl+N 新闻 · Esc 返回"
+        "打字即筛 · Enter 上网搜 · Space 排队 · Enter 安装(两次) · Tab 队列 · s 排序 · Ctrl+K 检查 · Ctrl+A AI审查 · Esc 返回"
     } else if app.files.is_some() {
         "↑↓ 选择 · Enter 切到该文件所在目录 · 打字过滤 · Esc 关闭"
     } else if app.is_help_open() {

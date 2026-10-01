@@ -1091,6 +1091,130 @@ impl App {
         Ok(())
     }
 
+    /// `Ctrl+K`：PKGBUILD 检查 —— `paru -Gp` 取下来，再过一遍 shellcheck 与 namcap，
+    /// 三段一起丢进输出视图（pacsea 的 Show PKGBUILD / ShellCheck / Namcap 就是这个）。
+    pub fn check_pkgbuild(&mut self, cwd: &Path) -> io::Result<()> {
+        let Some(name) = self
+            .packages
+            .as_ref()
+            .and_then(|view| view.selected_hit().map(|hit| hit.name.clone()))
+        else {
+            return Ok(());
+        };
+
+        if let Some(view) = self.packages.as_mut() {
+            view.message = format!("正在取 {name} 的 PKGBUILD 并检查…");
+        }
+
+        let paru = PathBuf::from("paru");
+        let fetched = runtime::run_captured(
+            &paru,
+            &[String::from("-Gp"), name.clone()],
+            cwd,
+            &format!("PKGBUILD {name}"),
+        )?;
+        self.request_full_redraw();
+
+        if !fetched.success || fetched.stdout.trim().is_empty() {
+            if let Some(view) = self.packages.as_mut() {
+                view.message = format!("没拿到 {name} 的 PKGBUILD（它是 AUR 包吗？网络通吗？）");
+            }
+            return Ok(());
+        }
+
+        // 写到临时文件：检查工具要的是文件，不是管道。
+        let path = std::env::temp_dir().join(format!("toolbox-hub-{name}-PKGBUILD"));
+        let _ = std::fs::write(&path, &fetched.stdout);
+
+        let mut captures = vec![fetched];
+        for (program, label) in [("shellcheck", "shellcheck"), ("namcap", "namcap")] {
+            let captured = runtime::run_captured(
+                &PathBuf::from(program),
+                &[path.display().to_string()],
+                cwd,
+                label,
+            );
+            match captured {
+                Ok(mut captured) => {
+                    // shellcheck 发现问题是**退出码 1**：那是检查成功、有告警，
+                    // 不是「命令失败」（不然头部会写着「失败 N 个」，误导）。
+                    if program == "shellcheck" && captured.status == Some(1) {
+                        captured.success = true;
+                        captured.label = format!("{program}（有告警）");
+                    }
+                    captures.push(captured);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // 没装就明说，别装作检查过了 —— 但也不算「失败」
+                    captures.push(runtime::Captured {
+                        label: format!("{program}（没装）"),
+                        command: format!("{program}（没装：pacman -S {program}）"),
+                        stdout: format!(
+                            "没装 {program}，这一步跳过了。\n装上它：pacman -S {program}"
+                        ),
+                        stderr: String::new(),
+                        status: Some(0),
+                        success: true,
+                        elapsed: std::time::Duration::ZERO,
+                        cancelled: false,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if let Some(viewer) = Viewer::from_captured(&captures) {
+            self.open_viewer(viewer);
+        }
+        Ok(())
+    }
+
+    /// `Ctrl+A`：借 `pac --check` 做 AUR 的 AI 审查。
+    ///
+    /// 为什么是「借」：审查用的是**你自己在 pac 里配好的 AI 供应商**
+    /// （`pac config`），工具箱不该假装自己实现了那套东西 —— 但也别让人为此切出去。
+    pub fn review_aur_with_pac(&mut self, cwd: &Path) -> io::Result<()> {
+        let Some(hit) = self
+            .packages
+            .as_ref()
+            .and_then(|view| view.selected_hit().cloned())
+        else {
+            return Ok(());
+        };
+
+        if !hit.is_aur() {
+            if let Some(view) = self.packages.as_mut() {
+                view.message = format!("{} 来自 {}，不是 AUR 包", hit.name, hit.repo);
+            }
+            return Ok(());
+        }
+
+        if let Some(view) = self.packages.as_mut() {
+            view.message = format!("把 {} 交给 pac 做 AI 审查…", hit.name);
+        }
+
+        // `--check` 只审查、不安装
+        let result =
+            runtime::run_in_terminal("pac", &[String::from("--check"), hit.name.clone()], cwd);
+        self.request_full_redraw();
+
+        match result {
+            Ok(_) => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.message = format!("{} 的 AI 审查结束（结论在上面）", hit.name);
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.message = String::from("没装 pac —— AI 审查要靠它配好的供应商");
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// `o`：在浏览器里打开 AUR 页面（评论、投票、看依赖都在那儿，需要你的登录）。
     pub fn open_aur_page(&mut self) {
         let Some(name) = self

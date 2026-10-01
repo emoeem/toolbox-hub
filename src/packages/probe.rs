@@ -35,19 +35,25 @@ pub struct InfoOutcome {
 /// 一律 `LC_ALL=C`：pacman 的标记是**本地化**的（中文系统上是 `[已安装]`），
 /// 不锁 locale 就解析不了。
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
+    run_ok_codes(program, args, &[0])
+}
+
+/// 同上，但可以声明「哪些退出码不算失败」。
+///
+/// 真实存在的例子：`pacman -Ss 没这个词` 退出码是 **1**（没有匹配），
+/// 那不是错误 —— 实拍时它被当成「官方源失败」报了出来。
+fn run_ok_codes(program: &str, args: &[&str], ok_codes: &[i32]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
         .output()
         .map_err(|error| format!("{program} 跑不起来：{error}"))?;
 
-    if !output.status.success() {
+    let code = output.status.code();
+    if !output.status.success() && !code.is_some_and(|code| ok_codes.contains(&code)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr.lines().next().unwrap_or("（没有错误信息）");
-        return Err(format!(
-            "{program} 退出码 {:?}：{first}",
-            output.status.code()
-        ));
+        return Err(format!("{program} 退出码 {code:?}：{first}"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -61,7 +67,8 @@ pub fn installed_names() -> BTreeSet<String> {
 
 /// 官方源搜索（`pacman -Ss`）。
 pub fn official_search(term: &str) -> Result<Vec<PackageHit>, String> {
-    run("pacman", &["-Ss", term]).map(|text| parse_official_search(&text))
+    // 1 = 没有匹配（不是失败）
+    run_ok_codes("pacman", &["-Ss", term], &[0, 1]).map(|text| parse_official_search(&text))
 }
 
 /// AUR 搜索（官方 RPC，走 curl；比解析 paru 的文本可靠得多）。
@@ -173,6 +180,15 @@ pub fn news() -> Result<Vec<NewsItem>, String> {
     Ok(items)
 }
 
+/// 有多少个包可以更新（`checkupdates`，只查不装）。
+pub fn pending_updates() -> Option<usize> {
+    // checkupdates 没有更新时退 2，`run` 会当成错误 —— 那种情况就是 0 个
+    run("checkupdates", &[])
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .ok()
+        .or(Some(0))
+}
+
 /// 最后一次全系统更新的时间（读 pacman 日志；读不到就 `None`）。
 pub fn last_upgrade() -> Option<u64> {
     let log = std::fs::read_to_string("/var/log/pacman.log").ok()?;
@@ -226,6 +242,29 @@ mod tests {
         for error in &outcome.errors {
             println!("（一路失败，可接受）：{error}");
         }
+    }
+
+    /// 真跑：搜一个不存在的词，两路都该是「0 个结果」而不是「失败」。
+    ///
+    /// `pacman -Ss 没有这个词` 退出码是 1 —— 这不是错误（实拍踩到过）。
+    #[test]
+    #[ignore = "真的执行 pacman -Ss 与 curl（只读），默认跳过"]
+    fn smoke_no_match_is_not_an_error() {
+        let outcome = search("toolbox-hub-definitely-nonexistent-xyz");
+
+        assert!(
+            !outcome
+                .errors
+                .iter()
+                .any(|error| error.starts_with("官方源")),
+            "没匹配不该报成失败：{:?}",
+            outcome.errors
+        );
+        assert!(
+            outcome.hits.len() < 5,
+            "这个词应该几乎没有结果：{}",
+            outcome.hits.len()
+        );
     }
 
     /// 真跑：官方源包信息 + AUR 包信息。

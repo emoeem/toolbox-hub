@@ -62,6 +62,81 @@ impl PackageHit {
     }
 }
 
+/// 极简模糊匹配（fzf 那套手感的骨架）。
+///
+/// `needle` 的字符按顺序出现在 `haystack` 里就算命中，返回分数：
+/// 前缀命中、连续命中、起点靠前都给高分 —— 这样输入 `fz` 时 `fzf` 会排在
+/// `fzf-tmux` 前面，和 fzf 的直觉一致。
+///
+/// 返回 `None` 表示不命中。
+pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    if needle.trim().is_empty() {
+        return Some(0);
+    }
+
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut cursor = 0usize;
+    let mut score = 0i32;
+    let mut previous: Option<usize> = None;
+
+    for ch in needle.trim().to_lowercase().chars() {
+        if ch == ' ' {
+            continue;
+        }
+        let offset = hay.get(cursor..)?.iter().position(|item| *item == ch)?;
+        let found = cursor + offset;
+
+        score += 1;
+        if found == 0 {
+            score += 8; // 命中开头
+        }
+        match previous {
+            Some(prev) if prev + 1 == found => score += 4, // 连续命中
+            Some(prev) => score -= ((found - prev) as i32 - 1).min(4), // 跳过的越少越好
+            None => score -= (found as i32).min(4),        // 起点越靠前越好
+        }
+
+        previous = Some(found);
+        cursor = found + 1;
+    }
+
+    Some(score)
+}
+
+/// 结果排序方式（pacsea 顶栏那个 `Sort v`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortMode {
+    /// 相关度：服务器给的顺序 + 本地模糊分数。
+    Relevance,
+    Name,
+    Repo,
+    /// AUR 的得票（官方源没有票，排后面）。
+    Votes,
+}
+
+impl SortMode {
+    pub const ALL: [SortMode; 4] = [
+        SortMode::Relevance,
+        SortMode::Name,
+        SortMode::Repo,
+        SortMode::Votes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Relevance => "相关度",
+            SortMode::Name => "名字",
+            SortMode::Repo => "仓库",
+            SortMode::Votes => "得票",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
+
 /// 解析 `LC_ALL=C pacman -Ss <词>` 的输出。
 ///
 /// 格式（两行一组）：
@@ -732,6 +807,35 @@ Download Size   : 2030.16 KiB
 
     /// 真实 AUR RPC 回复（裁到两个结果，字段一个不少）。
     const AUR_SEARCH: &str = r#"{"resultcount":1,"results":[{"Description":"Fast TUI for searching","FirstSubmitted":1759428378,"ID":2171380,"LastModified":1784573962,"Maintainer":"Firstpick","Name":"pacsea-bin","NumVotes":5,"OutOfDate":null,"PackageBase":"pacsea-bin","PackageBaseID":223019,"Popularity":0.093482,"URL":"https://github.com/Firstp1ck/Pacsea","URLPath":"/cgit/aur.git/snapshot/pacsea-bin.tar.gz","Version":"0.8.2-2"}]}"#;
+
+    #[test]
+    fn fuzzy_matching_prefers_prefix_and_consecutive_hits() {
+        // 命中与不命中
+        assert!(fuzzy_score("fzf", "fzf").is_some());
+        assert!(fuzzy_score("fz", "fzf").is_some(), "子序列也算");
+        assert!(fuzzy_score("FZ", "fzf").is_some(), "大小写无关");
+        assert!(fuzzy_score("zzz", "fzf").is_none());
+        assert!(fuzzy_score("", "anything").is_some(), "空词全命中");
+
+        // 前缀 + 连续 > 分散命中；`fzf` 应该压过 `fzf-tmux` 之前的那类
+        let tight = fuzzy_score("fzf", "fzf").expect("命中");
+        let spread = fuzzy_score("fzf", "foo-zzz-foo").expect("命中");
+        assert!(tight > spread, "{tight} 应该大于 {spread}");
+
+        let prefix = fuzzy_score("fz", "fzf").expect("命中");
+        let middle = fuzzy_score("fz", "xxfzf").expect("命中");
+        assert!(prefix > middle, "前缀应该更高：{prefix} vs {middle}");
+    }
+
+    #[test]
+    fn sort_modes_cycle_through_all_of_them() {
+        let mut mode = SortMode::Relevance;
+        for _ in 0..SortMode::ALL.len() {
+            mode = mode.next();
+        }
+        assert_eq!(mode, SortMode::Relevance, "转一圈回到起点");
+        assert_eq!(SortMode::Votes.label(), "得票");
+    }
 
     #[test]
     fn official_search_parses_repo_name_version_and_installed_marker() {

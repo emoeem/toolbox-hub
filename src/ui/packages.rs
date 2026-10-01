@@ -81,6 +81,21 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         spans.push(Span::raw(" "));
     }
 
+    spans.push(Span::styled(
+        format!("· 排序 {} ", view.sort.label()),
+        Style::default().fg(theme::DIM),
+    ));
+    if let Some(count) = view.pending_updates {
+        spans.push(Span::styled(
+            format!("· 待更新 {count} "),
+            Style::default().fg(if count > 0 {
+                theme::YELLOW
+            } else {
+                theme::GREEN
+            }),
+        ));
+    }
+
     if !view.queue.is_empty() {
         spans.push(Span::styled(
             format!("· 队列 {} ", view.queue.len()),
@@ -245,21 +260,9 @@ fn draw_search(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ));
-        if view.query.trim().is_empty() && !view.history.is_empty() {
-            let hint = view
-                .history
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" · ");
+        if false {
             spans.push(Span::styled(
-                format!("   ↑↓ 历史：{hint}"),
-                Style::default().fg(theme::FAINT),
-            ));
-        } else {
-            spans.push(Span::styled(
-                "   Enter 搜索 · Esc 退出输入 · Ctrl+U 清空",
+                "   打字即本地模糊过滤 · Enter 上网搜（官方源+AUR） · Esc 退出输入",
                 Style::default().fg(theme::FAINT),
             ));
         }

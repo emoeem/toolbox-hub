@@ -532,16 +532,19 @@ fn handle_packages_key(
         KeyCode::Char(ch) if editing && !ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.query.push(ch);
+                view.apply_filter(); // 本地模糊过滤：键入即筛
             }
         }
         KeyCode::Backspace if editing => {
             if let Some(view) = app.packages.as_mut() {
                 view.query.pop();
+                view.apply_filter();
             }
         }
         KeyCode::Char('u') if editing && ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.query.clear();
+                view.apply_filter();
             }
         }
         KeyCode::Up if editing => {
@@ -643,6 +646,16 @@ fn handle_packages_key(
             }
         }
         KeyCode::Char('x') if ctrl => app.show_pkgbuild(cwd)?,
+        // Ctrl+K：PKGBUILD 检查（shellcheck + namcap），三段一起进输出视图
+        KeyCode::Char('k') if ctrl => app.check_pkgbuild(cwd)?,
+        // Ctrl+A：借 pac 自己的 AI 审查（它认得你配的供应商）
+        KeyCode::Char('a') if ctrl => app.review_aur_with_pac(cwd)?,
+        // s：轮换排序（相关度 / 名字 / 仓库 / 得票）
+        KeyCode::Char('s') if !ctrl && !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.cycle_sort();
+            }
+        }
         KeyCode::Char('o') if !ctrl && !editing => app.open_aur_page(),
         // 数字键切换仓库标签（1-9），0 = 全开
         KeyCode::Char(digit @ '1'..='9') if !editing => {

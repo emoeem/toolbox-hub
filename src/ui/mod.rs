@@ -688,7 +688,8 @@ mod tests {
         app.open_help();
 
         // 用足够高的终端一次看全（矮终端要靠滚动，另有一条断言盯着）。
-        let text = render_compact(&mut app, 100, 70);
+        // 帮助内容会随着功能长，所以这里给得宽一点。
+        let text = render_compact(&mut app, 110, 100);
         for expected in [
             "帮助",
             "列表",
