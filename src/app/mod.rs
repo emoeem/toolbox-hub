@@ -4,6 +4,7 @@
 //! 数据来源统一走 [`crate::registry::Registry`]，这里不认识任何具体 Provider。
 
 mod input;
+pub mod package_view;
 mod picker;
 
 pub use input::handle_key;
@@ -19,8 +20,10 @@ use std::{
 use ratatui::widgets::TableState;
 
 use crate::{
+    app::package_view::PackageView,
     history, media,
     model::{ArgKind, Argument, ArgumentValues, Domain, ToolDefinition},
+    packages,
     registry::{Registry, ReloadReport},
     runtime::{self, Captured, RunningJob},
     state::{self, State, WORK_DIR_ENV},
@@ -395,6 +398,8 @@ pub struct App {
     pub media_root: PathBuf,
     /// 文件视图；`Some` 表示开着。
     pub files: Option<FilesView>,
+    /// 原生包管理视图；`Some` 表示开着。
+    pub packages: Option<PackageView>,
     /// 正在跑的后台任务。
     pub running: Option<RunningJobView>,
     /// 排队等着跑的任务（批量执行时用）。
@@ -436,6 +441,7 @@ impl App {
             media: media::ScanResult::default(),
             media_root: PathBuf::new(),
             files: None,
+            packages: None,
             running: None,
             job_queue: VecDeque::new(),
             job_results: Vec::new(),
@@ -963,6 +969,145 @@ impl App {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.dir_input = None;
         self.set_work_dir(path, "已改工作目录");
+    }
+
+    // ── 原生包管理视图 ───────────────────────────────────────────────────
+
+    /// 按 `p`：打开原生包管理（搜索 / 信息 / 排队 / 安装）。
+    pub fn open_packages(&mut self) {
+        let history = packages::load_searches_from(&packages::searches_path());
+        let mut view = PackageView::new(history);
+        // 上次没装完的队列还能接着装
+        let queue = packages::load_queue_from(&packages::queue_path());
+        if !queue.is_empty() {
+            view.message = format!("上次的队列还在：{} 个（Ctrl+I 也可导入）", queue.len());
+            view.queue = queue;
+        }
+        self.packages = Some(view);
+    }
+
+    /// 每帧收一次包管理的后台结果（搜索、包信息、新闻）。
+    pub fn poll_packages(&mut self) {
+        if let Some(view) = self.packages.as_mut() {
+            view.poll();
+        }
+    }
+
+    /// 关闭包管理视图（历史与队列都落盘）。
+    pub fn close_packages(&mut self) {
+        if let Some(view) = self.packages.take() {
+            view.persist_history();
+            if !view.queue.is_empty() {
+                let _ = packages::save_queue_to(&packages::queue_path(), &view.queue);
+            }
+        }
+    }
+
+    /// `Enter`：装队列里的包（先确认一次）。
+    pub fn install_queue(&mut self, cwd: &Path) -> io::Result<()> {
+        let Some(view) = self.packages.as_mut() else {
+            return Ok(());
+        };
+        if view.queue.is_empty() {
+            view.message = String::from("队列是空的：Space 把包加进来");
+            return Ok(());
+        }
+        if !view.install_armed {
+            view.install_armed = true;
+            view.message = format!(
+                "要装 {} 个包（{}）—— 再按一次 Enter 真的开始",
+                view.queue.len(),
+                if view.queue_has_aur() {
+                    "含 AUR，要编译"
+                } else {
+                    "只有官方源"
+                }
+            );
+            return Ok(());
+        }
+
+        let names = view.queue_names();
+        view.install_armed = false;
+        view.message = format!("正在装 {} 个包…", names.len());
+
+        let mut argv = vec![String::from("-S")];
+        argv.extend(names.iter().cloned());
+        let program = String::from("paru");
+
+        let result = runtime::run_in_terminal(&program, &argv, cwd);
+        // 它接管过终端：回来必须整屏重画。
+        self.request_full_redraw();
+
+        match result {
+            Ok(_) => {
+                let count = names.len();
+                if let Some(view) = self.packages.as_mut() {
+                    view.queue.clear();
+                    view.queue_selected = 0;
+                    view.focus_queue = false;
+                    view.message = format!("{count} 个包装完了（失败的话终端里有原因）");
+                    // 装完以后「已安装」标记得刷新，所以顺手重搜一次
+                    if view.searched.is_some() {
+                        view.start_search();
+                    }
+                }
+                let _ = packages::save_queue_to(&packages::queue_path(), &[]);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.message = String::from("没装 paru（装包要用它）");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.message = format!("装包失败：{error}");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// `Ctrl+X`：把 AUR 的 PKGBUILD 拉下来，用输出视图看（装之前该瞄一眼）。
+    pub fn show_pkgbuild(&mut self, cwd: &Path) -> io::Result<()> {
+        let Some(view) = self.packages.as_ref() else {
+            return Ok(());
+        };
+        let Some(name) = view.selected_hit().map(|hit| hit.name.clone()) else {
+            return Ok(());
+        };
+
+        let program = PathBuf::from("paru");
+        let argv = vec![String::from("-Gp"), name.clone()];
+        let captured = runtime::run_captured(&program, &argv, cwd, &format!("PKGBUILD {name}"))?;
+        self.request_full_redraw();
+
+        if let Some(viewer) = Viewer::from_captured(std::slice::from_ref(&captured)) {
+            self.open_viewer(viewer);
+        } else if let Some(view) = self.packages.as_mut() {
+            view.message = format!("没拿到 {name} 的 PKGBUILD（{name} 是 AUR 包吗）");
+        }
+        Ok(())
+    }
+
+    /// `o`：在浏览器里打开 AUR 页面（评论、投票、看依赖都在那儿，需要你的登录）。
+    pub fn open_aur_page(&mut self) {
+        let Some(name) = self
+            .packages
+            .as_ref()
+            .and_then(|view| view.selected_hit().map(|hit| hit.name.clone()))
+        else {
+            return;
+        };
+        let url = format!("https://aur.archlinux.org/packages/{name}");
+        let message = match packages::probe::open_in_browser(&url) {
+            Ok(()) => format!("已在浏览器打开 {url}"),
+            Err(error) => error,
+        };
+        if let Some(view) = self.packages.as_mut() {
+            view.message = message;
+        }
     }
 
     // ── 文件管理器（yazi） ────────────────────────────────────────────────

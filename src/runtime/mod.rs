@@ -7,5 +7,5 @@ mod exec;
 
 pub use exec::{
     BrowsedBack, Captured, ExecReport, JobEvent, RunningJob, browse_directories, execute_action,
-    execute_tools, parse_duration, probe_duration, run_captured, spawn_captured,
+    execute_tools, parse_duration, probe_duration, run_captured, run_in_terminal, spawn_captured,
 };

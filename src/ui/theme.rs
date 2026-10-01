@@ -20,6 +20,8 @@ pub const CYAN: Color = Color::Rgb(137, 220, 235);
 pub const GREEN: Color = Color::Rgb(166, 227, 161);
 pub const YELLOW: Color = Color::Rgb(249, 226, 175);
 pub const BLUE: Color = Color::Rgb(137, 180, 250);
+/// 错误与「已过期」这类要你注意的红。
+pub const RED: Color = Color::Rgb(243, 139, 168);
 pub const PINK: Color = Color::Rgb(245, 194, 231);
 
 /// 圆角面板：沿用 FFTools 的视觉基调。

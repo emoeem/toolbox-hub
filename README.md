@@ -29,7 +29,8 @@ cargo build --release && ./target/release/toolbox-hub    # 更快
 
 | 场景 | 键 |
 | --- | --- |
-| 列表 | `↑↓`/`jk` 选择 · `Enter` 执行 · `/` 搜索（跨域） · `←→`/`1-7` 域 · `h`/`l` 分类 · `Tab` 标记 · `f` 收藏 · `v` 视图 · `H` 历史 · **`F` 看文件** · **`y` 文件管理器** · **`d` 改工作目录** · `Ctrl-R` 重扫 · `?` 帮助 · `q` 退出 |
+| 列表 | `↑↓`/`jk` 选择 · `Enter` 执行 · `/` 搜索（跨域） · `←→`/`1-7` 域 · `h`/`l` 分类 · `Tab` 标记 · `f` 收藏 · `v` 视图 · `H` 历史 · **`F` 看文件** · **`y` 文件管理器** · **`p` 包管理** · **`d` 改工作目录** · `Ctrl-R` 重扫 · `?` 帮助 · `q` 退出 |
+| 包管理（`p`） | 打字+`Enter` 搜官方源+AUR · `1-9`/`0` 仓库标签 · `Space` 排队 · `Tab` 结果⇄队列 · `Enter` 安装（按两次） · `Ctrl+X` PKGBUILD · `Ctrl+N` 新闻 · `Ctrl+E`/`Ctrl+I` 导出/导入队列 · `o` 浏览器看 AUR 页 |
 | 表单 | `↑↓` 换字段 · `←→` 改选项 · `Enter` 编辑 · **`Ctrl-F` 挑文件** · `Ctrl-E` 执行（危险动作按两次） · `Esc` 返回 |
 | 输出视图 | `↑↓` 滚动 · `g`/`G` 顶底 · `s` 保存 · `c` 复制 · `q` 关闭 |
 | 执行中 | `q` 取消（先 SIGTERM 让工具收尾） · 其余按键照常可用 |
@@ -93,6 +94,29 @@ foreach = "input"                          # 每个输入各跑一次
 环境变量（都可选）：`TOOLBOX_HUB_PATH`（脚本目录）、`TOOLBOX_HUB_MANIFEST_PATH`（manifest 目录）、
 `TOOLBOX_HUB_WORKDIR`（启动工作目录）、`TOOLBOX_HUB_FILE_MANAGER`（默认 `yazi`）、
 `TOOLBOX_HUB_DATA`、`TOOLBOX_HUB_STATE`。
+
+## 原生包管理（`p`）
+
+照 [pacsea](https://github.com/Firstp1ck/Pacsea) 的布局自己实现的一个包管理界面 ——
+**不是**去启动 `pac`/`pacsea`，搜索、解析、筛选、队列、状态全在这个 Rust 程序里；
+只有「真正改系统」的那一下交给 `paru -S`（pacsea 也是这么做的）。
+
+| 数据 | 来源 |
+| --- | --- |
+| 官方源搜索 / 信息 | `LC_ALL=C pacman -Ss` / `-Sii`（锁 locale 是因为标记会本地化成 `[已安装]`） |
+| AUR 搜索 / 信息 | AUR 官方 RPC + `serde_json`：得票、热度、维护者、是否过期、依赖 |
+| 已安装集合 | `pacman -Qq` 一次拿全 |
+| PKGBUILD | `paru -Gp`，拿输出视图看 |
+| Arch 新闻 | `archlinux.org/feeds/news/`，并对比 `pacman.log` 里最后一次全系统更新，提醒未读 |
+
+```text
+┌ 结果 128 条 · [core✓][extra✓][aur✓] · 队列 2 · 「fzf」128 个结果 ──────────┐
+│ > extra  fzf        0.74.4-1  Command-line fuzzy finder    ✓ 已安装       │
+│   aur    fzf-git    0.74.4…   fzf from git                 票 12·0.31    │
+├ 搜索 fzf▏                     Enter 搜索 · Esc 退出输入                  │
+├ 包信息 fzf                    Depends On  glibc  …                       │
+└ Space 排队 · Enter 安装 · Tab 队列 · Ctrl+X PKGBUILD · Ctrl+N 新闻 …     ┘
+```
 
 ## 工作目录：脚本找不到文件的根因
 

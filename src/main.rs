@@ -14,6 +14,7 @@ mod app;
 mod history;
 mod media;
 mod model;
+mod packages;
 mod providers;
 mod registry;
 mod runtime;
@@ -119,6 +120,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
         //   （实测：面板上耗时在走、进度和输出一直空着，按一下键才刷出来）；
         // * 放在按键**之后**是为了让「按 q 取消」不会顺手把刚打开的输出视图关掉。
         app.poll_job(&cwd);
+        app.poll_packages();
     }
     Ok(())
 }

@@ -20,7 +20,9 @@ const KEYS_WIDTH: u16 = 52;
 const MESSAGE_WIDTH: u16 = 48;
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let keys = if app.files.is_some() {
+    let keys = if app.packages.is_some() {
+        "打字+Enter 搜索 · Space 排队 · Enter 安装(两次) · Tab 队列 · Ctrl+X PKGBUILD · Ctrl+N 新闻 · Esc 返回"
+    } else if app.files.is_some() {
         "↑↓ 选择 · Enter 切到该文件所在目录 · 打字过滤 · Esc 关闭"
     } else if app.is_help_open() {
         "↑↓ 滚动 · q 关闭帮助"
@@ -37,14 +39,19 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     } else if app.searching {
         "输入搜索 · Enter 确认 · Esc 清除"
     } else {
-        "↑↓/jk 选择 · Enter 执行 · / 搜索 · F 文件 · y 浏览 · f 收藏 · v 视图 · H 历史 · Tab 标记 · d 目录 · q 退出"
+        "↑↓/jk 选择 · Enter 执行 · / 搜索 · F 文件 · y 浏览 · p 包管理 · f 收藏 · v 视图 · H 历史 · d 目录 · q 退出"
     };
 
     let queue = match app.marked_count() {
         0 => String::new(),
         count => format!(" · 队列 {count}"),
     };
-    let message = format!("{}{queue}", app.message);
+    // 包管理视图有自己的消息（排队、安装确认、导出结果…），优先显示它 ——
+    // 否则那些反馈全在状态里，你看不到（实拍发现的一次自己的疏漏）。
+    let message = match app.packages.as_ref() {
+        Some(view) if !view.message.is_empty() => view.message.clone(),
+        _ => format!("{}{queue}", app.message),
+    };
 
     let block = Block::default()
         .borders(Borders::TOP)

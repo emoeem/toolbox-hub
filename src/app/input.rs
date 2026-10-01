@@ -30,6 +30,11 @@ pub fn handle_key(
     key: KeyEvent,
     cwd: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // 原生包管理视图开着时它吃掉所有按键（它有搜索框和队列两种焦点）。
+    if app.packages.is_some() {
+        return handle_packages_key(app, key, cwd);
+    }
+
     // 文件视图开着时它吃掉所有按键（字母进过滤词，和选择器一致）。
     if app.files.is_some() {
         match key.code {
@@ -81,6 +86,7 @@ pub fn handle_key(
     if app.is_running()
         && app.viewer.is_none()
         && app.files.is_none()
+        && app.packages.is_none()
         && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             || (matches!(key.code, KeyCode::Char('c')) && key.modifiers == KeyModifiers::CONTROL))
     {
@@ -158,6 +164,9 @@ pub fn handle_key(
         // y：把终端交给文件管理器（yazi），回来工作目录跟着走 ——
         // 「先逛目录、再用脚本」就靠它。
         KeyCode::Char('y') if !ctrl => app.browse_with_file_manager()?,
+
+        // p：原生包管理（搜索官方源 + AUR、看信息、排队、装）。
+        KeyCode::Char('p') if !ctrl => app.open_packages(),
 
         // d：改工作目录 —— 扫目录的脚本就是在这里找输入文件的。
         KeyCode::Char('d') if !ctrl => app.open_dir_input(),
@@ -480,6 +489,182 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// 包管理视图的按键（它自己管搜索框与队列两种焦点）。
+fn handle_packages_key(
+    app: &mut App,
+    key: KeyEvent,
+    cwd: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let editing = app.packages.as_ref().is_some_and(|view| view.editing);
+    let focus_queue = app.packages.as_ref().is_some_and(|view| view.focus_queue);
+
+    // 除了 Enter（安装确认）与 Space 之外，任何按键都解除危险确认
+    if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+        && let Some(view) = app.packages.as_mut()
+    {
+        view.install_armed = false;
+    }
+
+    match key.code {
+        // 关掉视图（q / Esc）；在输入状态时 Esc 只是退出输入
+        KeyCode::Esc => {
+            if editing {
+                if let Some(view) = app.packages.as_mut() {
+                    view.editing = false;
+                    view.message = String::from("退出输入（i 或 / 继续改词）");
+                }
+            } else {
+                app.close_packages();
+            }
+        }
+        KeyCode::Char('q') if !ctrl && !editing => app.close_packages(),
+        KeyCode::Char('c') if ctrl => app.close_packages(),
+
+        // 搜索框
+        KeyCode::Enter if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.start_search();
+            }
+        }
+        KeyCode::Char(ch) if editing && !ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.push(ch);
+            }
+        }
+        KeyCode::Backspace if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.pop();
+            }
+        }
+        KeyCode::Char('u') if editing && ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.clear();
+            }
+        }
+        KeyCode::Up if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.history_step(-1);
+            }
+        }
+        KeyCode::Down if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.history_step(1);
+            }
+        }
+
+        // 结果 / 队列
+        KeyCode::Up => {
+            if let Some(view) = app.packages.as_mut() {
+                view.move_selection(-1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(view) = app.packages.as_mut() {
+                view.move_selection(1);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(view) = app.packages.as_mut() {
+                view.move_selection(-10);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(view) = app.packages.as_mut() {
+                view.move_selection(10);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(view) = app.packages.as_mut() {
+                if view.focus_queue {
+                    view.queue_selected = 0;
+                } else {
+                    view.selected = 0;
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(view) = app.packages.as_mut() {
+                if view.focus_queue {
+                    view.queue_selected = view.queue.len().saturating_sub(1);
+                } else {
+                    view.selected = view.visible_len().saturating_sub(1);
+                }
+            }
+        }
+        KeyCode::Tab => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_focus();
+            }
+        }
+        KeyCode::Char(' ') if !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_queue();
+            }
+        }
+        KeyCode::Char('d') if ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.clear_queue();
+            }
+        }
+        KeyCode::Delete if !editing && focus_queue => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_queue();
+            }
+        }
+        KeyCode::Enter if !editing => app.install_queue(cwd)?,
+        KeyCode::Char('i') | KeyCode::Char('/') if !ctrl && !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.editing = true;
+            }
+        }
+        KeyCode::Char('r') if ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.start_search();
+            }
+        }
+        KeyCode::Char('n') if ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.start_news();
+            }
+        }
+        KeyCode::Char('e') if ctrl => {
+            let path = crate::app::package_view::default_queue_path();
+            if let Some(view) = app.packages.as_mut() {
+                view.export_queue(&path);
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Char('i') if ctrl => {
+            let path = crate::app::package_view::default_queue_path();
+            if let Some(view) = app.packages.as_mut() {
+                view.import_queue(&path);
+            }
+        }
+        KeyCode::Char('x') if ctrl => app.show_pkgbuild(cwd)?,
+        KeyCode::Char('o') if !ctrl && !editing => app.open_aur_page(),
+        // 数字键切换仓库标签（1-9），0 = 全开
+        KeyCode::Char(digit @ '1'..='9') if !editing => {
+            let index = digit as usize - '1' as usize;
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_repo(index);
+            }
+        }
+        KeyCode::Char('0') if !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                let total = view.repos.len();
+                for index in 0..total {
+                    if !view.repos[index].1 {
+                        view.toggle_repo(index);
+                    }
+                }
+                view.message = String::from("仓库标签全开");
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
 }
 
 /// 执行选中的工具：挂起 TUI、交给 runtime、回来后清标记。

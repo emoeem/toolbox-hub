@@ -99,6 +99,35 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// 把终端交给某个程序跑一遍（安装、交互式确认这类）。
+///
+/// 和 [`browse_directories`] 的区别：这个不读回任何状态，只等它退出。
+/// 找不到程序返回 `NotFound`，调用方据此给一句「没装」。
+pub fn run_in_terminal(program: &str, argv: &[String], cwd: &Path) -> io::Result<Option<i32>> {
+    let program_path = if program.contains('/') {
+        let path = PathBuf::from(program);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("找不到 {program}"),
+            ));
+        }
+        path
+    } else {
+        find_on_path(program).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("$PATH 里没有 {program}"))
+        })?
+    };
+
+    suspend_terminal()?;
+    let status = Command::new(&program_path)
+        .args(argv)
+        .current_dir(cwd)
+        .status();
+    resume_terminal()?;
+    Ok(status?.code())
+}
+
 /// 文件管理器逛完之后反馈回来的东西。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BrowsedBack {

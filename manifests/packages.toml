@@ -182,6 +182,8 @@ summary = "du -sh：/var/cache/pacman/pkg 现在占了多少磁盘"
 domain = "包管理"
 tags = ["清理"]
 program = "du"
+# 缓存目录里有只有 root 能读的子目录，du 会因此退 1 —— 但总量照样给出来了
+ok_exit_codes = [0, 1]
 mode = "capture"
 install = "自带（coreutils）"
 input = "无"

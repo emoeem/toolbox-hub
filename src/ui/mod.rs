@@ -20,6 +20,7 @@ mod form;
 mod header;
 mod help;
 mod history;
+mod packages;
 mod picker;
 mod run;
 mod table;
@@ -68,6 +69,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let show_sub = app.viewer.is_none()
         && app.history.is_none()
         && app.files.is_none()
+        && app.packages.is_none()
         && app.picker.is_none()
         && app.form.is_none()
         && (app.is_global_search() || app.scope != Scope::All || app.has_sub_tabs());
@@ -113,6 +115,8 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             viewer::draw(frame, app, list.union(detail));
         } else if app.history.is_some() {
             history::draw(frame, app, list.union(detail));
+        } else if app.packages.is_some() {
+            packages::draw(frame, app, list.union(detail));
         } else if app.files.is_some() {
             files::draw(frame, app, list.union(detail));
         } else if app.picker.is_some() {
