@@ -1008,7 +1008,14 @@ impl App {
                 None
             }
         };
-        let mut view = PackageView::new(history, worker);
+        // 偏好（默认仓库 / 演练模式 / 保留版本 / 排序 / 模式）。
+        // 文件不在或写坏了都用默认值，并把问题挂在状态行上 —— 一个手改错的
+        // 配置文件不该让工具打不开。
+        let loaded = crate::config::load_packages();
+        if let Some(problem) = loaded.problem.clone() {
+            self.message = problem;
+        }
+        let mut view = PackageView::new(history, worker, loaded.value);
         // 上次没装完的队列还能接着装
         let queue = packages::load_queue_from(&packages::queue_path());
         if !queue.is_empty() {
@@ -1053,9 +1060,13 @@ impl App {
         }
     }
 
-    /// `C`：清缓存的确认面板（保留几个版本由 `keep` 决定，`[` `]` 可当场调）。
-    pub fn arm_cache(&mut self, keep: u8) {
+    /// `c`：清缓存的确认面板。
+    ///
+    /// 保留几个版本默认来自 `packages.toml`（`cache_keep`），确认面板里 `[` `]`
+    /// 还能当场改这一次的。
+    pub fn arm_cache(&mut self) {
         if let Some(view) = self.packages.as_mut() {
+            let keep = view.cache_keep;
             view.arm_cache(keep);
         }
     }

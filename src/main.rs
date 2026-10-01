@@ -12,6 +12,7 @@
 
 mod app;
 mod cli;
+mod config;
 mod history;
 mod media;
 mod model;
@@ -43,6 +44,8 @@ use crate::{app::App, registry::Registry};
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_panic_hook();
+
     // 先看这次是「命令行模式」还是「进 TUI」：带动作参数时干完就退，
     // 一个终端都不进（`toolbox-hub -s fzf | head` 要能在管道里安静地跑）。
     let invocation = match cli::parse(env::args().skip(1)) {
@@ -53,8 +56,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let bin_dir = match invocation {
-        cli::Invocation::Tui { bin_dir } => resolve_bin_dir(bin_dir),
+        cli::Invocation::Tui { bin_dir, dirs } => {
+            // 目录必须在**任何人读路径之前**定下来（state / tools.d / 队列都在后面读）
+            config::configure(dirs.config, dirs.data);
+            // 第一次跑就写一份带注释的 packages.toml —— 不写的话没人知道有它
+            config::ensure_packages_template();
+            resolve_bin_dir(bin_dir)
+        }
         cli::Invocation::Command(options) => {
+            config::configure(options.dirs.config.clone(), options.dirs.data.clone());
             if let Err(error) = cli::run(&options) {
                 eprintln!("toolbox-hub: {error}");
                 std::process::exit(1);

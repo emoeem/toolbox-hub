@@ -15,10 +15,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::packages::{
-    self, InstalledFilter, InstalledPackage, NewsFilter, NewsItem, PackageHit, QueuedPackage,
-    SortMode, fuzzy_score,
-    worker::{Response, Worker},
+use crate::{
+    config::PackagePrefs,
+    packages::{
+        self, InstalledFilter, InstalledPackage, NewsFilter, NewsItem, PackageHit, QueuedPackage,
+        SortMode, fuzzy_score,
+        worker::{Response, Worker},
+    },
 };
 
 /// 队列要执行的操作（真身定义在 [`crate::packages`]，命令行模式也要用；
@@ -178,6 +181,12 @@ pub struct PackageView {
     // ── 确认面板 ──
     pub confirm: Option<Confirm>,
 
+    // ── 配置文件带来的偏好 ──
+    /// `c` 清缓存时保留几个版本（`[` `]` 可以当场改这一次的）。
+    pub cache_keep: u8,
+    /// 默认只显示这些仓库（空 = 全看）。
+    wanted_repos: Vec<String>,
+
     // ── 历史 ──
     pub history: Vec<String>,
     history_index: Option<usize>,
@@ -194,11 +203,11 @@ pub struct PackageView {
 }
 
 impl PackageView {
-    pub fn new(history: Vec<String>, worker: Option<Worker>) -> Self {
+    pub fn new(history: Vec<String>, worker: Option<Worker>, prefs: PackagePrefs) -> Self {
         let mut view = Self {
             mode: PackageMode::Search,
             pane: Pane::Rows,
-            dry_run: false,
+            dry_run: prefs.dry_run,
             operation: PackageOperation::Install,
             message: String::new(),
             query: TextInput::new(),
@@ -234,6 +243,8 @@ impl PackageView {
             queue: Vec::new(),
             queue_selected: 0,
             confirm: None,
+            cache_keep: prefs.cache_keep(),
+            wanted_repos: prefs.repos.clone(),
             history,
             history_index: None,
             worker,
@@ -243,6 +254,11 @@ impl PackageView {
             awaiting_aur: false,
         };
         view.read_news = packages::load_read_news(&packages::read_news_path());
+        view.sort = prefs.sort();
+        view.wanted_repos = prefs.repos.clone();
+        if let Some(mode) = prefs.mode() {
+            view.mode = mode;
+        }
         view
     }
 
@@ -616,12 +632,15 @@ impl PackageView {
                 chip.count += 1;
                 continue;
             }
-            // 之前关掉的仓库保持关着（刷新结果不该把筛选重置）
+            // 之前关掉的仓库保持关着（刷新结果不该把筛选重置）；
+            // 第一次见到的仓库看配置：`packages.toml` 里列了名单就只开名单里的。
             let enabled = previous
                 .iter()
                 .find(|chip| chip.name == hit.repo)
                 .map(|chip| chip.enabled)
-                .unwrap_or(true);
+                .unwrap_or_else(|| {
+                    self.wanted_repos.is_empty() || self.wanted_repos.contains(&hit.repo)
+                });
             repos.push(RepoChip {
                 name: hit.repo.clone(),
                 enabled,
@@ -1450,7 +1469,7 @@ mod tests {
     }
 
     fn view_with(hits: Vec<PackageHit>) -> PackageView {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         view.hits = hits;
         view.rebuild_repos();
         view.apply_filter();
@@ -1553,7 +1572,7 @@ mod tests {
 
     #[test]
     fn package_operation_cycles_through_install_remove_download() {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         assert_eq!(view.operation, PackageOperation::Install);
         view.cycle_operation();
         assert_eq!(view.operation, PackageOperation::Remove);
@@ -1577,7 +1596,7 @@ mod tests {
         view.export_queue(&path);
         assert!(path.exists());
 
-        let mut other = PackageView::new(Vec::new(), None);
+        let mut other = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         other.import_queue(&path);
         assert_eq!(other.queue, view.queue, "导出再导入要一样");
 
@@ -1590,7 +1609,7 @@ mod tests {
     /// 已安装模式的四个筛选 + 排队卸载会自动把操作切成「卸载」。
     #[test]
     fn installed_filters_and_queue_switch_to_remove() {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         view.installed = vec![
             installed("bash", true, false, false),
             installed("readline", false, false, false),
@@ -1668,7 +1687,7 @@ mod tests {
     /// 卸载的确认面板会挂上「谁依赖它们」的分析（这里只验证流程，不跑 pacman）。
     #[test]
     fn removal_confirm_waits_for_the_impact_report() {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         view.queue.push(QueuedPackage {
             name: String::from("bash"),
             origin: String::from("core"),
@@ -1688,7 +1707,7 @@ mod tests {
     /// 新闻：未读/已读筛选跟着已读集合走，且标记会落盘。
     #[test]
     fn news_read_state_drives_the_filter() {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         // 直接摆状态，不走 set_mode（那会真的去抓一次新闻）
         view.mode = PackageMode::News;
         view.news = vec![
@@ -1732,7 +1751,7 @@ mod tests {
     /// 三种模式共用一个输入框：输入即筛，在哪一屏都成立。
     #[test]
     fn the_search_box_filters_whichever_mode_you_are_in() {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         view.installed = vec![
             installed("bash", true, false, false),
             installed("readline", false, false, false),
@@ -1786,7 +1805,7 @@ mod tests {
     /// 模式标签：搜索/已安装/新闻都能切，且切过去会自动带上该有的数据。
     #[test]
     fn mode_tabs_cycle() {
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         assert_eq!(view.mode, PackageMode::Search);
         view.cycle_mode();
         assert_eq!(view.mode, PackageMode::Installed);

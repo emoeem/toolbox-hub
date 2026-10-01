@@ -216,7 +216,7 @@ pub fn ago(epoch: u64) -> String {
     }
 }
 
-/// 数据目录：`$TOOLBOX_HUB_DATA` > `~/.local/share/toolbox-hub`。
+/// 数据目录：`$TOOLBOX_HUB_DATA` > `<数据目录>`（见 [`crate::config`]）。
 pub fn data_dir() -> PathBuf {
     if let Some(raw) = env::var_os(DATA_ENV) {
         return PathBuf::from(raw);

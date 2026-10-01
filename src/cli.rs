@@ -41,11 +41,22 @@ pub enum Action {
     Version,
 }
 
+/// 目录覆盖（`--config-dir` / `--data-dir`）。
+///
+/// 两个分开是有意的：配置（收藏、你自己的 manifest 与脚本、包中心偏好）是换机器要
+/// 带走的东西；数据（历史、队列、已读新闻）是可再生的。`--config-dir` 只挪前者。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dirs {
+    pub config: Option<PathBuf>,
+    pub data: Option<PathBuf>,
+}
+
 /// 命令行调用的全部参数。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// 只打印将要执行的命令，不动系统。
     pub dry_run: bool,
+    pub dirs: Dirs,
     pub action: Action,
 }
 
@@ -53,7 +64,10 @@ pub struct Options {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Invocation {
     /// 没有动作参数：进 TUI（可选一个脚本目录）。
-    Tui { bin_dir: Option<PathBuf> },
+    Tui {
+        bin_dir: Option<PathBuf>,
+        dirs: Dirs,
+    },
     /// 有动作参数：干完就退。
     Command(Options),
 }
@@ -69,6 +83,7 @@ where
     let mut action: Option<Action> = None;
     let mut dry_run = false;
     let mut bin_dir: Option<PathBuf> = None;
+    let mut dirs = Dirs::default();
     let mut news_scope: Option<NewsFilter> = None;
     let mut list_scope: Option<InstalledFilter> = None;
 
@@ -76,8 +91,10 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
-            "-h" | "--help" => return Ok(command(dry_run, Action::Help)),
-            "-V" | "--version" => return Ok(command(dry_run, Action::Version)),
+            "--config-dir" => dirs.config = Some(PathBuf::from(one_value(&mut args, &arg)?)),
+            "--data-dir" => dirs.data = Some(PathBuf::from(one_value(&mut args, &arg)?)),
+            "-h" | "--help" => return Ok(command(dry_run, dirs, Action::Help)),
+            "-V" | "--version" => return Ok(command(dry_run, dirs, Action::Version)),
 
             "-s" | "--search" => {
                 let term = one_value(&mut args, &arg)?;
@@ -122,7 +139,7 @@ where
     }
 
     let Some(mut chosen) = action else {
-        return Ok(Invocation::Tui { bin_dir });
+        return Ok(Invocation::Tui { bin_dir, dirs });
     };
 
     // 范围参数搭在动作上：`--unread` 只对 `-n` 有意义，`--exp` 只对 `-l` 有意义。
@@ -145,12 +162,17 @@ where
 
     Ok(Invocation::Command(Options {
         dry_run,
+        dirs,
         action: chosen,
     }))
 }
 
-fn command(dry_run: bool, action: Action) -> Invocation {
-    Invocation::Command(Options { dry_run, action })
+fn command(dry_run: bool, dirs: Dirs, action: Action) -> Invocation {
+    Invocation::Command(Options {
+        dry_run,
+        dirs,
+        action,
+    })
 }
 
 /// 一次只能有一个动作参数（`-s` 和 `-i` 同时给是打错了，不是「先搜再装」）。
@@ -260,6 +282,10 @@ Toolbox Hub —— Linux CLI 工具箱（TUI + 命令行两用）
 
 通用:
       --dry-run              只打印将要执行的命令，不动系统
+      --config-dir <目录>    配置目录（state.toml / tools.d / packages.toml）
+                             默认 ~/.config/toolbox-hub，也可用 TOOLBOX_HUB_CONFIG
+      --data-dir <目录>      数据目录（历史 / 队列 / 已读新闻）
+                             默认 ~/.local/share/toolbox-hub，也可用 TOOLBOX_HUB_DATA
   -h, --help                 显示这份帮助
   -V, --version              显示版本
 
@@ -464,14 +490,44 @@ mod tests {
 
     #[test]
     fn no_arguments_means_tui() {
-        assert_eq!(parse_args(&[]), Invocation::Tui { bin_dir: None });
+        assert_eq!(
+            parse_args(&[]),
+            Invocation::Tui {
+                bin_dir: None,
+                dirs: Dirs::default()
+            }
+        );
         // 老语义还在：位置参数就是脚本目录
         assert_eq!(
             parse_args(&["/tmp/scripts"]),
             Invocation::Tui {
-                bin_dir: Some(PathBuf::from("/tmp/scripts"))
+                bin_dir: Some(PathBuf::from("/tmp/scripts")),
+                dirs: Dirs::default()
             }
         );
+    }
+
+    /// 两个目录参数对「进 TUI」和「干完就退」两种模式都生效。
+    #[test]
+    fn directories_can_be_overridden() {
+        let dirs = Dirs {
+            config: Some(PathBuf::from("/tmp/cfg")),
+            data: Some(PathBuf::from("/tmp/data")),
+        };
+        assert_eq!(
+            parse_args(&["--config-dir", "/tmp/cfg", "--data-dir", "/tmp/data"]),
+            Invocation::Tui {
+                bin_dir: None,
+                dirs: dirs.clone()
+            }
+        );
+        match parse_args(&["--config-dir", "/tmp/cfg", "-l"]) {
+            Invocation::Command(options) => {
+                assert_eq!(options.dirs.config, Some(PathBuf::from("/tmp/cfg")));
+                assert_eq!(options.action, Action::List(InstalledFilter::All));
+            }
+            other => panic!("期望是个动作：{other:?}"),
+        }
     }
 
     #[test]

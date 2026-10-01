@@ -335,7 +335,7 @@ mod tests {
         use crate::packages::QueuedPackage;
 
         let mut app = app();
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         view.mode = PackageMode::Search;
         view.query.set("fzf");
         view.hits = vec![
@@ -467,7 +467,7 @@ mod tests {
         use crate::app::{handle_paste, package_view::PackageView};
 
         let mut app = app();
-        let mut view = PackageView::new(Vec::new(), None);
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         view.editing = true;
         app.packages = Some(view);
 

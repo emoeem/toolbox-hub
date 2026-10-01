@@ -1008,13 +1008,12 @@ pub fn save_read_news(path: &Path, read: &BTreeSet<String>) -> std::io::Result<(
     fs::write(path, body)
 }
 
-/// 数据文件放哪儿（队列、搜索历史）。
+/// 数据文件放哪儿（队列、搜索历史、已读新闻）。
+///
+/// 由 [`crate::config`] 统一定：`--data-dir` > `TOOLBOX_HUB_DATA` >
+/// `~/.local/share/toolbox-hub`。
 pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("TOOLBOX_HUB_DATA") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".local/share/toolbox-hub")
+    crate::config::data_dir()
 }
 
 pub fn queue_path() -> PathBuf {

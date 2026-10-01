@@ -73,15 +73,15 @@ impl State {
     }
 }
 
-/// 状态文件位置：`$TOOLBOX_HUB_STATE` > `~/.config/toolbox-hub/state.toml`。
+/// 状态文件位置：`$TOOLBOX_HUB_STATE` > `<配置目录>/state.toml`。
+///
+/// 配置目录由 [`crate::config`] 统一定（`--config-dir` > `TOOLBOX_HUB_CONFIG` >
+/// `~/.config/toolbox-hub`），这里不再自己拼。
 pub fn path() -> PathBuf {
     if let Some(raw) = env::var_os(STATE_ENV) {
         return PathBuf::from(raw);
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/toolbox-hub/state.toml")
+    crate::config::config_dir().join("state.toml")
 }
 
 pub fn load() -> State {

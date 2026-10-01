@@ -31,7 +31,7 @@ use crate::{
 pub const DIRS_ENV: &str = "TOOLBOX_HUB_MANIFEST_PATH";
 
 /// 用户放 manifest 的地方（相对 `$HOME`）。
-pub const USER_DIR: &str = ".config/toolbox-hub/tools.d";
+pub const USER_DIR: &str = "tools.d";
 
 const PROVIDER_ID: &str = "manifest";
 const PROVIDER_LABEL: &str = "Manifest";
@@ -85,7 +85,7 @@ impl ManifestProvider {
         }
         Self::new(
             std::env::var_os("HOME")
-                .map(|home| vec![PathBuf::from(home).join(USER_DIR)])
+                .map(|_| vec![crate::config::config_dir().join(USER_DIR)])
                 .unwrap_or_default(),
         )
     }

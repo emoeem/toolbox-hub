@@ -24,8 +24,8 @@ use crate::{
 /// 覆盖扫描根的环境变量，冒号分隔（与 `PATH` 同构）。
 pub const ROOTS_ENV: &str = "TOOLBOX_HUB_PATH";
 
-/// 用户自己放注解脚本的地方（相对 `$HOME`）。
-pub const USER_TOOLS_DIR: &str = ".config/toolbox-hub/tools";
+/// 用户自己放注解脚本的地方（相对**配置目录**）。
+pub const USER_TOOLS_DIR: &str = "tools";
 
 /// 扫描若干目录，收录带注解的脚本。
 pub struct ScriptedProvider {
@@ -54,8 +54,9 @@ impl ScriptedProvider {
         let mut roots = vec![bin_dir.to_path_buf()];
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             roots.push(home.join("bin"));
-            roots.push(home.join(USER_TOOLS_DIR));
         }
+        // 用户脚本目录跟着配置目录走（`--config-dir` 能把它一起挪走）
+        roots.push(crate::config::config_dir().join(USER_TOOLS_DIR));
         roots.push(PathBuf::from("/usr/local/bin"));
         Self::new(roots)
     }

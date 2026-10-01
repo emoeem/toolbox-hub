@@ -100,7 +100,34 @@ foreach = "input"                          # 每个输入各跑一次
 
 环境变量（都可选）：`TOOLBOX_HUB_PATH`（脚本目录）、`TOOLBOX_HUB_MANIFEST_PATH`（manifest 目录）、
 `TOOLBOX_HUB_WORKDIR`（启动工作目录）、`TOOLBOX_HUB_FILE_MANAGER`（默认 `yazi`）、
-`TOOLBOX_HUB_DATA`、`TOOLBOX_HUB_STATE`。
+`TOOLBOX_HUB_CONFIG`（配置目录）、`TOOLBOX_HUB_DATA`（数据目录）、`TOOLBOX_HUB_STATE`（状态文件）。
+
+## 配置：两个目录，别混
+
+| 目录 | 放什么 | 默认 | 怎么覆盖 |
+| --- | --- | --- | --- |
+| **配置** | `state.toml`（收藏）、`tools.d/`（你的 manifest）、`tools/`（你的脚本）、`packages.toml` | `~/.config/toolbox-hub` | `--config-dir DIR` > `TOOLBOX_HUB_CONFIG` |
+| **数据** | 执行历史、安装队列、搜索历史、已读新闻、输出留存 | `~/.local/share/toolbox-hub` | `--data-dir DIR` > `TOOLBOX_HUB_DATA` |
+
+分开是因为：配置是换机器要**带走**的，数据是可再生的。想让整套都进一个目录
+（比如塞进 U 盘随身带），两个参数都给：
+
+```bash
+toolbox-hub --config-dir /run/media/u/tbh/config --data-dir /run/media/u/tbh/data
+```
+
+`packages.toml` 管软件包中心的默认值，**第一次进 TUI 时会自动写一份带注释的模板**：
+
+```toml
+repos = []          # 默认只看这些仓库（空 = 全看），名字就是 pacman.conf 的段名
+dry_run = false     # 打开就进「演练模式」
+cache_keep = 1      # 清缓存时每个包留几个版本（界面里 [ ] 还能当场改）
+sort = "相关度"      # 相关度 / 名字 / 仓库 / 得票 / 版本
+mode = "搜索"        # 打开时停在哪个模式：搜索 / 已安装 / 新闻 / 维护
+```
+
+写错了不会崩：不认识的排序/模式回落到默认，拼错的字段名会在状态行里报出来
+（那是最坏的情况——你以为配上了，其实没有）。
 
 ## 软件包中心（`p`）
 

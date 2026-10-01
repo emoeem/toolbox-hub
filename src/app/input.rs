@@ -856,7 +856,10 @@ fn handle_packages_key(
                     } else {
                         (keep + 1).min(9)
                     };
-                    app.arm_cache(next);
+                    if let Some(view) = app.packages.as_mut() {
+                        view.cache_keep = next;
+                    }
+                    app.arm_cache();
                 }
             }
             _ => {}
@@ -1102,7 +1105,7 @@ fn handle_packages_key(
             }
         }
         KeyCode::Char('U') if !ctrl && !editing => app.arm_upgrade(),
-        KeyCode::Char('c') if !ctrl && !editing => app.arm_cache(1),
+        KeyCode::Char('c') if !ctrl && !editing => app.arm_cache(),
         KeyCode::Char('O') if !ctrl && !editing => app.arm_orphans(),
         KeyCode::Char('D') if !ctrl && !editing => {
             if let Some(view) = app.packages.as_mut() {
