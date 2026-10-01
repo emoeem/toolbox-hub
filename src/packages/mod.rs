@@ -15,6 +15,7 @@
 
 pub mod libalpm;
 pub mod probe;
+pub mod worker;
 
 use std::{
     collections::BTreeSet,
@@ -206,9 +207,14 @@ struct AurResponse {
     results: Vec<AurPackage>,
 }
 
-#[derive(serde::Deserialize)]
+/// AUR RPC 返回的一个包。
+///
+/// **整个结构都留着**，不只在搜索时拧成一条 [`PackageHit`]：信息面板要的
+/// Depends / License / Provides / Keywords / 得票 …… 全都在这个响应里，
+/// 留着它，选中 AUR 结果时就**不需要再发一次 RPC**（那是又一次冷握手的钱）。
+#[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct AurPackage {
+pub struct AurPackage {
     name: String,
     #[serde(default)]
     version: String,
@@ -252,121 +258,137 @@ struct AurPackage {
     url_path: Option<String>,
 }
 
-fn aur_hit(package: AurPackage) -> PackageHit {
-    PackageHit {
-        repo: String::from("aur"),
-        name: package.name,
-        version: package.version,
-        description: package.description.unwrap_or_default(),
-        // AUR 的回答里没有「本地装没装」，由调用方查本地库补上
-        installed_state: InstalledState::NotInstalled,
-        votes: Some(package.num_votes),
-        popularity: Some(package.popularity),
-        maintainer: package.maintainer,
-        out_of_date: package.out_of_date.is_some(),
+impl AurPackage {
+    /// 搜索结果表里的一行。
+    ///
+    /// 「本地装没装」AUR 不知道，由调用方拿本地库补上
+    /// （[`crate::packages::probe::Net::search_aur`] 会做这件事）。
+    pub fn hit(&self) -> PackageHit {
+        PackageHit {
+            repo: String::from("aur"),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            description: self.description.clone().unwrap_or_default(),
+            installed_state: InstalledState::NotInstalled,
+            votes: Some(self.num_votes),
+            popularity: Some(self.popularity),
+            maintainer: self.maintainer.clone(),
+            out_of_date: self.out_of_date.is_some(),
+        }
     }
 }
 
-/// 解析 AUR 搜索的 JSON。
-pub fn parse_aur_search(json: &str) -> Result<Vec<PackageHit>, String> {
+/// 解析 AUR 搜索的 JSON：**把整个响应留着**，不急着拧成 `PackageHit`。
+pub fn parse_aur_search(json: &str) -> Result<Vec<AurPackage>, String> {
     let response: AurResponse =
         serde_json::from_str(json).map_err(|error| format!("AUR 返回的不是预期 JSON：{error}"))?;
-    Ok(response.results.into_iter().map(aur_hit).collect())
+    Ok(response.results)
 }
 
-/// 把 AUR 的包信息整理成和 `pacman -Sii` 一样的面板字段（顺序照着 pacsea 排）。
-pub fn parse_aur_info(json: &str) -> Result<Vec<(String, String)>, String> {
+/// 解析 AUR `info` 的 JSON（拿不到包就报错）。
+pub fn parse_aur_one(json: &str) -> Result<AurPackage, String> {
     let response: AurResponse =
         serde_json::from_str(json).map_err(|error| format!("AUR 返回的不是预期 JSON：{error}"))?;
-    let Some(package) = response.results.into_iter().next() else {
-        return Err(String::from("AUR 里没有这个包"));
-    };
+    response
+        .results
+        .into_iter()
+        .next()
+        .ok_or_else(|| String::from("AUR 里没有这个包"))
+}
 
-    let list = |items: Option<Vec<String>>| match items {
-        Some(items) if !items.is_empty() => items.join("  "),
-        _ => String::from("None"),
-    };
-    let time = |stamp: Option<u64>| {
-        stamp
-            .map(format_epoch)
-            .unwrap_or_else(|| String::from("None"))
-    };
-
-    let mut fields = vec![
-        (String::from("Repository"), String::from("aur")),
-        (String::from("Name"), package.name.clone()),
-        (String::from("Version"), package.version.clone()),
-        (
-            String::from("Description"),
-            package.description.clone().unwrap_or_default(),
-        ),
-        (String::from("URL"), package.url.clone().unwrap_or_default()),
-        (String::from("Licenses"), list(package.license.clone())),
-        (
-            String::from("Maintainer"),
-            package
-                .maintainer
-                .clone()
-                .unwrap_or_else(|| String::from("无（孤儿包）")),
-        ),
-        (
-            String::from("Submitter"),
-            package.submitter.clone().unwrap_or_default(),
-        ),
-        (String::from("Votes"), package.num_votes.to_string()),
-        (
-            String::from("Popularity"),
-            format!("{:.2}", package.popularity),
-        ),
-        (
-            String::from("Out of Date"),
-            package
-                .out_of_date
+impl AurPackage {
+    /// 整理成和官方源同一套的信息面板字段（顺序照着 paru / pacsea 排）。
+    ///
+    /// 关键在于它**不需要联网**：这些字段早就在搜索响应里了。
+    pub fn info_fields(&self) -> Vec<(String, String)> {
+        let package = self;
+        let list = |items: Option<Vec<String>>| match items {
+            Some(items) if !items.is_empty() => items.join("  "),
+            _ => String::from("None"),
+        };
+        let time = |stamp: Option<u64>| {
+            stamp
                 .map(format_epoch)
-                .unwrap_or_else(|| String::from("No")),
-        ),
-        (String::from("Depends On"), list(package.depends.clone())),
-        (
-            String::from("Make Deps"),
-            list(package.make_depends.clone()),
-        ),
-        (
-            String::from("Check Deps"),
-            list(package.check_depends.clone()),
-        ),
-        (
-            String::from("Optional Deps"),
-            list(package.opt_depends.clone()),
-        ),
-        (String::from("Provides"), list(package.provides.clone())),
-        (
-            String::from("Conflicts With"),
-            list(package.conflicts.clone()),
-        ),
-        (String::from("Keywords"), list(package.keywords.clone())),
-        (
-            String::from("Package Base"),
-            package.package_base.clone().unwrap_or_default(),
-        ),
-        (
-            String::from("AUR URL"),
-            format!("https://aur.archlinux.org/packages/{}", package.name),
-        ),
-        (
-            String::from("Snapshot"),
-            package
-                .url_path
-                .map(|path| format!("https://aur.archlinux.org{path}"))
-                .unwrap_or_default(),
-        ),
-        (
-            String::from("First Submitted"),
-            time(package.first_submitted),
-        ),
-        (String::from("Last Modified"), time(package.last_modified)),
-    ];
-    fields.retain(|(_, value)| !value.is_empty());
-    Ok(fields)
+                .unwrap_or_else(|| String::from("None"))
+        };
+
+        let mut fields = vec![
+            (String::from("Repository"), String::from("aur")),
+            (String::from("Name"), package.name.clone()),
+            (String::from("Version"), package.version.clone()),
+            (
+                String::from("Description"),
+                package.description.clone().unwrap_or_default(),
+            ),
+            (String::from("URL"), package.url.clone().unwrap_or_default()),
+            (String::from("Licenses"), list(package.license.clone())),
+            (
+                String::from("Maintainer"),
+                package
+                    .maintainer
+                    .clone()
+                    .unwrap_or_else(|| String::from("无（孤儿包）")),
+            ),
+            (
+                String::from("Submitter"),
+                package.submitter.clone().unwrap_or_default(),
+            ),
+            (String::from("Votes"), package.num_votes.to_string()),
+            (
+                String::from("Popularity"),
+                format!("{:.2}", package.popularity),
+            ),
+            (
+                String::from("Out of Date"),
+                package
+                    .out_of_date
+                    .map(format_epoch)
+                    .unwrap_or_else(|| String::from("No")),
+            ),
+            (String::from("Depends On"), list(package.depends.clone())),
+            (
+                String::from("Make Deps"),
+                list(package.make_depends.clone()),
+            ),
+            (
+                String::from("Check Deps"),
+                list(package.check_depends.clone()),
+            ),
+            (
+                String::from("Optional Deps"),
+                list(package.opt_depends.clone()),
+            ),
+            (String::from("Provides"), list(package.provides.clone())),
+            (
+                String::from("Conflicts With"),
+                list(package.conflicts.clone()),
+            ),
+            (String::from("Keywords"), list(package.keywords.clone())),
+            (
+                String::from("Package Base"),
+                package.package_base.clone().unwrap_or_default(),
+            ),
+            (
+                String::from("AUR URL"),
+                format!("https://aur.archlinux.org/packages/{}", package.name),
+            ),
+            (
+                String::from("Snapshot"),
+                package
+                    .url_path
+                    .clone()
+                    .map(|path| format!("https://aur.archlinux.org{path}"))
+                    .unwrap_or_default(),
+            ),
+            (
+                String::from("First Submitted"),
+                time(package.first_submitted),
+            ),
+            (String::from("Last Modified"), time(package.last_modified)),
+        ];
+        fields.retain(|(_, value)| !value.is_empty());
+        fields
+    }
 }
 
 /// `1712345678` → `2024-04-05 22:01 UTC`（不引日期库，自己算；**刻意用 UTC 并写明**，
@@ -1038,11 +1060,15 @@ mod tests {
         assert_eq!(PackageOperation::Download.next(), PackageOperation::Install);
     }
 
+    /// 搜索响应留的是整个 [`AurPackage`]，转成结果行是它自己的事
+    /// —— 这样信息面板就不用为了几个字段再发一次请求。
     #[test]
-    fn aur_search_json_becomes_hits() {
-        let hits = parse_aur_search(AUR_SEARCH).expect("应能解析");
-        assert_eq!(hits.len(), 1);
-        let hit = &hits[0];
+    fn aur_search_json_becomes_packages_and_hits() {
+        let packages = parse_aur_search(AUR_SEARCH).expect("应能解析");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "pacsea-bin");
+
+        let hit = packages[0].hit();
         assert_eq!(hit.repo, "aur");
         assert_eq!(hit.name, "pacsea-bin");
         assert_eq!(hit.version, "0.8.2-2");
@@ -1051,6 +1077,11 @@ mod tests {
         assert_eq!(hit.maintainer.as_deref(), Some("Firstpick"));
         assert!(!hit.out_of_date, "OutOfDate 是 null 就是没过期");
         assert!(hit.is_aur());
+
+        // 同一个对象就能拼出信息面板：这一条是「看 AUR 信息不再联网」的根据
+        let fields = packages[0].info_fields();
+        assert!(fields.iter().any(|(key, _)| key == "Votes"));
+        assert!(fields.iter().any(|(key, _)| key == "Depends On"));
     }
 
     #[test]
@@ -1062,7 +1093,7 @@ mod tests {
     #[test]
     fn aur_info_lines_up_with_the_official_panel() {
         let json = r#"{"resultcount":1,"results":[{"Conflicts":["pacsea"],"Depends":["pacman","curl"],"Description":"Fast TUI","FirstSubmitted":1759428378,"Keywords":["tui","pacman"],"LastModified":1784573962,"License":["MIT"],"Maintainer":"Firstpick","Name":"pacsea-bin","NumVotes":5,"OptDepends":["paru: 装包用"],"OutOfDate":null,"PackageBase":"pacsea-bin","Popularity":0.093482,"Provides":["pacsea"],"URL":"https://example.com","URLPath":"/cgit/aur.git/snapshot/pacsea-bin.tar.gz","Version":"0.8.2-2"}]}"#;
-        let fields = parse_aur_info(json).expect("应能解析");
+        let fields = parse_aur_one(json).expect("应能解析").info_fields();
         let get = |key: &str| {
             fields
                 .iter()

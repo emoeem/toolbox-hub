@@ -335,7 +335,7 @@ mod tests {
         use crate::packages::QueuedPackage;
 
         let mut app = app();
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         view.mode = PackageMode::Search;
         view.query = String::from("fzf");
         view.hits = vec![

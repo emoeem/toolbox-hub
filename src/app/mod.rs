@@ -995,7 +995,16 @@ impl App {
     /// 按 `p`：打开原生包管理（搜索 / 信息 / 排队 / 安装）。
     pub fn open_packages(&mut self) {
         let history = packages::load_searches_from(&packages::searches_path());
-        let mut view = PackageView::new(history);
+        // 常驻取数线程：libalpm 句柄与 HTTP 连接都活在它里面（见 packages::worker）。
+        // 起不来也把界面打开 —— 每块面板会自己说明「取数线程没起来」。
+        let worker = match packages::worker::Worker::start() {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                self.message = format!("包管理取数线程起不来：{error}");
+                None
+            }
+        };
+        let mut view = PackageView::new(history, worker);
         // 上次没装完的队列还能接着装
         let queue = packages::load_queue_from(&packages::queue_path());
         if !queue.is_empty() {

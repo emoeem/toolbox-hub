@@ -12,30 +12,17 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    thread,
 };
 
 use crate::packages::{
     self, InstalledFilter, InstalledPackage, NewsFilter, NewsItem, PackageHit, QueuedPackage,
-    SortMode, fuzzy_score, probe,
+    SortMode, fuzzy_score,
+    worker::{Response, Worker},
 };
 
 /// 队列要执行的操作（真身定义在 [`crate::packages`]，命令行模式也要用；
 /// 这里再导一次是为了让 UI 那层能用 `package_view::PackageOperation` 这个老路径）。
 pub use crate::packages::PackageOperation;
-
-/// 新闻线程回来的东西：条目 + 「升级后发布」的条数 + 待更新数。
-struct NewsOutcome {
-    items: Vec<NewsItem>,
-    after_upgrade: usize,
-    /// 最后一次全系统升级的时间点（给列表打「★ 升级后发布」用的）。
-    mark: Option<u64>,
-    pending_updates: Option<usize>,
-    /// 本地同步库多久没同步了（秒）——「待更新」是按它算的，旧了要说明。
-    sync_age: Option<u64>,
-    error: Option<String>,
-}
 
 /// 结果区的行高上限：再多的行也滚不到底，但滚动位置要有个界。
 const MAX_INFO_SCROLL: usize = 400;
@@ -195,16 +182,18 @@ pub struct PackageView {
     history_index: Option<usize>,
 
     // ── 在飞的请求 ──
-    search_rx: Option<Receiver<probe::SearchOutcome>>,
-    info_rx: Option<Receiver<probe::InfoOutcome>>,
-    news_rx: Option<Receiver<NewsOutcome>>,
-    installed_rx: Option<Receiver<Result<Vec<InstalledPackage>, String>>>,
-    orphans_rx: Option<Receiver<Vec<String>>>,
-    confirm_rx: Option<Receiver<Vec<String>>>,
+    /// 常驻取数线程（libalpm 句柄 + HTTP 连接都活在里面，见 `packages::worker`）。
+    worker: Option<Worker>,
+    /// 官方源的命中（与 AUR 分开存：两路各回各的，谁先到谁先上屏）。
+    official_hits: Vec<PackageHit>,
+    aur_hits: Vec<PackageHit>,
+    /// 还在等哪一路（官方源 / AUR）。
+    awaiting_official: bool,
+    awaiting_aur: bool,
 }
 
 impl PackageView {
-    pub fn new(history: Vec<String>) -> Self {
+    pub fn new(history: Vec<String>, worker: Option<Worker>) -> Self {
         let mut view = Self {
             mode: PackageMode::Search,
             pane: Pane::Rows,
@@ -246,12 +235,11 @@ impl PackageView {
             confirm: None,
             history,
             history_index: None,
-            search_rx: None,
-            info_rx: None,
-            news_rx: None,
-            installed_rx: None,
-            orphans_rx: None,
-            confirm_rx: None,
+            worker,
+            official_hits: Vec::new(),
+            aur_hits: Vec::new(),
+            awaiting_official: false,
+            awaiting_aur: false,
         };
         view.read_news = packages::load_read_news(&packages::read_news_path());
         view
@@ -288,20 +276,27 @@ impl PackageView {
     }
 
     fn ensure_news(&mut self) {
-        if self.news.is_empty() && self.news_rx.is_none() {
+        if self.news.is_empty() {
             self.start_news();
         }
     }
 
     // ── 搜索 ─────────────────────────────────────────────────────────────
 
-    /// 发起一次搜索（官方源 + AUR 都在后台线程里取）。
+    /// 发起一次搜索：官方源与 AUR **各回各的**，谁先回来谁先上屏。
+    ///
+    /// 之前是「两路都回来才算数」，于是官方源 0.45 秒就有结果，你却要盯着
+    /// 「搜索中…」等 AUR 那十几秒。现在官方源一到就显示，AUR 到了再补进来。
     pub fn start_search(&mut self) {
         let term = self.query.trim().to_string();
         if term.is_empty() {
             self.message = String::from("先填个搜索词");
             return;
         }
+        let Some(worker) = self.worker.as_ref() else {
+            self.message = String::from("取数线程没起来，搜不了");
+            return;
+        };
         if self.searching {
             return;
         }
@@ -310,6 +305,8 @@ impl PackageView {
         let _ = packages::save_searches_to(&packages::searches_path(), &self.history);
 
         self.searching = true;
+        self.awaiting_official = true;
+        self.awaiting_aur = true;
         self.searched = Some(term.clone());
         self.editing = false;
         self.history_index = None;
@@ -317,21 +314,14 @@ impl PackageView {
         self.errors.clear();
         self.info = None;
         self.info_pending = None;
-        self.message = String::from("搜索中…（官方源 + AUR 两路并行）");
+        self.official_hits.clear();
+        self.aur_hits.clear();
+        self.hits.clear();
+        self.visible.clear();
+        self.selected = 0;
+        self.message = format!("搜「{term}」…（官方源 + AUR 两路并行，先到的先显示）");
 
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name(String::from("pkg-search"))
-            .spawn(move || {
-                let _ = tx.send(probe::search(&term));
-            });
-        match spawned {
-            Ok(_) => self.search_rx = Some(rx),
-            Err(error) => {
-                self.searching = false;
-                self.message = format!("开不了搜索线程：{error}");
-            }
-        }
+        worker.search(&term);
     }
 
     /// 已安装包浏览器：`pacman -Q/-Qe/-Qm/-Qtd`（都是本地查询，很快）。
@@ -339,108 +329,72 @@ impl PackageView {
         if self.installed_loading {
             return;
         }
+        let Some(worker) = self.worker.as_ref() else {
+            self.message = String::from("取数线程没起来，读不了已安装列表");
+            return;
+        };
         self.installed_loading = true;
         self.message = String::from("正在读已安装的包…");
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name(String::from("pkg-installed"))
-            .spawn(move || {
-                let _ = tx.send(probe::installed_packages());
-            });
-        match spawned {
-            Ok(_) => self.installed_rx = Some(rx),
-            Err(error) => {
-                self.installed_loading = false;
-                self.message = format!("开不了查询线程：{error}");
-            }
-        }
+        worker.installed();
     }
 
     /// 新闻 + 未读判断 + 「有几个包能更新」（`Ctrl+N`，进新闻模式也会自动拉一次）。
+    ///
+    /// 可更新数与新闻是**两个请求**：前者走数据库线程（毫秒级），后者走网络。
+    /// 以前它俩串在同一个线程里，而「可更新」那一步是 18 秒的 `checkupdates` ——
+    /// 新闻就被它堵在后面。
     pub fn start_news(&mut self) {
-        if self.news_rx.is_some() {
+        let Some(worker) = self.worker.as_ref() else {
+            self.message = String::from("取数线程没起来，看不了新闻");
             return;
-        }
+        };
         self.read_news = packages::load_read_news(&packages::read_news_path());
         self.message = String::from("正在看 Arch 新闻…");
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name(String::from("pkg-news"))
-            .spawn(move || {
-                let pending_updates = probe::pending_updates();
-                let sync_age = probe::sync_db_age().map(|age| age.as_secs());
-                let mark = probe::last_upgrade();
-                let outcome = match probe::news() {
-                    Ok(items) => NewsOutcome {
-                        after_upgrade: packages::news_published_since(&items, mark),
-                        items,
-                        mark,
-                        pending_updates,
-                        sync_age,
-                        error: None,
-                    },
-                    Err(error) => NewsOutcome {
-                        items: Vec::new(),
-                        after_upgrade: 0,
-                        mark,
-                        pending_updates,
-                        sync_age,
-                        error: Some(error),
-                    },
-                };
-                let _ = tx.send(outcome);
-            });
-        match spawned {
-            Ok(_) => self.news_rx = Some(rx),
-            Err(error) => self.message = format!("开不了新闻线程：{error}"),
-        }
+        worker.news();
+        worker.updates();
     }
 
-    /// 每帧收一次结果（和 `App::poll_job` 一样的位置调用）。
+    /// 每帧把两个常驻线程攒下的回答取干净。
+    ///
+    /// 以前这里有六个接收器、六段几乎一样的 `try_recv` 样板；现在只有一个
+    /// [`Response`]，分发集中在一处 —— 加一种取数只需动 `worker` 和这里各一行。
     pub fn poll(&mut self) {
-        self.poll_search();
-        self.poll_info();
-        self.poll_news();
-        self.poll_installed();
-        self.poll_orphans();
-        self.poll_confirm_notes();
+        // 先把回答收干净再处理：`try_recv` 借着 worker（也就是 self），
+        // 而 `handle` 要改 self —— 不先收完就是借用冲突。
+        let mut responses = Vec::new();
+        if let Some(worker) = self.worker.as_ref() {
+            while let Some(response) = worker.try_recv() {
+                responses.push(response);
+            }
+        }
+        for response in responses {
+            self.handle(response);
+        }
         self.follow_selection();
     }
 
-    fn poll_search(&mut self) {
-        let Some(rx) = &self.search_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(outcome) => {
-                self.searching = false;
-                self.errors = outcome.errors;
-                self.hits = outcome.hits;
-                self.selected = 0;
-                self.rebuild_repos();
-                self.apply_filter();
-                self.message = if self.hits.is_empty() {
-                    String::from("没有匹配的包")
+    fn handle(&mut self, response: Response) {
+        match response {
+            Response::Official(hits) => {
+                self.awaiting_official = false;
+                self.official_hits = hits;
+                self.rebuild_hits();
+            }
+            Response::Aur(hits) => {
+                self.awaiting_aur = false;
+                self.aur_hits = hits;
+                self.rebuild_hits();
+            }
+            Response::Failed { source, error } => {
+                if source == "官方源" {
+                    self.awaiting_official = false;
                 } else {
-                    format!("{} 个结果", self.hits.len())
-                };
-                self.search_rx = None;
+                    self.awaiting_aur = false;
+                }
+                self.errors.push(format!("{source}：{error}"));
+                self.rebuild_hits();
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.searching = false;
-                self.search_rx = None;
-                self.message = String::from("搜索线程没了");
-            }
-        }
-    }
-
-    fn poll_info(&mut self) {
-        let Some(rx) = &self.info_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(outcome) => {
+            Response::Info(outcome) => {
                 self.info_pending = None;
                 self.info_scroll = 0;
                 if let Some(error) = outcome.error {
@@ -450,58 +404,8 @@ impl PackageView {
                     self.info_error = None;
                     self.info = Some((outcome.name, outcome.fields));
                 }
-                self.info_rx = None;
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.info_pending = None;
-                self.info_rx = None;
-            }
-        }
-    }
-
-    fn poll_news(&mut self) {
-        let Some(rx) = &self.news_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(outcome) => {
-                self.news_rx = None;
-                self.pending_updates = outcome.pending_updates;
-                self.sync_age = outcome.sync_age;
-                if let Some(error) = outcome.error {
-                    self.message = format!("抓新闻失败：{error}");
-                    return;
-                }
-                self.news_after_upgrade = Some(outcome.after_upgrade);
-                self.news_mark = outcome.mark;
-                let unread = outcome
-                    .items
-                    .iter()
-                    .filter(|item| !self.read_news.contains(&packages::news_key(item)))
-                    .count();
-                self.message = format!(
-                    "Arch 新闻 {} 条 · 未读 {unread} · 升级后发布 {}",
-                    outcome.items.len(),
-                    outcome.after_upgrade
-                );
-                self.news = outcome.items;
-                self.rebuild_news();
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.news_rx = None;
-                self.message = String::from("新闻线程没了");
-            }
-        }
-    }
-
-    fn poll_installed(&mut self) {
-        let Some(rx) = &self.installed_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(packages)) => {
+            Response::Installed(Ok(packages)) => {
                 self.installed_loading = false;
                 self.installed_loaded = true;
                 let orphans = packages.iter().filter(|item| item.orphan).count();
@@ -513,28 +417,26 @@ impl PackageView {
                 self.installed = packages;
                 self.installed_selected = 0;
                 self.apply_installed_filter();
-                self.installed_rx = None;
             }
-            Ok(Err(error)) => {
+            Response::Installed(Err(error)) => {
                 self.installed_loading = false;
-                self.installed_rx = None;
                 self.message = format!("读已安装包失败：{error}");
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.installed_loading = false;
-                self.installed_rx = None;
+            Response::Updates { count, age } => {
+                self.pending_updates = count;
+                self.sync_age = age;
             }
-        }
-    }
-
-    fn poll_orphans(&mut self) {
-        let Some(rx) = &self.orphans_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(names) => {
-                self.orphans_rx = None;
+            Response::Removal(notes) => self.append_confirm_notes(notes),
+            Response::DownloadTotal(bytes) => {
+                let note = bytes.map(|bytes| {
+                    format!(
+                        "要下载 {}（AUR 包的体积要等编译时才知道）",
+                        packages::libalpm::size_text(bytes)
+                    )
+                });
+                self.append_confirm_notes(note.into_iter().collect());
+            }
+            Response::OrphanNames(names) => {
                 if names.is_empty() {
                     self.message = String::from("没有孤儿包，系统很干净");
                     return;
@@ -546,76 +448,44 @@ impl PackageView {
                     command: packages::command_preview(&program, &argv),
                     notes: vec![
                         String::from("孤儿 = 没人依赖、你也没点名装过"),
-                        format!("{}", names.join("  ")),
+                        names.join("  "),
                     ],
                     action: ConfirmAction::Orphans(names),
                     pending: false,
                 });
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.orphans_rx = None,
-        }
-    }
-
-    /// 收确认面板的补充信息（谁依赖它们 / 要下载多少 / 有几个能更新）。
-    ///
-    /// 这些都要读 pacman 数据库：libalpm 只要几十毫秒，但界面一帧都不该等 ——
-    /// 面板先弹出来，分析结果到了再补一行。
-    fn poll_confirm_notes(&mut self) {
-        let Some(rx) = &self.confirm_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(notes) => {
-                self.confirm_rx = None;
-                if let Some(confirm) = self.confirm.as_mut() {
-                    confirm.pending = false;
-                    confirm.notes.extend(notes);
-                }
+            Response::News(Ok(chunk)) => {
+                self.news_after_upgrade = Some(chunk.after_upgrade);
+                self.news_mark = chunk.mark;
+                let unread = chunk
+                    .items
+                    .iter()
+                    .filter(|item| !self.read_news.contains(&packages::news_key(item)))
+                    .count();
+                self.message = format!(
+                    "Arch 新闻 {} 条 · 未读 {unread} · 升级后发布 {}",
+                    chunk.items.len(),
+                    chunk.after_upgrade
+                );
+                self.news = chunk.items;
+                self.rebuild_news();
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                if let Some(confirm) = self.confirm.as_mut() {
-                    confirm.pending = false;
-                }
-                self.confirm_rx = None;
+            Response::News(Err(error)) => {
+                self.message = format!("抓新闻失败：{error}");
             }
-        }
-    }
-
-    /// 起一个后台线程算确认面板的补充信息。
-    fn spawn_confirm_notes<F>(&mut self, job: F)
-    where
-        F: FnOnce() -> Vec<String> + Send + 'static,
-    {
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name(String::from("pkg-preflight"))
-            .spawn(move || {
-                let _ = tx.send(job());
-            });
-        if spawned.is_ok() {
-            self.confirm_rx = Some(rx);
-        } else if let Some(confirm) = self.confirm.as_mut() {
-            confirm.pending = false;
         }
     }
 
     /// 让信息面板跟上当前选中的包。
     ///
-    /// 搜索模式查**仓库里**的包（`pacman -Sii` / AUR RPC），已安装模式查**本地**的
-    /// 那份（`pacman -Qi`）—— 外来包在同步库里根本不存在。
-    /// 让信息面板跟上当前选中的包。
-    ///
-    /// 两个数据源分工明确：搜索模式查**仓库里**的包（`pacman -Sii` / AUR RPC），
-    /// 已安装模式查**本地**的那份（`pacman -Qi`）—— 外来包在同步库里根本不存在，
-    /// 用 `-Sii` 去问只会得到「找不到目标」。
+    /// 两个数据源分工明确：搜索模式查**仓库里**的包（官方源走 libalpm、AUR 走
+    /// RPC），已安装模式查**本地**的那份 —— 外来包在同步库里根本不存在。
     fn follow_selection(&mut self) {
-        if self.info_rx.is_some() {
+        if self.info_pending.is_some() {
             return;
         }
-
-        // 要查谁、走哪条路
+        // 先把「要查谁」定下来（这一段只借 self 的不可变引用），再去发请求，
+        // 免得「借 worker」和「改 info_pending」同时要 self。
         enum Target {
             Repo(PackageHit),
             Local(String),
@@ -632,38 +502,100 @@ impl PackageView {
             PackageMode::News => return,
         };
 
-        let shown = self.info.as_ref().map(|(shown, _)| shown.as_str());
-        if shown == Some(name.as_str()) || self.info_pending.as_deref() == Some(name.as_str()) {
+        if self.info.as_ref().map(|(shown, _)| shown.as_str()) == Some(name.as_str()) {
             return;
         }
+        self.info_pending = Some(name.clone());
 
-        self.info_pending = Some(name);
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name(String::from("pkg-info"))
-            .spawn(move || {
-                let outcome = match target {
-                    Target::Repo(hit) => probe::info(&hit),
-                    // 本地包的「仓库」是 local：probe::info 对非 AUR 一律走 libalpm，
-                    // 同步库里没有就自动落到本地库（外来包也能看信息）。
-                    Target::Local(name) => probe::info(&super::packages::PackageHit {
-                        repo: String::from("local"),
-                        name,
-                        version: String::new(),
-                        description: String::new(),
-                        installed_state: super::packages::InstalledState::NotInstalled,
-                        votes: None,
-                        popularity: None,
-                        maintainer: None,
-                        out_of_date: false,
-                    }),
-                };
-                let _ = tx.send(outcome);
-            });
-        if spawned.is_ok() {
-            self.info_rx = Some(rx);
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        let hit = match target {
+            Target::Repo(hit) => hit,
+            // 本地包用 仓库=local 的壳：worker 对非 AUR 一律走 libalpm，
+            // 同步库里没有就自动落到本地库（外来包也能看信息）。
+            Target::Local(name) => PackageHit {
+                repo: String::from("local"),
+                name,
+                version: String::new(),
+                description: String::new(),
+                installed_state: crate::packages::InstalledState::NotInstalled,
+                votes: None,
+                popularity: None,
+                maintainer: None,
+                out_of_date: false,
+            },
+        };
+        worker.info(&hit);
+    }
+
+    /// 两路结果合流：排序 + 去重 + 重建筛选，尽量保住当前选中的那个包。
+    ///
+    /// 「保住选中」很重要：AUR 那一批晚几秒到，如果不保，你刚用 ↑↓ 选中的行会
+    /// 在结果补进来的一瞬间跳走。
+    fn rebuild_hits(&mut self) {
+        let keep = self.selected_hit().map(|hit| hit.name.clone());
+
+        let mut hits: Vec<PackageHit> = self
+            .official_hits
+            .iter()
+            .chain(self.aur_hits.iter())
+            .cloned()
+            .collect();
+
+        let needle = self
+            .searched
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches('^')
+            .trim_end_matches('$')
+            .to_string();
+        hits.sort_by(|a, b| {
+            let exact = |hit: &PackageHit| hit.name.eq_ignore_ascii_case(&needle) as u8;
+            b.is_installed()
+                .cmp(&a.is_installed())
+                .then(exact(b).cmp(&exact(a)))
+                .then(b.votes.unwrap_or(0).cmp(&a.votes.unwrap_or(0)))
+                .then(a.repo.cmp(&b.repo))
+                .then(a.name.cmp(&b.name))
+        });
+        hits.dedup_by(|a, b| a.name == b.name && a.version == b.version);
+        self.hits = hits;
+
+        self.rebuild_repos();
+        self.apply_filter();
+
+        if let Some(name) = keep
+            && let Some(row) = self
+                .visible
+                .iter()
+                .position(|&index| self.hits[index].name == name)
+        {
+            self.selected = row;
+        }
+
+        // 两路都回来了才算搜完
+        self.searching = self.awaiting_official || self.awaiting_aur;
+        self.message = if self.searching {
+            let waiting = match (self.awaiting_official, self.awaiting_aur) {
+                (true, true) => "官方源 + AUR",
+                (true, false) => "官方源",
+                _ => "AUR",
+            };
+            format!("{} 个结果，还在等 {waiting}…", self.hits.len())
+        } else if self.hits.is_empty() {
+            String::from("没有匹配的包")
         } else {
-            self.info_pending = None;
+            format!("{} 个结果", self.hits.len())
+        };
+    }
+
+    /// 确认面板的补充信息到了就接上（体积 / 谁依赖它们）。
+    fn append_confirm_notes(&mut self, notes: Vec<String>) {
+        if let Some(confirm) = self.confirm.as_mut() {
+            confirm.pending = false;
+            confirm.notes.extend(notes);
         }
     }
 
@@ -1228,21 +1160,21 @@ impl PackageView {
             pending: true,
         });
 
-        self.spawn_confirm_notes(move || match operation {
-            PackageOperation::Remove => probe::removal_report(&names),
-            _ => match probe::download_total(&names) {
-                Some(bytes) => vec![format!(
-                    "要下载 {}（AUR 包的体积要等编译时才知道）",
-                    packages::libalpm::size_text(bytes)
-                )],
-                None => Vec::new(),
-            },
-        });
+        if let Some(worker) = self.worker.as_ref() {
+            match operation {
+                PackageOperation::Remove => worker.removal(names),
+                _ => worker.download_total(names),
+            }
+        }
     }
 
     /// 系统更新的确认面板。
     pub fn arm_upgrade(&mut self) {
-        let program = if probe::has_paru() { "paru" } else { "pacman" };
+        let program = if packages::probe::has_paru() {
+            "paru"
+        } else {
+            "pacman"
+        };
         let (program, argv) = packages::escalate(program, &[String::from(packages::UPGRADE_FLAG)]);
         self.confirm = Some(Confirm {
             title: String::from("系统更新"),
@@ -1255,16 +1187,15 @@ impl PackageView {
             pending: true,
         });
 
-        // 实时数一遍（libalpm 约 20ms，放后台只是不想让面板晚一帧出现）
-        self.spawn_confirm_notes(|| match probe::pending_updates() {
-            Some(count) => vec![format!("现在有 {count} 个包可以更新")],
-            None => vec![String::from("查不出可更新数（数据库读不到）")],
-        });
+        // 实时数一遍（走数据库线程；界面不等它）
+        if let Some(worker) = self.worker.as_ref() {
+            worker.updates();
+        }
     }
 
     /// 清缓存的确认面板。
     pub fn arm_cache(&mut self, keep: u8) {
-        let (program, argv) = packages::cache_command(keep, probe::has_paccache());
+        let (program, argv) = packages::cache_command(keep, packages::probe::has_paccache());
         let (program, argv) = packages::escalate(&program, &argv);
         let mut notes = vec![format!("只保留每个包最近 {keep} 个版本，更旧的从缓存删掉")];
         if program.ends_with("pacman") {
@@ -1281,21 +1212,14 @@ impl PackageView {
         });
     }
 
-    /// 清孤儿的确认面板：名单要现查（`pacman -Qtdq`）。
+    /// 清孤儿的确认面板：名单现查（libalpm 的孤儿判定，见 [`packages::libalpm`]）。
     pub fn arm_orphans(&mut self) {
-        if self.orphans_rx.is_some() {
+        let Some(worker) = self.worker.as_ref() else {
+            self.message = String::from("取数线程没起来");
             return;
-        }
+        };
         self.message = String::from("正在找孤儿包…");
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name(String::from("pkg-orphans"))
-            .spawn(move || {
-                let _ = tx.send(probe::orphan_names());
-            });
-        if spawned.is_ok() {
-            self.orphans_rx = Some(rx);
-        }
+        worker.orphan_names();
     }
 
     pub fn cancel_confirm(&mut self) {
@@ -1520,7 +1444,7 @@ mod tests {
     }
 
     fn view_with(hits: Vec<PackageHit>) -> PackageView {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         view.hits = hits;
         view.rebuild_repos();
         view.apply_filter();
@@ -1623,7 +1547,7 @@ mod tests {
 
     #[test]
     fn package_operation_cycles_through_install_remove_download() {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         assert_eq!(view.operation, PackageOperation::Install);
         view.cycle_operation();
         assert_eq!(view.operation, PackageOperation::Remove);
@@ -1647,7 +1571,7 @@ mod tests {
         view.export_queue(&path);
         assert!(path.exists());
 
-        let mut other = PackageView::new(Vec::new());
+        let mut other = PackageView::new(Vec::new(), None);
         other.import_queue(&path);
         assert_eq!(other.queue, view.queue, "导出再导入要一样");
 
@@ -1660,7 +1584,7 @@ mod tests {
     /// 已安装模式的四个筛选 + 排队卸载会自动把操作切成「卸载」。
     #[test]
     fn installed_filters_and_queue_switch_to_remove() {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         view.installed = vec![
             installed("bash", true, false, false),
             installed("readline", false, false, false),
@@ -1738,7 +1662,7 @@ mod tests {
     /// 卸载的确认面板会挂上「谁依赖它们」的分析（这里只验证流程，不跑 pacman）。
     #[test]
     fn removal_confirm_waits_for_the_impact_report() {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         view.queue.push(QueuedPackage {
             name: String::from("bash"),
             origin: String::from("core"),
@@ -1758,7 +1682,7 @@ mod tests {
     /// 新闻：未读/已读筛选跟着已读集合走，且标记会落盘。
     #[test]
     fn news_read_state_drives_the_filter() {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         // 直接摆状态，不走 set_mode（那会真的去抓一次新闻）
         view.mode = PackageMode::News;
         view.news = vec![
@@ -1802,7 +1726,7 @@ mod tests {
     /// 三种模式共用一个输入框：输入即筛，在哪一屏都成立。
     #[test]
     fn the_search_box_filters_whichever_mode_you_are_in() {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         view.installed = vec![
             installed("bash", true, false, false),
             installed("readline", false, false, false),
@@ -1856,11 +1780,14 @@ mod tests {
     /// 模式标签：搜索/已安装/新闻都能切，且切过去会自动带上该有的数据。
     #[test]
     fn mode_tabs_cycle() {
-        let mut view = PackageView::new(Vec::new());
+        let mut view = PackageView::new(Vec::new(), None);
         assert_eq!(view.mode, PackageMode::Search);
         view.cycle_mode();
         assert_eq!(view.mode, PackageMode::Installed);
-        assert!(view.installed_loading, "切到已安装就该去读一次");
+        // 测试里没有取数线程：这时**不许装样子**（显示「正在读…」却没人在读），
+        // 要老老实实说清楚 —— 这条钉住的就是「失败要说人话」。
+        assert!(!view.installed_loading);
+        assert!(view.message.contains("取数线程"), "{}", view.message);
         view.cycle_mode();
         assert_eq!(view.mode, PackageMode::News);
         view.cycle_mode();

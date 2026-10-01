@@ -15,7 +15,7 @@ use std::{io::Write, path::PathBuf, process::Command};
 
 use crate::packages::{
     self, InstalledFilter, InstalledPackage, NewsFilter, NewsItem, PackageHit, PackageOperation,
-    probe,
+    libalpm::Db, probe::Net,
 };
 
 /// 一次命令行调用想干什么。
@@ -215,7 +215,11 @@ pub fn run(options: &Options) -> Result<(), String> {
         Action::Install(names) => package_op(PackageOperation::Install, names, options.dry_run),
         Action::Remove(names) => package_op(PackageOperation::Remove, names, options.dry_run),
         Action::Update => {
-            let program = if probe::has_paru() { "paru" } else { "pacman" };
+            let program = if packages::probe::has_paru() {
+                "paru"
+            } else {
+                "pacman"
+            };
             let (program, argv) =
                 packages::escalate(program, &[String::from(packages::UPGRADE_FLAG)]);
             execute(&program, &argv, options.dry_run, "系统更新")
@@ -224,7 +228,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         Action::List(scope) => list_installed(*scope),
         Action::RemoveOrphans => remove_orphans(options.dry_run),
         Action::ClearCache => {
-            let (program, argv) = packages::cache_command(1, probe::has_paccache());
+            let (program, argv) = packages::cache_command(1, packages::probe::has_paccache());
             let (program, argv) = packages::escalate(&program, &argv);
             execute(&program, &argv, options.dry_run, "清包缓存")
         }
@@ -265,7 +269,25 @@ TUI 里的按键: 进界面按 ? 看全部（包管理是 p 键）。
 // ── 各个动作 ────────────────────────────────────────────────────────────────
 
 fn search(term: &str) -> Result<(), String> {
-    let outcome = probe::search(term);
+    let db = Db::open()?;
+    let mut net = Net::new();
+
+    let mut outcome = crate::packages::probe::SearchOutcome::default();
+    match db.search(term) {
+        Ok(hits) => outcome.hits.extend(hits),
+        Err(error) => outcome.errors.push(format!("官方源：{error}")),
+    }
+    match net.search_aur(term, db.local_versions()) {
+        Ok(hits) => outcome.hits.extend(hits),
+        Err(error) => outcome.errors.push(format!("AUR：{error}")),
+    }
+    outcome.hits.sort_by(|a, b| {
+        b.is_installed()
+            .cmp(&a.is_installed())
+            .then(b.votes.unwrap_or(0).cmp(&a.votes.unwrap_or(0)))
+            .then(a.name.cmp(&b.name))
+    });
+
     for error in &outcome.errors {
         eprintln!("（一路失败，可接受）：{error}");
     }
@@ -312,9 +334,11 @@ fn package_op(operation: PackageOperation, names: &[String], dry_run: bool) -> R
 /// 这个名字是不是只有 AUR 有（不在官方源里）。
 ///
 /// 查的是 libalpm（本地数据库），不起 `pacman -Ss` 进程 —— 这也是「装的时候用
-/// pacman 还是 paru」的判断依据。
+/// pacman 还是 paru」的判断依据。库打不开就当它不是 AUR 包（宁可让 pacman 报错，
+/// 也不要莫名其妙把活派给 paru）。
 fn is_aur_only(name: &str) -> bool {
-    packages::libalpm::search(name)
+    Db::open()
+        .and_then(|db| db.search(name))
         .map(|hits| !hits.iter().any(|hit| hit.name == name))
         .unwrap_or(false)
 }
@@ -347,9 +371,9 @@ fn execute(program: &str, argv: &[String], dry_run: bool, what: &str) -> Result<
 }
 
 fn news(scope: NewsFilter) -> Result<(), String> {
-    let items = probe::news()?;
+    let items = Net::new().news()?;
     let read = packages::load_read_news(&packages::read_news_path());
-    let mark = probe::last_upgrade();
+    let mark = packages::probe::last_upgrade();
 
     let visible: Vec<&NewsItem> = items
         .iter()
@@ -383,7 +407,7 @@ fn news(scope: NewsFilter) -> Result<(), String> {
 }
 
 fn list_installed(scope: InstalledFilter) -> Result<(), String> {
-    let all = probe::installed_packages()?;
+    let all = Db::open()?.installed()?;
     let shown: Vec<&InstalledPackage> = all
         .iter()
         .filter(|package| scope.matches(package))
@@ -408,7 +432,7 @@ fn list_installed(scope: InstalledFilter) -> Result<(), String> {
 }
 
 fn remove_orphans(dry_run: bool) -> Result<(), String> {
-    let names = probe::orphan_names();
+    let names = Db::open()?.orphan_names();
     if names.is_empty() {
         println!("没有孤儿包，系统很干净");
         return Ok(());

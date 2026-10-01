@@ -43,7 +43,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use ::alpm::{Alpm, Db, LogLevel, Package, PackageReason, SigLevel};
+use ::alpm::{Alpm, Db as AlpmDb, LogLevel, Package, PackageReason, SigLevel};
 
 use super::{InstalledPackage, InstalledState, PackageHit};
 
@@ -115,8 +115,11 @@ fn register_repos(handle: &Alpm, sync_dir: &std::path::Path) -> usize {
     registered
 }
 
-/// 打开一个句柄（本地库 + 同步库）。
-pub fn open() -> Result<Alpm, String> {
+/// 打开一个**裸句柄**（本地库 + 按 pacman.conf 顺序注册同步库）。
+///
+/// 一般不该直接用：句柄本身不带任何缓存，每次问都要重付同步库的首次解析。
+/// 要反复问就用 [`Db`]。
+fn open_handle() -> Result<Alpm, String> {
     let handle =
         Alpm::new("/", DB_PATH).map_err(|error| format!("打不开 pacman 数据库：{error}"))?;
 
@@ -159,7 +162,7 @@ impl Demand {
     }
 
     /// 一次扫完本地库里的全部依赖边（14k 条边 ≈ 0.2ms）。
-    pub fn scan(local: &Db) -> Self {
+    pub fn scan(local: &AlpmDb) -> Self {
         // 名字 → 包，以及「被 provides 出来的名字 → 提供它的包」
         let mut by_name: HashMap<&str, &Package> = HashMap::new();
         // key 必须 owned：provides 的条目是拼出来的字符串，借不得（原来这里悬垂过）
@@ -403,211 +406,265 @@ pub fn installed_row(
     }
 }
 
-// ── 对外功能 ────────────────────────────────────────────────────────────────
+// ── 常驻上下文：句柄 + 一次算好的索引 ──────────────────────────────────────
 
-/// 本地已装包的名字 → 包（一次扫完；搜索标状态、信息面板补本地字段都要它）。
-fn local_packages(local: &Db) -> HashMap<&str, &Package> {
-    local
-        .pkgs()
-        .iter()
-        .map(|package| (package.name(), package))
-        .collect()
+/// 包数据库的常驻上下文。
+///
+/// 存在的理由只有一个：**libalpm 的首次解析很贵，缓存很值钱**。
+///
+/// * 第一次访问同步库要 ~365ms（把整个 `.db` 解析进内存），之后 ~3ms；
+/// * 本地依赖索引（[`Demand`]）要 ~26ms，`sync_names` 要 ~365ms。
+///
+/// 所以后台线程该持有它、反复用；每问一次就 [`Db::open`] 一次等于把这笔钱
+/// 重复付一遍（实测：起进程查一次已安装列表 730ms，常驻上下文里第二次问是几毫秒）。
+pub struct Db {
+    handle: Alpm,
+    /// 「谁需要谁」索引（一次扫完 14k 条依赖边，之后全是查表）。
+    demand: Demand,
+    /// 本地已装：名字 → 版本（搜索结果标状态、AUR 命中标状态都要它）。
+    local_versions: HashMap<String, String>,
+    /// 同步库里出现过的包名（判断「外来包」用）。要 365ms，所以只算一次。
+    sync_name_set: std::sync::OnceLock<HashSet<String>>,
 }
 
-/// 官方源搜索。
-///
-/// 语义与 `pacman -Ss` 接近但不完全一样：**子串匹配**（不分大小写），
-/// 不认正则。用户顺手写的 `^fzf$` 会被当成「去掉锚点的词」处理 ——
-/// 中心里的排序本来就把完全同名的排最前，锚点没必要。
-///
-/// 同一个包在多个仓库里出现时**只留优先级最高**的那个（pacman.conf 的顺序），
-/// 这样 `cachyos-extra-v3/fzf` 与 `extra/fzf` 不会并排出现两条。
-pub fn search(term: &str) -> Result<Vec<PackageHit>, String> {
-    let handle = open()?;
-    let local = local_packages(handle.localdb());
-    let needle = term
-        .trim()
-        .trim_start_matches('^')
-        .trim_end_matches('$')
-        .to_lowercase();
-    if needle.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut hits = Vec::new();
-    let mut claimed: HashSet<&str> = HashSet::new();
-
-    for db in handle.syncdbs() {
-        for package in db.pkgs() {
-            // 仓库优先级：名字被前面的仓库占住就不再考虑
-            if !claimed.insert(package.name()) {
-                continue;
-            }
-            let name_hit = package.name().contains(needle.as_str());
-            let desc_hit = package
-                .desc()
-                .is_some_and(|desc| desc.to_lowercase().contains(needle.as_str()));
-            if !name_hit && !desc_hit {
-                continue;
-            }
-
-            let installed = local.get(package.name()).copied();
-            hits.push(PackageHit {
-                repo: db.name().to_string(),
-                name: package.name().to_string(),
-                version: package.version().to_string(),
-                description: package.desc().unwrap_or_default().to_string(),
-                installed_state: state_of(
-                    package.version(),
-                    installed.map(|local| local.version()),
-                ),
-                votes: None,
-                popularity: None,
-                maintainer: None,
-                out_of_date: false,
-            });
-        }
-    }
-
-    Ok(hits)
-}
-
-/// 官方源（或本地已装）包的信息面板。
-///
-/// 先找同步库（用户多半在看「能装的那个」），找不到再看本地库 ——
-/// 外来包（AUR / 手工装的）在同步库里根本不存在，但它的信息仍然值得看。
-pub fn info(name: &str) -> Result<Vec<(String, String)>, String> {
-    let handle = open()?;
-    let demand = Demand::scan(handle.localdb());
-    let local = local_packages(handle.localdb());
-
-    let found = handle.syncdbs().iter().find_map(|db| {
-        db.pkg(name)
-            .ok()
-            .map(|package| (db.name().to_string(), package))
-    });
-
-    let facts = match found {
-        Some((repo, package)) => {
-            facts_from(package, &repo, local.get(package.name()).copied(), &demand)
-        }
-        None => {
-            let package = handle
-                .localdb()
-                .pkg(name)
-                .map_err(|error| format!("{name}：{error}"))?;
-            facts_from(package, "local", Some(package), &demand)
-        }
-    };
-
-    let fields = info_fields(&facts);
-    if fields.is_empty() {
-        return Err(format!("{name} 没有任何可显示的字段"));
-    }
-    Ok(fields)
-}
-
-/// 已安装列表（显式 / 依赖 / 外来 / 孤儿）。
-pub fn installed() -> Result<Vec<InstalledPackage>, String> {
-    let handle = open()?;
-    let demand = Demand::scan(handle.localdb());
-    let sync_names = sync_names(&handle);
-
-    // 这一条路径**刻意不走 `facts_from`**：那张表会为一个包取十几个字段
-    // （依赖、provides、许可证……），而列表只需要名字、版本、安装原因和孤儿标记。
-    // 实测 2271 个包：走完整 Facts 是 0.56s，这样是几十毫秒 —— 区别全在
-    // 「每个包都要 libalpm 现场解析一遍条目」上。
-    let mut rows: Vec<InstalledPackage> = handle
-        .localdb()
-        .pkgs()
-        .iter()
-        .map(|package| {
-            let name = package.name();
-            installed_row(
-                name,
-                package.version().as_ref(),
-                package.reason() == PackageReason::Explicit,
-                !sync_names.contains(name),
-                demand.required_by(name).len(),
-                demand.optional_for(name).len(),
-            )
+impl Db {
+    /// 打开上下文（本地索引立刻就建，同步库等到第一次用到才解析）。
+    pub fn open() -> Result<Self, String> {
+        let handle = open_handle()?;
+        let demand = Demand::scan(handle.localdb());
+        let local_versions = handle
+            .localdb()
+            .pkgs()
+            .iter()
+            .map(|package| (package.name().to_string(), package.version().to_string()))
+            .collect();
+        Ok(Self {
+            handle,
+            demand,
+            local_versions,
+            sync_name_set: std::sync::OnceLock::new(),
         })
-        .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(rows)
-}
+    }
 
-/// 有多少个包可以更新 —— `checkupdates` 的替代品。
-///
-/// `None` 表示**不知道**（数据库打不开），不是「0 个」：
-/// 把「查不了」说成「没有更新」是实打实的谎报。
-pub fn pending_updates() -> Option<usize> {
-    let handle = open().ok()?;
-    let local = local_packages(handle.localdb());
-    let mut claimed: HashSet<&str> = HashSet::new();
-    let mut count = 0;
-    for db in handle.syncdbs() {
-        for package in db.pkgs() {
-            if !claimed.insert(package.name()) {
-                continue;
-            }
-            if let Some(installed) = local.get(package.name())
-                && newer(package.version(), installed.version())
-            {
-                count += 1;
+    /// 本地已装的名字 → 版本（给 AUR 命中标「已安装 / 可升级」用）。
+    pub fn local_versions(&self) -> &HashMap<String, String> {
+        &self.local_versions
+    }
+
+    /// 同步库里出现过的包名（外来包判定）。要 365ms，所以只算一次。
+    fn sync_names(&self) -> &HashSet<String> {
+        self.sync_name_set.get_or_init(|| {
+            self.handle
+                .syncdbs()
+                .iter()
+                .flat_map(|db| db.pkgs().iter().map(|package| package.name().to_string()))
+                .collect()
+        })
+    }
+
+    /// 孤儿包名单（没人依赖、你也没点名装的）。
+    pub fn orphan_names(&self) -> Vec<String> {
+        self.installed()
+            .map(|packages| {
+                packages
+                    .into_iter()
+                    .filter(|package| package.orphan)
+                    .map(|package| package.name)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 官方源搜索（子串匹配，仓库优先级去重；详见自由函数时代的注释）。
+    ///
+    /// 语义与 `pacman -Ss` 接近但不完全一样：**子串匹配**（不分大小写），不认正则。
+    /// 顺手写的 `^fzf$` 会被当成「去掉锚点的词」——排序本来就把完全同名的排最前。
+    pub fn search(&self, term: &str) -> Result<Vec<PackageHit>, String> {
+        let needle = term
+            .trim()
+            .trim_start_matches('^')
+            .trim_end_matches('$')
+            .to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let local = self.local_versions();
+        let mut hits = Vec::new();
+        let mut claimed: HashSet<&str> = HashSet::new();
+
+        for db in self.handle.syncdbs() {
+            for package in db.pkgs() {
+                // 仓库优先级：名字被前面的仓库占住就不再考虑（cachyos 与 extra 同名只留一个）
+                if !claimed.insert(package.name()) {
+                    continue;
+                }
+                let name_hit = package.name().contains(needle.as_str());
+                let desc_hit = package
+                    .desc()
+                    .is_some_and(|desc| desc.to_lowercase().contains(needle.as_str()));
+                if !name_hit && !desc_hit {
+                    continue;
+                }
+
+                hits.push(PackageHit {
+                    repo: db.name().to_string(),
+                    name: package.name().to_string(),
+                    version: package.version().to_string(),
+                    description: package.desc().unwrap_or_default().to_string(),
+                    installed_state: state_for_versions(
+                        self.handle.localdb().pkg(package.name()).ok(),
+                        package.version(),
+                    ),
+                    votes: None,
+                    popularity: None,
+                    maintainer: None,
+                    out_of_date: false,
+                });
+                let _ = &local;
             }
         }
+        Ok(hits)
     }
-    Some(count)
-}
 
-/// 卸载这些包会连累谁（替代原来「一个包起一次 `pacman -Qi`」）。
-pub fn removal_report(names: &[String]) -> Vec<String> {
-    let Ok(handle) = open() else {
-        return Vec::new();
-    };
-    let demand = Demand::scan(handle.localdb());
-    let asked: HashSet<&str> = names.iter().map(String::as_str).collect();
+    /// 官方源（或本地外来包）的信息面板。
+    pub fn info(&self, name: &str) -> Result<Vec<(String, String)>, String> {
+        let found = self.handle.syncdbs().iter().find_map(|db| {
+            db.pkg(name)
+                .ok()
+                .map(|package| (db.name().to_string(), package))
+        });
 
-    let mut dependents: BTreeSet<String> = BTreeSet::new();
-    let mut optional: BTreeSet<String> = BTreeSet::new();
-    for name in names {
-        for who in demand.required_by(name) {
-            if !asked.contains(who.as_str()) {
-                dependents.insert(who.clone());
+        let facts = match found {
+            Some((repo, package)) => facts_from(package, &repo, self.local_pkg(name), &self.demand),
+            None => {
+                let package = self
+                    .handle
+                    .localdb()
+                    .pkg(name)
+                    .map_err(|error| format!("{name}：{error}"))?;
+                facts_from(package, "local", Some(package), &self.demand)
+            }
+        };
+
+        let fields = info_fields(&facts);
+        if fields.is_empty() {
+            return Err(format!("{name} 没有任何可显示的字段"));
+        }
+        Ok(fields)
+    }
+
+    fn local_pkg(&self, name: &str) -> Option<&Package> {
+        self.handle.localdb().pkg(name).ok()
+    }
+
+    /// 已安装列表（显式 / 依赖 / 外来 / 孤儿）。
+    pub fn installed(&self) -> Result<Vec<InstalledPackage>, String> {
+        let sync_names = self.sync_names();
+        let mut rows: Vec<InstalledPackage> = self
+            .handle
+            .localdb()
+            .pkgs()
+            .iter()
+            .map(|package| {
+                let name = package.name();
+                installed_row(
+                    name,
+                    package.version().as_ref(),
+                    package.reason() == PackageReason::Explicit,
+                    !sync_names.contains(name),
+                    self.demand.required_by(name).len(),
+                    self.demand.optional_for(name).len(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rows)
+    }
+
+    /// 有多少个包可以更新 —— `checkupdates` 的替代品。
+    ///
+    /// `None` 表示**不知道**（数据库打不开），不是「0 个」。
+    pub fn pending_updates(&self) -> Option<usize> {
+        let mut claimed: HashSet<&str> = HashSet::new();
+        let mut count = 0;
+        for db in self.handle.syncdbs() {
+            for package in db.pkgs() {
+                if !claimed.insert(package.name()) {
+                    continue;
+                }
+                if let Some(installed) = self.local_pkg(package.name())
+                    && newer(package.version(), installed.version())
+                {
+                    count += 1;
+                }
             }
         }
-        for who in demand.optional_for(name) {
-            if !asked.contains(who.as_str()) {
-                optional.insert(who.clone());
-            }
-        }
+        Some(count)
     }
 
-    let mut lines = Vec::new();
-    if !dependents.is_empty() {
-        lines.push(format!("依赖它们的有 {}", sample(&dependents)));
-    }
-    if !optional.is_empty() {
-        lines.push(format!("可选依赖它们的有 {}", sample(&optional)));
-    }
-    lines
-}
+    /// 卸载这些包会连累谁。
+    pub fn removal_report(&self, names: &[String]) -> Vec<String> {
+        let asked: HashSet<&str> = names.iter().map(String::as_str).collect();
 
-/// 队列里这些包一共要下载多少字节（同步库里查得到的才算）。
-pub fn download_total(names: &[String]) -> Option<u64> {
-    let handle = open().ok()?;
-    let mut claimed: HashSet<&str> = HashSet::new();
-    let mut wanted: HashMap<&str, u64> = HashMap::new();
-    for db in handle.syncdbs() {
-        for package in db.pkgs() {
-            if !claimed.insert(package.name()) || !names.iter().any(|name| name == package.name()) {
-                continue;
+        let mut dependents: BTreeSet<String> = BTreeSet::new();
+        let mut optional: BTreeSet<String> = BTreeSet::new();
+        for name in names {
+            for who in self.demand.required_by(name) {
+                if !asked.contains(who.as_str()) {
+                    dependents.insert(who.clone());
+                }
             }
-            wanted.insert(package.name(), package.download_size().max(0) as u64);
+            for who in self.demand.optional_for(name) {
+                if !asked.contains(who.as_str()) {
+                    optional.insert(who.clone());
+                }
+            }
         }
+
+        let mut lines = Vec::new();
+        if !dependents.is_empty() {
+            lines.push(format!("依赖它们的有 {}", sample(&dependents)));
+        }
+        if !optional.is_empty() {
+            lines.push(format!("可选依赖它们的有 {}", sample(&optional)));
+        }
+        lines
     }
-    (!wanted.is_empty()).then(|| wanted.values().sum())
+
+    /// 队列里这些包一共要下载多少字节（同步库里查得到的才算）。
+    pub fn download_total(&self, names: &[String]) -> Option<u64> {
+        let wanted: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut claimed: HashSet<&str> = HashSet::new();
+        let mut total = 0u64;
+        let mut found = false;
+        for db in self.handle.syncdbs() {
+            for package in db.pkgs() {
+                if !claimed.insert(package.name()) || !wanted.contains(&package.name()) {
+                    continue;
+                }
+                total += package.download_size().max(0) as u64;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+
+    /// 同步库有多旧（最新的那个 `.db` 文件的 mtime 到现在）。
+    ///
+    /// **「有多少可更新」是按本地数据库算的**（和 `pacman -Qu` 同一口径），
+    /// 数据库旧了这个数就偏小。`checkupdates` 之所以更「准」，是因为它每次都
+    /// 重新下载数据库 —— 代价就是那 18 秒。库旧了就该说出来。
+    pub fn sync_age(&self) -> Option<std::time::Duration> {
+        let dir = std::path::Path::new(DB_PATH).join("sync");
+        let newest = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".db"))
+            .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+            .max()?;
+        newest.elapsed().ok()
+    }
 }
 
 fn sample(items: &BTreeSet<String>) -> String {
@@ -624,16 +681,6 @@ fn sample(items: &BTreeSet<String>) -> String {
     )
 }
 
-fn sync_names(handle: &Alpm) -> HashSet<&str> {
-    let mut names = HashSet::new();
-    for db in handle.syncdbs() {
-        for package in db.pkgs() {
-            names.insert(package.name());
-        }
-    }
-    names
-}
-
 /// 「仓库里这个版本」与「本地那个版本」的关系（没装就是 `NotInstalled`）。
 fn state_of(repo: &::alpm::Ver, installed: Option<&::alpm::Ver>) -> InstalledState {
     match installed {
@@ -646,34 +693,9 @@ fn state_of(repo: &::alpm::Ver, installed: Option<&::alpm::Ver>) -> InstalledSta
     }
 }
 
-/// 同步库有多旧（最新的那个 `.db` 文件的 mtime 到现在）。
-///
-/// 为什么要暴露这个：**「有多少可更新」是按本地数据库算的**（和 `pacman -Qu`
-/// 同一口径），数据库旧了这个数就偏小。`checkupdates` 之所以更「准」，是因为它
-/// 每次都重新下载数据库 —— 代价就是那 18 秒。库旧了就该说出来，而不是给一个
-/// 看着很确定的数字。
-pub fn sync_db_age() -> Option<std::time::Duration> {
-    let dir = std::path::Path::new(DB_PATH).join("sync");
-    let newest = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".db"))
-        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
-        .max()?;
-    newest.elapsed().ok()
-}
-
-/// 孤儿包名单（给「清孤儿」用；`installed()` 里已经算好了，这里只是挑出来）。
-pub fn orphan_names() -> Vec<String> {
-    installed()
-        .map(|packages| {
-            packages
-                .into_iter()
-                .filter(|package| package.orphan)
-                .map(|package| package.name)
-                .collect()
-        })
-        .unwrap_or_default()
+/// 同上，但入口是「本地包对象」（列表路径拿到的是它）。
+fn state_for_versions(local: Option<&Package>, repo: &::alpm::Ver) -> InstalledState {
+    state_of(repo, local.map(|package| package.version()))
 }
 
 /// 把 libalpm 的包对象翻成 [`Facts`]（这一层之外就全是纯逻辑了）。
