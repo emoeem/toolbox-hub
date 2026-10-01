@@ -448,6 +448,49 @@ mod tests {
             );
         }
 
+        // 维护模式：一屏检查项 + 右边的明细
+        if let Some(view) = app.packages.as_mut() {
+            use crate::packages::health::{HealthAction, HealthItem, HealthStatus};
+            view.mode = PackageMode::Health;
+            view.health_loaded = true;
+            view.health = vec![
+                HealthItem {
+                    title: "孤儿包",
+                    status: HealthStatus::Warn,
+                    summary: String::from("12 个（可以清掉）"),
+                    detail: vec![String::from("stale-lib"), String::from("old-tool")],
+                    action: HealthAction::None,
+                },
+                HealthItem {
+                    title: "包缓存",
+                    status: HealthStatus::Bad,
+                    summary: String::from("651 个文件 · 8.54 GiB"),
+                    detail: vec![String::from("目录：/var/cache/pacman/pkg")],
+                    action: HealthAction::ClearCache,
+                },
+            ];
+            view.health_selected = 1;
+        }
+        let screen = render_compact(&mut app, 160, 40);
+        for wanted in [
+            "维护",
+            "孤儿包",
+            "包缓存",
+            "12个（可以清掉）",
+            "8.54GiB",
+            "这一项在说什么",
+            "Enter清包缓存",
+        ] {
+            assert!(screen.contains(wanted), "维护面板少了 {wanted}：\n{screen}");
+        }
+
+        // 回到已安装模式（下面那段断言的是它的空过滤提示）
+        if let Some(view) = app.packages.as_mut() {
+            view.mode = PackageMode::Installed;
+            view.query.clear();
+            view.refilter();
+        }
+
         // 输入框的词在已安装模式里也是本地过滤（三种模式共用一个输入框）
         if let Some(view) = app.packages.as_mut() {
             view.query.set("zzz");

@@ -826,6 +826,16 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// 上一个模式（`[` 用；`←` 那套反过来是 `←` 从搜索跳到维护，这里保持一致）。
+fn previous_mode(mode: PackageMode) -> PackageMode {
+    match mode {
+        PackageMode::Search => PackageMode::Health,
+        PackageMode::Installed => PackageMode::Search,
+        PackageMode::News => PackageMode::Installed,
+        PackageMode::Health => PackageMode::News,
+    }
+}
+
 /// 软件包中心的按键。
 ///
 /// 优先级从高到低：**确认面板** > **排序菜单** > 搜索框输入 > 常规操作。
@@ -926,7 +936,23 @@ fn handle_packages_key(
                     PackageMode::Search => view.start_search(),
                     PackageMode::Installed => view.start_installed(),
                     PackageMode::News => view.start_news(),
+                    PackageMode::Health => view.start_health(),
                 }
+            }
+        }
+        // 输入态下也想切模式：`[` `]` 单键、不跟光标打架（包名里不会有方括号）。
+        // 这是实拍补的：搜索框默认就在输入态，而 ←→ 在输入态归光标 ——
+        // 于是「刚打开界面，想切到维护模式」变成了一件做不到的事。
+        KeyCode::Char('[') if !ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.editing = false;
+                view.set_mode(previous_mode(mode));
+            }
+        }
+        KeyCode::Char(']') if !ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.editing = false;
+                view.cycle_mode();
             }
         }
         KeyCode::Char(ch) if editing && !ctrl => {
@@ -1027,9 +1053,10 @@ fn handle_packages_key(
         KeyCode::Left if !editing => {
             if let Some(view) = app.packages.as_mut() {
                 view.set_mode(match mode {
-                    PackageMode::Search => PackageMode::News,
+                    PackageMode::Search => PackageMode::Health,
                     PackageMode::Installed => PackageMode::Search,
                     PackageMode::News => PackageMode::Installed,
+                    PackageMode::Health => PackageMode::News,
                 });
             }
         }
@@ -1098,6 +1125,8 @@ fn handle_packages_key(
                     view.start_news();
                 }
             }
+            // 维护面板：Enter 就是「处理这一项」
+            PackageMode::Health => app.run_health_action(cwd)?,
         },
         KeyCode::Char('m') if !ctrl && !editing => {
             if let Some(view) = app.packages.as_mut() {
@@ -1130,6 +1159,7 @@ fn handle_packages_key(
                     PackageMode::Search => view.start_search(),
                     PackageMode::Installed => view.start_installed(),
                     PackageMode::News => view.start_news(),
+                    PackageMode::Health => view.start_health(),
                 }
             }
         }

@@ -17,6 +17,7 @@ use std::{
 
 use crate::{
     config::PackagePrefs,
+    packages::health::{self, HealthItem},
     packages::{
         self, InstalledFilter, InstalledPackage, NewsFilter, NewsItem, PackageHit, QueuedPackage,
         SortMode, fuzzy_score,
@@ -37,16 +38,19 @@ pub enum PackageMode {
     Search,
     Installed,
     News,
+    /// 维护：孤儿包 / 依赖完整性 / .pacnew / 缓存 / 更新 / 上次升级。
+    Health,
 }
 
 impl PackageMode {
-    pub const ALL: [PackageMode; 3] = [Self::Search, Self::Installed, Self::News];
+    pub const ALL: [PackageMode; 4] = [Self::Search, Self::Installed, Self::News, Self::Health];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Search => "搜索",
             Self::Installed => "已安装",
             Self::News => "新闻",
+            Self::Health => "维护",
         }
     }
 
@@ -54,7 +58,8 @@ impl PackageMode {
         match self {
             Self::Search => Self::Installed,
             Self::Installed => Self::News,
-            Self::News => Self::Search,
+            Self::News => Self::Health,
+            Self::Health => Self::Search,
         }
     }
 }
@@ -181,6 +186,17 @@ pub struct PackageView {
     // ── 确认面板 ──
     pub confirm: Option<Confirm>,
 
+    // ── 维护 ──
+    /// 一屏检查结果（进「维护」模式时拉一次）。
+    pub health: Vec<HealthItem>,
+    pub health_selected: usize,
+    pub health_loading: bool,
+    pub health_loaded: bool,
+    /// 文件完整性检查在跑（那一步要几秒，界面上要说清楚）。
+    pub health_checking_files: bool,
+    /// 有明细要交给 App 打开输出视图（`(标题, 行)`）：由 `App::poll_packages` 取走。
+    pub pending_view: Option<(String, Vec<String>)>,
+
     // ── 配置文件带来的偏好 ──
     /// `c` 清缓存时保留几个版本（`[` `]` 可以当场改这一次的）。
     pub cache_keep: u8,
@@ -243,6 +259,12 @@ impl PackageView {
             queue: Vec::new(),
             queue_selected: 0,
             confirm: None,
+            health: Vec::new(),
+            health_selected: 0,
+            health_loading: false,
+            health_loaded: false,
+            health_checking_files: false,
+            pending_view: None,
             cache_keep: prefs.cache_keep(),
             wanted_repos: prefs.repos.clone(),
             history,
@@ -276,6 +298,7 @@ impl PackageView {
             PackageMode::Search => {}
             PackageMode::Installed => self.ensure_installed(),
             PackageMode::News => self.ensure_news(),
+            PackageMode::Health => self.ensure_health(),
         }
         // 输入框里的词跟着模式走：切过去就该按新列表重筛一次
         self.refilter();
@@ -290,6 +313,11 @@ impl PackageView {
             return;
         }
         self.start_installed();
+    }
+
+    /// 维护模式：每次进来都重扫一遍（这东西的价值就在于「现在是什么样」）。
+    fn ensure_health(&mut self) {
+        self.start_health();
     }
 
     fn ensure_news(&mut self) {
@@ -369,6 +397,27 @@ impl PackageView {
         self.message = String::from("正在看 Arch 新闻…");
         worker.news();
         worker.updates();
+    }
+
+    /// 扫一遍维护检查。
+    pub fn start_health(&mut self) {
+        let Some(worker) = self.worker.as_ref() else {
+            self.message = String::from("取数线程没起来，扫不了");
+            return;
+        };
+        self.health_loading = true;
+        self.message = String::from("正在检查系统状态…");
+        worker.health();
+    }
+
+    /// 文件完整性（几秒，用户按了才跑）。
+    pub fn start_file_integrity(&mut self) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        self.health_checking_files = true;
+        self.message = String::from("正在查文件完整性（pacman -Qk，要几秒）…");
+        worker.file_integrity();
     }
 
     /// 每帧把两个常驻线程攒下的回答取干净。
@@ -457,6 +506,25 @@ impl PackageView {
                 });
                 self.append_confirm_notes(note.into_iter().collect());
             }
+            Response::Health(items) => {
+                self.health_loading = false;
+                self.health_loaded = true;
+                let (bad, warn) = health::tally(&items);
+                self.message = if bad + warn == 0 {
+                    String::from("维护检查：一切正常")
+                } else {
+                    format!("维护检查：{bad} 项待处理 · {warn} 项注意")
+                };
+                self.health = items;
+                if self.health_selected >= self.health.len() {
+                    self.health_selected = self.health.len().saturating_sub(1);
+                }
+            }
+            Response::FileIntegrity(lines) => {
+                self.health_checking_files = false;
+                self.message = format!("文件完整性：{} 行输出", lines.len());
+                self.pending_view = Some((String::from("pacman -Qk"), lines));
+            }
             Response::OrphanNames(names) => {
                 if names.is_empty() {
                     self.message = String::from("没有孤儿包，系统很干净");
@@ -520,7 +588,7 @@ impl PackageView {
                 Some(package) => (package.name.clone(), Target::Local(package.name.clone())),
                 None => return false,
             },
-            PackageMode::News => return false,
+            PackageMode::News | PackageMode::Health => return false,
         };
 
         if self.info.as_ref().map(|(shown, _)| shown.as_str()) == Some(name.as_str()) {
@@ -801,6 +869,8 @@ impl PackageView {
             PackageMode::Search => self.apply_filter(),
             PackageMode::Installed => self.apply_installed_filter(),
             PackageMode::News => self.rebuild_news(),
+            // 维护面板是系统状态，不是能筛的列表
+            PackageMode::Health => {}
         }
     }
 
@@ -814,7 +884,8 @@ impl PackageView {
                 SortMode::Votes,
             ],
             PackageMode::Installed => vec![SortMode::Name, SortMode::Version, SortMode::Repo],
-            PackageMode::News => Vec::new(),
+            // 新闻固定按时间；维护面板的顺序是「要紧的在前」，都不给排序菜单
+            PackageMode::News | PackageMode::Health => Vec::new(),
         }
     }
 
@@ -857,6 +928,7 @@ impl PackageView {
                 PackageMode::Installed => self.apply_installed_filter(),
                 PackageMode::News => self.rebuild_news(),
                 PackageMode::Search => self.apply_filter(),
+                PackageMode::Health => {}
             }
         }
     }
@@ -882,6 +954,7 @@ impl PackageView {
             PackageMode::Search => self.visible.len(),
             PackageMode::Installed => self.installed_visible.len(),
             PackageMode::News => self.news_visible.len(),
+            PackageMode::Health => self.health.len(),
         }
     }
 
@@ -890,6 +963,7 @@ impl PackageView {
             PackageMode::Search => self.selected,
             PackageMode::Installed => self.installed_selected,
             PackageMode::News => self.news_selected,
+            PackageMode::Health => self.health_selected,
         }
     }
 
@@ -958,6 +1032,7 @@ impl PackageView {
                     self.rebuild_news();
                 }
             }
+            PackageMode::Health => {}
         }
     }
 
@@ -979,6 +1054,7 @@ impl PackageView {
                 self.news_filter = NewsFilter::All;
                 self.rebuild_news();
             }
+            PackageMode::Health => {}
         }
     }
 
@@ -1014,6 +1090,7 @@ impl PackageView {
             PackageMode::Search => self.selected = next,
             PackageMode::Installed => self.installed_selected = next,
             PackageMode::News => self.news_selected = next,
+            PackageMode::Health => self.health_selected = next,
         }
     }
 
@@ -1368,6 +1445,16 @@ impl PackageView {
                     format!("{} / {} 条新闻", self.news_visible.len(), self.news.len())
                 }
             }
+            PackageMode::Health => {
+                if self.health_loading {
+                    String::from("检查中…")
+                } else if !self.health_loaded {
+                    String::from("按 Enter 扫一遍")
+                } else {
+                    let (bad, warn) = health::tally(&self.health);
+                    format!("{} 项检查 · 待处理 {bad} · 注意 {warn}", self.health.len())
+                }
+            }
         }
     }
 
@@ -1409,6 +1496,8 @@ impl PackageView {
                     )
                 })
                 .collect(),
+            // 维护面板没有筛选标签：一屏六个检查项，筛它没意义
+            PackageMode::Health => Vec::new(),
         }
     }
 
@@ -1815,6 +1904,11 @@ mod tests {
         assert!(view.message.contains("取数线程"), "{}", view.message);
         view.cycle_mode();
         assert_eq!(view.mode, PackageMode::News);
+        view.cycle_mode();
+        assert_eq!(view.mode, PackageMode::Health);
+        // 同上：没有取数线程时要说实话，而不是显示「检查中…」却没人检查
+        assert!(!view.health_loading);
+        assert!(view.message.contains("取数线程"), "{}", view.message);
         view.cycle_mode();
         assert_eq!(view.mode, PackageMode::Search);
     }

@@ -256,7 +256,61 @@ fn draw_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         PackageMode::Search => draw_search_rows(frame, view, area),
         PackageMode::Installed => draw_installed_rows(frame, view, area),
         PackageMode::News => draw_news_rows(frame, view, area),
+        PackageMode::Health => draw_health_rows(frame, view, area),
     }
+}
+
+/// 维护面板：一屏检查项，`状态 / 检查 / 说明`。
+fn draw_health_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
+    if view.health_loading && view.health.is_empty() {
+        empty_hint(frame, "正在检查系统状态…", area);
+        return;
+    }
+    if view.health.is_empty() {
+        empty_hint(
+            frame,
+            "按 Enter 扫一遍（孤儿包 / 依赖完整性 / 配置文件 / 缓存 / 更新）",
+            area,
+        );
+        return;
+    }
+
+    let (start, end) = window(view.rows_len(), view.rows_selected(), area.height);
+    let rows = (start..end)
+        .filter_map(|index| view.health.get(index))
+        .map(|item| {
+            let color = match item.status {
+                crate::packages::health::HealthStatus::Ok => theme::GREEN,
+                crate::packages::health::HealthStatus::Warn => theme::YELLOW,
+                crate::packages::health::HealthStatus::Bad => theme::RED,
+            };
+            Row::new(vec![
+                Cell::from(format!("{} {}", item.status.icon(), item.status.label()))
+                    .style(Style::default().fg(color)),
+                Cell::from(item.title).style(
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(item.summary.clone()).style(Style::default().fg(theme::DIM)),
+            ])
+            .height(1)
+        });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(18),
+            Constraint::Min(20),
+        ],
+    )
+    .row_highlight_style(row_style(view))
+    .highlight_symbol("➤ ");
+
+    let mut state =
+        TableState::default().with_selected(Some(view.rows_selected().saturating_sub(start)));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 /// 结果表统一的高亮样式（焦点不在结果区时不高亮，免得看错地方）。
@@ -600,6 +654,12 @@ fn draw_queue(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
 }
 
 fn draw_info(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
+    // 维护模式下这一栏显示选中检查项的明细（那里才是它的「信息面板」）
+    if view.mode == PackageMode::Health {
+        draw_health_detail(frame, view, area);
+        return;
+    }
+
     let title = view
         .info_title()
         .unwrap_or_else(|| String::from("选中一个包看信息"));
@@ -662,6 +722,58 @@ fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .split(vertical[0]);
     horizontal[0]
+}
+
+/// 维护面板右边的明细。
+fn draw_health_detail(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
+    let block = theme::panel(" 这一项在说什么 ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(item) = view.health.get(view.health_selected) else {
+        frame.render_widget(
+            Paragraph::new("左边挑一项，这里说清楚它是什么、能做什么")
+                .style(Style::default().fg(theme::FAINT)),
+            inner,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{}  {}", item.status.icon(), item.title),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            item.summary.clone(),
+            Style::default().fg(theme::YELLOW),
+        )),
+        Line::from(""),
+    ];
+    for line in &item.detail {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        match &item.action {
+            crate::packages::health::HealthAction::None => "  Enter 没事可做（这一项只能看）",
+            crate::packages::health::HealthAction::RemoveOrphans(_) => "  Enter 清掉这些孤儿包",
+            crate::packages::health::HealthAction::ClearCache => "  Enter 清包缓存（先看命令）",
+            crate::packages::health::HealthAction::Show(_) => "  Enter 看完整明细",
+            crate::packages::health::HealthAction::Update => "  Enter 系统更新（先看命令）",
+            crate::packages::health::HealthAction::CheckFiles => {
+                "  Enter 开始检查（几秒，之后自动打开输出）"
+            }
+        },
+        Style::default().fg(theme::PURPLE),
+    )));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_sort_menu(frame: &mut ratatui::Frame, view: &PackageView, selected: usize, area: Rect) {

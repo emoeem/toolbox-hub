@@ -1031,7 +1031,79 @@ impl App {
         let Some(view) = self.packages.as_mut() else {
             return false;
         };
-        view.poll()
+        let changed = view.poll();
+        // 维护面板要「把明细丢进输出视图」时，得由 App 来做（它才是打开视图的那个人）
+        if let Some((title, lines)) = view.pending_view.take() {
+            let captured = runtime::Captured {
+                label: title,
+                command: String::from("（维护检查的输出）"),
+                stdout: lines.join("\n"),
+                stderr: String::new(),
+                status: Some(0),
+                success: true,
+                elapsed: std::time::Duration::ZERO,
+                cancelled: false,
+            };
+            if let Some(viewer) = Viewer::from_captured(&[captured]) {
+                self.open_viewer(viewer);
+                return true;
+            }
+        }
+        changed
+    }
+
+    /// 维护面板里按 Enter：处理选中的那一项。
+    ///
+    /// 分两步写：先把「选中项的动作」取出来（只借不可变引用），松开之后再分发 ——
+    /// 因为处理动作要改 App（清缓存、系统更新都是），两边同时借 self 是过不去的。
+    pub fn run_health_action(&mut self, _cwd: &Path) -> io::Result<()> {
+        use packages::health::HealthAction;
+
+        let Some(view) = self.packages.as_ref() else {
+            return Ok(());
+        };
+        let Some(item) = view.health.get(view.health_selected) else {
+            return Ok(());
+        };
+        let title = item.title.to_string();
+        let action = item.action.clone();
+
+        match action {
+            HealthAction::None => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.message = format!("{title}：没什么要做的");
+                }
+            }
+            HealthAction::RemoveOrphans(names) => {
+                let (program, argv) = packages::orphan_remove_command(&names);
+                let (program, argv) = packages::escalate(&program, &argv);
+                if let Some(view) = self.packages.as_mut() {
+                    view.confirm = Some(crate::app::package_view::Confirm {
+                        title: format!("卸载 {} 个孤儿包", names.len()),
+                        command: packages::command_preview(&program, &argv),
+                        notes: vec![
+                            String::from("孤儿 = 没人依赖、你也没点名装过"),
+                            names.join("  "),
+                        ],
+                        action: crate::app::package_view::ConfirmAction::Orphans(names),
+                        pending: false,
+                    });
+                }
+            }
+            HealthAction::ClearCache => self.arm_cache(),
+            HealthAction::Update => self.arm_upgrade(),
+            HealthAction::CheckFiles => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.start_file_integrity();
+                }
+            }
+            HealthAction::Show(lines) => {
+                if let Some(view) = self.packages.as_mut() {
+                    view.pending_view = Some((title, lines));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 关闭包管理视图（历史与队列都落盘）。

@@ -13,6 +13,7 @@
 //! | PKGBUILD | `paru -Gp` | 官方没有第二条路 |
 //! | Arch 新闻 | `archlinux.org/feeds/news/` | 用来提醒「有没读过的新闻」，pacsea 的 Arch Status 就是这个意思 |
 
+pub mod health;
 pub mod libalpm;
 pub mod probe;
 pub mod worker;

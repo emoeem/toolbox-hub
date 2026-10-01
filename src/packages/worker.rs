@@ -32,6 +32,7 @@ use std::{
 
 use super::{
     InstalledPackage, NewsItem, PackageHit,
+    health::{self, HealthItem},
     libalpm::Db,
     probe::{InfoOutcome, Net},
 };
@@ -46,6 +47,10 @@ pub enum DbRequest {
     Removal(Vec<String>),
     DownloadTotal(Vec<String>),
     OrphanNames,
+    /// 维护面板的一屏检查。
+    Health,
+    /// 文件完整性（`pacman -Qk`，几秒，按需跑）。
+    FileIntegrity,
 }
 
 /// 发给网络线程的请求。
@@ -78,6 +83,10 @@ pub enum Response {
     Removal(Vec<String>),
     DownloadTotal(Option<u64>),
     OrphanNames(Vec<String>),
+    /// 维护面板的一屏检查。
+    Health(Vec<HealthItem>),
+    /// 文件完整性检查的输出（已经整理成行）。
+    FileIntegrity(Vec<String>),
     News(Result<NewsChunk, String>),
 }
 
@@ -162,6 +171,15 @@ impl Worker {
         self.db(DbRequest::OrphanNames);
     }
 
+    pub fn health(&self) {
+        self.db(DbRequest::Health);
+    }
+
+    /// 文件完整性（慢，用户按了才跑）。
+    pub fn file_integrity(&self) {
+        self.db(DbRequest::FileIntegrity);
+    }
+
     pub fn news(&self) {
         self.net(NetRequest::News);
     }
@@ -233,6 +251,8 @@ fn spawn_db(
                         Response::DownloadTotal(db.download_total(&names))
                     }
                     DbRequest::OrphanNames => Response::OrphanNames(db.orphan_names()),
+                    DbRequest::Health => Response::Health(health::scan(&db)),
+                    DbRequest::FileIntegrity => Response::FileIntegrity(file_integrity_output()),
                 };
                 if tx.send(response).is_err() {
                     break;
@@ -295,6 +315,21 @@ fn spawn_net(
     Ok(net_tx)
 }
 
+/// `pacman -Qk` 的输出整理成行（几秒级，只在用户按了才跑）。
+fn file_integrity_output() -> Vec<String> {
+    match std::process::Command::new("pacman").args(["-Qk"]).output() {
+        Ok(output) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            health::parse_file_check(&text, 200)
+        }
+        Err(error) => vec![format!("pacman -Qk 跑不起来：{error}")],
+    }
+}
+
 /// 数据库打不开时，把错误翻译成「这次请求该回什么」。
 fn failed_for(request: &DbRequest, error: &str) -> Response {
     match request {
@@ -315,6 +350,8 @@ fn failed_for(request: &DbRequest, error: &str) -> Response {
         DbRequest::Removal(_) => Response::Removal(Vec::new()),
         DbRequest::DownloadTotal(_) => Response::DownloadTotal(None),
         DbRequest::OrphanNames => Response::OrphanNames(Vec::new()),
+        DbRequest::Health => Response::Health(Vec::new()),
+        DbRequest::FileIntegrity => Response::FileIntegrity(Vec::new()),
     }
 }
 
@@ -360,6 +397,8 @@ mod tests {
             Response::Removal(_) => "卸载影响",
             Response::DownloadTotal(_) => "下载体积",
             Response::OrphanNames(_) => "孤儿名单",
+            Response::Health(_) => "维护检查",
+            Response::FileIntegrity(_) => "文件完整性",
             Response::News(_) => "新闻",
         }
     }

@@ -21,7 +21,7 @@ const MESSAGE_WIDTH: u16 = 48;
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let keys = if app.packages.is_some() {
-        "打字即筛 · Enter 摆命令再确认 · Space 排队 · ←→ 模式 · Tab 面板 · s 排序 · U 更新 · c 清缓存 · D 演练"
+        "打字即筛 · Enter 执行/处理 · Space 排队 · [ ] 切模式 · Tab 面板 · s 排序 · U 更新 · c 清缓存 · D 演练"
     } else if app.files.is_some() {
         "↑↓ 选择 · Enter 切到该文件所在目录 · 打字过滤 · Esc 关闭"
     } else if app.is_help_open() {

@@ -114,7 +114,7 @@ impl PackagePrefs {
         match self.mode.as_deref().map(str::trim) {
             Some("已安装") => Some(PackageMode::Installed),
             Some("新闻") => Some(PackageMode::News),
-            // 「维护」模式见下一条提交（那之前写了也只是回落到默认）
+            Some("维护") => Some(PackageMode::Health),
             Some("搜索") => Some(PackageMode::Search),
             _ => None,
         }

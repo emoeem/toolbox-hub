@@ -463,16 +463,25 @@ impl Db {
     }
 
     /// 孤儿包名单（没人依赖、你也没点名装的）。
+    ///
+    /// 刻意**不走 [`Db::installed`]**：那个还要判断「是不是外来包」，得先碰同步库
+    /// （首次 365ms）。孤儿判定只用本地库 + 依赖索引，几十微秒就够了 ——
+    /// 维护面板每次进都要扫一遍，省下来的都是按下去到看见东西之间的时间。
     pub fn orphan_names(&self) -> Vec<String> {
-        self.installed()
-            .map(|packages| {
-                packages
-                    .into_iter()
-                    .filter(|package| package.orphan)
-                    .map(|package| package.name)
-                    .collect()
+        self.handle
+            .localdb()
+            .pkgs()
+            .iter()
+            .filter(|package| {
+                let name = package.name();
+                is_orphan(
+                    package.reason() == PackageReason::Explicit,
+                    self.demand.required_by(name).len(),
+                    self.demand.optional_for(name).len(),
+                )
             })
-            .unwrap_or_default()
+            .map(|package| package.name().to_string())
+            .collect()
     }
 
     /// 官方源搜索（子串匹配，仓库优先级去重；详见自由函数时代的注释）。
