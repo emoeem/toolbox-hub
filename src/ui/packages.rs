@@ -134,7 +134,7 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         ),
     ];
 
-    // 已选（队列里有几个）—— 对应 paru 那个 `(0)`
+    // 已选（队列里有几个）—— 对应 paru 那个 `(0)`；顺手把「怎么去掉」写出来
     spans.push(Span::styled(
         format!("  ({} 已选)", view.queue.len()),
         Style::default().fg(if view.queue.is_empty() {
@@ -143,9 +143,16 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
             theme::YELLOW
         }),
     ));
+    if !view.queue.is_empty() {
+        spans.push(Span::styled(
+            " Space/Del 取消 · Tab 看队列",
+            Style::default().fg(theme::FAINT),
+        ));
+    }
 
-    // 输入态：把过滤词就写在这儿（paru 也没有单独的搜索框）
-    if view.editing {
+    // 筛选词就写在这儿（paru 也没有单独的搜索框）。
+    // 输入框**始终**在输入态，所以光标一直画着 —— 一眼就知道「打字是有效的」。
+    {
         let (before, after) = view.query.split_at_cursor();
         spans.push(Span::styled("   筛选 ", Style::default().fg(theme::GREEN)));
         spans.push(Span::styled(
@@ -160,11 +167,6 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
             Style::default()
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
-        ));
-    } else if !view.query.is_empty() {
-        spans.push(Span::styled(
-            format!("   筛选 {}", view.query.text()),
-            Style::default().fg(theme::DIM),
         ));
     }
 
@@ -204,7 +206,7 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     ));
 
     // 右端：键提示（paru 那行 `Tab:多选 | Enter:安装 | …`）
-    let hint = "Tab:队列 · Enter:执行 · Space:多选 · s:排序 · Esc:退出";
+    let hint = "打字:过滤 · Space:多选 · Enter:装 · Esc:清空筛选 · Ctrl+R:上网搜";
     let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
     let room = (area.width as usize).saturating_sub(used + hint.chars().count() + 2);
     spans.push(Span::raw(" ".repeat(room)));
@@ -363,7 +365,7 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
         } else if view.searched.is_none() && view.hits.is_empty() {
             "取数线程没起来：直接打字 + Enter 也能搜官方源与 AUR"
         } else if view.hits.is_empty() {
-            "没有匹配的包。Enter 上网搜一次，或者改改关键词"
+            "没有匹配的包。Enter 上网搜官方源 + AUR；或者按 Esc 清空筛选再看全部"
         } else {
             "都被仓库标签筛掉了：按 0 全开，或者点标签"
         };

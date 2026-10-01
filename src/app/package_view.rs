@@ -136,8 +136,13 @@ pub struct PackageView {
 
     // ── 搜索 ──
     pub query: TextInput,
-    /// 搜索框是不是在输入状态（字母会进 query）。
-    pub editing: bool,
+    /// 最近一次改筛选词的时间。
+    ///
+    /// 用来做「停手之后再上网找」：打字时只过滤本地全库（毫秒级），
+    /// 停手 400ms 且本地一个都没有，才去问 AUR（见 [`PackageView::poll`]）。
+    last_edit: Option<std::time::Instant>,
+    /// 已经为哪个词自动问过 AUR（同一个词只自动问一次）。
+    auto_searched: Option<String>,
     pub hits: Vec<PackageHit>,
     pub visible: Vec<usize>,
     pub repos: Vec<RepoChip>,
@@ -231,7 +236,8 @@ impl PackageView {
             operation: PackageOperation::Install,
             message: String::new(),
             query: TextInput::new(),
-            editing: true,
+            last_edit: None,
+            auto_searched: None,
             hits: Vec::new(),
             visible: Vec::new(),
             repos: Vec::new(),
@@ -378,7 +384,6 @@ impl PackageView {
         self.awaiting_official = true;
         self.awaiting_aur = true;
         self.searched = Some(term.clone());
-        self.editing = false;
         self.history_index = None;
         self.confirm = None;
         self.errors.clear();
@@ -465,7 +470,45 @@ impl PackageView {
             self.handle(response);
         }
         let asked = self.follow_selection();
-        handled || asked
+        let auto = self.maybe_auto_search();
+        handled || asked || auto
+    }
+
+    /// 停手之后再上网找：本地全库没有 → 自动问一次 AUR。
+    ///
+    /// 为什么要「停手」：打字时每个键都要过滤本地全库（毫秒级，很便宜），但**不能**
+    /// 每个键都发一次网络请求。所以打字的 400ms 内只做本地过滤，停下来了、
+    /// 而且本地一个都没匹配上，才去问 AUR —— 这正是「我要搜另一个包」时想要的：
+    /// 官方源里的包本地全库就有，AUR 里的包自动补上，不用记得按什么键。
+    fn maybe_auto_search(&mut self) -> bool {
+        if self.mode != PackageMode::Search || self.searching {
+            return false;
+        }
+        let term = self.query.text().trim().to_string();
+        if term.chars().count() < 4 || self.auto_searched.as_deref() == Some(term.as_str()) {
+            return false;
+        }
+        if !self.visible.is_empty() {
+            return false;
+        }
+        let Some(last) = self.last_edit else {
+            return false;
+        };
+        if last.elapsed() < std::time::Duration::from_millis(400) {
+            return false; // 还在打字
+        }
+
+        self.auto_searched = Some(term.clone());
+        self.searched = Some(term.clone());
+        self.awaiting_official = true;
+        self.awaiting_aur = true;
+        self.official_hits.clear();
+        self.aur_hits.clear();
+        self.message = format!("本地没有「{term}」，正在问官方源与 AUR…");
+        if let Some(worker) = self.worker.as_ref() {
+            worker.search(&term);
+        }
+        true
     }
 
     fn handle(&mut self, response: Response) {
@@ -914,6 +957,14 @@ impl PackageView {
     /// 三种模式共用一个输入框，所以不能在每个按键处各写一遍分发 —— 那是重复，
     /// 也是「某个模式忘了刷新」的来源。
     pub fn refilter(&mut self) {
+        // 改词就记时间：`poll` 靠它判断「你停手了没有」
+        self.last_edit = Some(std::time::Instant::now());
+        self.auto_searched = None;
+        // 光标回到第一条 —— 这是模糊查找的常识：打了 `vlc` 就该在最相关的
+        // `vlc` 上，而不是停在上一次的位置（实拍反馈：打完字先看到的是 y/z 一片）。
+        self.selected = 0;
+        self.installed_selected = 0;
+        self.news_selected = 0;
         match self.mode {
             PackageMode::Search => self.apply_filter(),
             PackageMode::Installed => self.apply_installed_filter(),
@@ -921,6 +972,21 @@ impl PackageView {
             // 维护面板是系统状态，不是能筛的列表
             PackageMode::Health => {}
         }
+    }
+
+    /// 清空筛选词（Esc 的第一下）。
+    pub fn clear_query(&mut self) {
+        if self.query.is_empty() {
+            return;
+        }
+        self.query.clear();
+        // 清空等于「重新开始」：顺手把搜索结果也丢掉，回到全库浏览
+        self.searched = None;
+        self.official_hits.clear();
+        self.aur_hits.clear();
+        self.auto_searched = None;
+        self.message = String::from("已清空筛选：显示全部包");
+        self.rebuild_hits();
     }
 
     /// 当前模式能用的排序方式（搜索与已安装看的东西不一样）。
@@ -1228,6 +1294,66 @@ impl PackageView {
         );
     }
 
+    /// 当前选中的那一行的包名（三种模式各自取）。
+    pub fn current_row_name(&self) -> Option<String> {
+        match self.mode {
+            PackageMode::Search => self.selected_hit().map(|hit| hit.name.clone()),
+            PackageMode::Installed => self.selected_installed().map(|item| item.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// 造一条队列项（从当前模式里能找到的信息来）。
+    fn queue_entry_for(&self, name: &str) -> QueuedPackage {
+        if let Some(hit) = self.hits.iter().find(|hit| hit.name == name) {
+            return QueuedPackage::new(hit);
+        }
+        if let Some(item) = self.installed.iter().find(|item| item.name == name) {
+            return QueuedPackage {
+                name: item.name.clone(),
+                origin: item.tag().to_string(),
+                version: item.version.clone(),
+            };
+        }
+        QueuedPackage {
+            name: name.to_string(),
+            origin: String::from("?"),
+            version: String::new(),
+        }
+    }
+
+    /// 把当前选中的那一行移出队列（`Del`）。
+    ///
+    /// 和 `toggle_queue` 的区别：这个**只减不增** —— 用户想「取消刚才选的」时
+    /// 不该担心再按一下又把它加回去。
+    pub fn remove_from_queue(&mut self) {
+        let removed = if self.pane == Pane::Queue {
+            if self.queue_selected < self.queue.len() {
+                Some(self.queue.remove(self.queue_selected).name)
+            } else {
+                None
+            }
+        } else {
+            let name = match self.mode {
+                PackageMode::Installed => self.selected_installed().map(|item| item.name.clone()),
+                PackageMode::Search => self.selected_hit().map(|hit| hit.name.clone()),
+                _ => None,
+            };
+            name.and_then(|name| {
+                let position = self.queue.iter().position(|item| item.name == name)?;
+                Some(self.queue.remove(position).name)
+            })
+        };
+
+        match removed {
+            Some(name) => self.message = format!("已从队列移除 {name}（Ctrl+D 清空整个队列）"),
+            None => self.message = String::from("这一行不在队列里（Space 才会加进去）"),
+        }
+        if self.queue_selected >= self.queue.len() {
+            self.queue_selected = self.queue.len().saturating_sub(1);
+        }
+    }
+
     /// 队列里的包名（拼命令用）。
     pub fn queue_names(&self) -> Vec<String> {
         self.queue.iter().map(|item| item.name.clone()).collect()
@@ -1281,10 +1407,17 @@ impl PackageView {
     // ── 确认（dry-run 预览）───────────────────────────────────────────────
 
     /// 执行队列前先摆出命令与影响（再按一次 Enter 才真跑）。
+    ///
+    /// 队列空的时候，**把当前选中的那个包加进来** —— 这就是 paru 的 `Enter:安装`：
+    /// 你不是先「多选」再「执行」，而是「就装这一个」。多选仍然可用（Space），
+    /// 那时 Enter 装的是队列里的全部。
     pub fn arm_queue(&mut self) {
         if self.queue.is_empty() {
-            self.message = String::from("队列是空的：Space 把包加进来");
-            return;
+            let Some(name) = self.current_row_name() else {
+                self.message = String::from("没有选中的包：先打字过滤，或者 Space 多选");
+                return;
+            };
+            self.queue.push(self.queue_entry_for(&name));
         }
         let names = self.queue_names();
         let uses_aur = self.queue_has_aur();

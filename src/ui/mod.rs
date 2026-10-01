@@ -393,7 +393,6 @@ mod tests {
 
         // 光标画在它真正在的位置上（以前永远贴在末尾，因为压根没有光标）
         if let Some(view) = app.packages.as_mut() {
-            view.editing = true;
             view.query.set("fzf");
             view.query.left();
         }
@@ -404,7 +403,6 @@ mod tests {
         );
         if let Some(view) = app.packages.as_mut() {
             view.query.end();
-            view.editing = false;
         }
 
         let screen = render_compact(&mut app, 160, 40);
@@ -421,7 +419,8 @@ mod tests {
             "依赖于",
             "下载大小",
             "已选",
-            "Tab:队列",
+            "Space/Del取消",
+            "打字:过滤",
         ] {
             assert!(screen.contains(wanted), "屏幕上少了 {wanted}：\n{screen}");
         }
@@ -557,8 +556,7 @@ mod tests {
         use crate::app::{handle_paste, package_view::PackageView};
 
         let mut app = app();
-        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
-        view.editing = true;
+        let view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         app.packages = Some(view);
 
         handle_paste(&mut app, "fzf\n--height 40%\t-x");

@@ -59,7 +59,15 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::FAINT),
             ),
             Span::styled("   ", Style::default()),
-            Span::styled("q 退出", Style::default().fg(theme::DIM)),
+            // 软件包中心里 `q` 是**打字**（输入框常驻），所以那儿只能说 Esc
+            Span::styled(
+                if app.packages.is_some() {
+                    "Esc 退出"
+                } else {
+                    "q 退出"
+                },
+                Style::default().fg(theme::DIM),
+            ),
         ]))
         .alignment(Alignment::Right),
         right,
