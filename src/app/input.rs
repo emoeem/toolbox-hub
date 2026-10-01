@@ -933,9 +933,17 @@ fn handle_packages_key(
         .unwrap_or(PackageMode::Search);
 
     match key.code {
-        // 关掉视图（q / Esc）；在输入状态时 Esc 只是退出输入
+        // 关掉视图（q / Esc）。
+        //
+        // 输入态下 Esc 先退出输入 —— **但输入框是空的时候直接关**。
+        // 理由很实在：一进包管理域界面就开着（自动打开），输入框默认是输入态，
+        // 于是「Esc 回动作列表」要按两下；而空输入框本来也没什么可「退出」的。
         KeyCode::Esc => {
-            if editing {
+            let has_text = app
+                .packages
+                .as_ref()
+                .is_some_and(|view| !view.query.is_empty());
+            if editing && has_text {
                 if let Some(view) = app.packages.as_mut() {
                     view.editing = false;
                     view.message = String::from("退出输入（i 或 / 继续改词）");
