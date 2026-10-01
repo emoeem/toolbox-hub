@@ -1,0 +1,53 @@
+# toolbox-hub 的 PKGBUILD。
+#
+# 这个文件**现在就能用**：它从仓库根目录打包（见 packaging/make-source-tarball.sh），
+# 不依赖任何还没发布的远端。等仓库推到公开地址之后，把 source 与 sha256sums
+# 换成 URL 那一套就能交 AUR（步骤见 packaging/README.md）。
+#
+# 维护者: 待填 <you@example.com>      # AUR 要求填真名与邮箱
+
+pkgname=toolbox-hub
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管理（直连 libalpm）"
+arch=('x86_64' 'aarch64')
+url="https://github.com/你的用户名/toolbox-hub"   # TODO: 换了远端记得改这里
+# TODO: 仓库里还没有 LICENSE 文件。定了许可证之后把这里改掉，
+# 并把 LICENSE 提交进去 —— AUR 要求许可证字段是真实有效的。
+license=('unknown')
+# 为什么只写 pacman：二进制直接链接了 libalpm.so，而 libalpm 自己的依赖
+# （libarchive / openssl / curl / gpgme / brotli / bzip2 / acl …）都由 pacman 包
+# 声明并安装。同理 gcc-libs 提供 libgcc_s。
+depends=('glibc' 'gcc-libs' 'pacman')
+makedepends=('cargo' 'rust' 'pkgconf')
+# options：不生成 debug 包（Rust 的调试符号很大，对使用者没用）。
+options=('!debug')
+# 本地打包：tarball 由 make-source-tarball.sh 生成在旁边，所以校验和写 SKIP。
+# 发布到 AUR 时换成 URL + 真实 sha256sums（makepkg -g >> PKGBUILD）。
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  # --locked：用仓库里的 Cargo.lock 构建，避免“在我机器上是好的”。
+  cargo build --release --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  # 项目的三道门之一。想跳过用 makepkg --nocheck。
+  cargo test --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 packaging/toolbox-hub.1 \
+    "$pkgdir/usr/share/man/man1/toolbox-hub.1"
+  install -Dm644 completions/toolbox-hub.fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/toolbox-hub.fish"
+
+  # 许可证文件还没进仓库，有 LICENSE 之后取消注释
+  # install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

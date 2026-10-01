@@ -1,0 +1,306 @@
+.\" toolbox-hub 的手册页。roff 源，装到 /usr/share/man/man1/。
+.\"
+.\" 写法上的两条约定：
+.\" 1. 中文用 .ds 定义不了，直接写在正文里（groff 的 man 宏对 UTF-8 是透明的）；
+.\" 2. 每个选项都写清楚「它到底干了什么」，而不是把 --help 抄一遍 ——
+.\"    手册页的价值在于把「为什么」也写进去。
+.TH TOOLBOX-HUB 1 "2026-10-01" "toolbox-hub 0.1.0" "用户命令"
+.SH 名称
+toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 工具箱
+.SH 概要
+.B toolbox-hub
+.RI [ 选项 ]
+.RI [ 脚本目录 ]
+.br
+.B toolbox-hub
+.B \-s
+.I 关键词
+.br
+.B toolbox-hub
+.B \-i
+.I 包名
+.RI [ 包名 …]
+.SH 描述
+.B toolbox-hub
+把「命令复杂、参数众多、难以记忆」的命令行工具，以及你自己的脚本，统一包装成一个
+可发现、可填表、可回看的界面。
+.PP
+它\fB不是\fR桌面应用启动器：界面只是命令行工具的交互层，真正干活的始终是那些工具本身。
+不带动作参数时进入 TUI；带上动作参数就干完即退，可以写进脚本、丢进管道。
+.PP
+包管理部分是\fB原生\fR的：搜索、包信息、已安装列表、可更新数都由
+.B libalpm
+直接读取 pacman 的数据库（不是解析
+.BR pacman (8)
+的输出），所以拿到的是结构化数据，版本比较也用的是 pacman 自己的规则。
+真正改系统的那一下仍然交给
+.BR pacman (8)
+或
+.BR paru (8)。
+.SH 选项
+.SS 动作
+不带动作参数时进入 TUI。
+.TP
+.BR \-s ", " \-\-search " " \fI关键词\fR
+搜索官方源与 AUR。官方源的结果先出（毫秒级），AUR 的晚几秒补进来。
+.TP
+.BR \-i ", " \-\-install " " \fI包名…\fR
+安装包。队列里出现 AUR 包时自动改用
+.BR paru (8)；
+非 root 时命令前面会自动补
+.BR sudo (8)。
+.TP
+.BR \-r ", " \-\-remove " " \fI包名…\fR
+卸载包（
+.BR "pacman \-Rns" ），
+只被它们依赖的依赖会一起清掉。
+.TP
+.BR \-u ", " \-\-update
+系统更新（有
+.B paru
+就
+.BR "paru \-Syu" ，
+否则
+.BR "sudo pacman \-Syu" ）。
+.TP
+.BR \-n ", " \-\-news
+看 Arch 官方新闻。
+.TP
+.BR \-l ", " \-\-list
+列已安装的包。
+.TP
+.B \-\-orphans
+列出孤儿包（没人依赖、你也没点名装过的那些）。
+.TP
+.B \-\-remove\-orphans
+卸载孤儿包。
+.TP
+.B \-\-clear\-cache
+清包缓存。有
+.B paccache
+就用
+.BR "paccache \-rk1" ，
+否则退回
+.BR "pacman \-Sc" 。
+.SS 范围（配合上面某些动作）
+.TP
+.B \-\-unread
+只看没读过的新闻（与
+.B \-n
+搭配）。
+.TP
+.B \-\-read
+只看读过的新闻（与
+.B \-n
+搭配）。
+.TP
+.BR \-a ", " \-\-all\-news
+全部新闻（与
+.B \-n
+搭配）。
+.TP
+.B \-\-exp
+只看自己点名装的（与
+.B \-l
+搭配）。
+.TP
+.B \-\-imp
+只看被依赖拖进来的（与
+.B \-l
+搭配）。
+.TP
+.B \-\-all
+全部（
+.B \-n
+与
+.B \-l
+都认）。
+.SS 通用
+.TP
+.B \-\-dry\-run
+只打印将要执行的命令，不动系统。TUI 里对应的是按
+.B D
+打开「演练模式」。
+.TP
+.BI \-\-config\-dir " 目录"
+配置目录：收藏、你自己的 manifest 与脚本、包中心偏好。
+默认
+.IR ~/.config/toolbox-hub ，
+也可用环境变量
+.BR TOOLBOX_HUB_CONFIG 。
+.TP
+.BI \-\-data\-dir " 目录"
+数据目录：执行历史、安装队列、搜索历史、已读新闻。
+默认
+.IR ~/.local/share/toolbox-hub ，
+也可用
+.BR TOOLBOX_HUB_DATA 。
+配置与数据分开是有意的：配置是换机器要带走的，数据是可再生的。
+.TP
+.BR \-h ", " \-\-help
+显示帮助。
+.TP
+.BR \-V ", " \-\-version
+显示版本。
+.SH 界面按键
+进界面按
+.B ?
+可以随时看全部键位。常用的：
+.TP
+.B ↑ ↓ / j k
+选择。
+.TP
+.B Enter
+执行选中的工具（要参数的工具会先打开表单）。
+.TP
+.B /
+搜索（跨所有域）。
+.TP
+.BR ← → " / " 1\-7
+切换域（媒体 / 图像 / 系统 / 网络 / 开发 / 工具 / 包管理）。
+.TP
+.BR F
+看工作目录里的媒体文件（脚本看到的也是这些），右半边预览图片。
+.TP
+.BR p
+打开软件包中心。
+.TP
+.BR y
+把终端交给文件管理器（默认
+.BR yazi ），
+退出时工作目录跟着你走。
+.TP
+.B ?
+帮助；
+.B q
+退出。
+.SS 软件包中心（按 p）
+.TP
+.BR ← → " / " [ " " ]
+切换模式：搜索 / 已安装 / 新闻 / 维护。
+输入状态下
+.B ← →
+归光标管，这时用
+.B [ ] 
+切模式。
+.TP
+.B 打字
+本地模糊过滤已有结果（键入即筛）；按
+.B Enter
+才上网搜。
+.TP
+.BR Tab
+在结果 / 安装清单 / 包信息之间换焦点。
+.TP
+.B Space
+把选中的包加入安装清单（再按一次移出）。
+.TP
+.B Enter
+把要跑的命令摆到确认面板上 —— \fB再按一次\fR才真的执行。
+.TP
+.BR m " / " U " / " c " / " O
+切换队列操作（安装 / 卸载 / 仅下载）、系统更新、清缓存、清孤儿。
+.TP
+.BR D
+演练模式：确认之后只显示命令，不动系统。
+.SH 环境变量
+所有变量都是可选的。
+.TP
+.B TOOLBOX_HUB_PATH
+脚本目录（冒号分隔），相当于命令行里的「脚本目录」位置参数。
+.TP
+.B TOOLBOX_HUB_MANIFEST_PATH
+manifest 目录（冒号分隔），默认
+.IR <配置目录>/tools.d 。
+.TP
+.B TOOLBOX_HUB_CONFIG
+配置目录。
+.TP
+.B TOOLBOX_HUB_DATA
+数据目录。
+.TP
+.B TOOLBOX_HUB_STATE
+状态文件（收藏 / 工作目录）的完整路径，覆盖配置目录里的
+.IR state.toml 。
+.TP
+.B TOOLBOX_HUB_WORKDIR
+启动时的工作目录（工具在这里执行、找文件）。
+.TP
+.B TOOLBOX_HUB_FILE_MANAGER
+按
+.B y
+时启动的文件管理器，默认
+.BR yazi 。
+.SH 文件
+.TP
+.I <配置目录>/state.toml
+收藏、工作目录、最近用过的目录。
+.TP
+.I <配置目录>/tools.d/*.toml
+你自己的 manifest（同 id 会覆盖内置动作）。
+.TP
+.I <配置目录>/tools/
+你自己的脚本（头部注解即可被发现）。
+.TP
+.I <配置目录>/packages.toml
+软件包中心的默认偏好（默认仓库、演练模式、清缓存保留几个版本、排序、默认模式）。
+第一次进界面时会自动写一份带注释的模板。
+.TP
+.I <数据目录>/history.log
+执行历史（纯文本，可直接看 / 改）。
+.TP
+.I <数据目录>/install-queue.txt
+安装清单（一行一个
+.IR 仓库/包名 " " 版本 ）。
+.TP
+.I <数据目录>/package-searches.log
+搜索历史。
+.TP
+.I <数据目录>/news-read.log
+已读新闻（一行一个链接；删掉一行就等于标回未读）。
+.SH 示例
+搜索并安装：
+.PP
+.RS 4
+.EX
+$ toolbox\-hub \-s fzf
+$ toolbox\-hub \-i fzf ripgrep
+.EE
+.RE
+.PP
+先看要跑什么，再决定跑不跑：
+.PP
+.RS 4
+.EX
+$ toolbox\-hub \-\-dry\-run \-i fzf
+（演练，没有执行）sudo pacman \-S \-\-needed fzf
+.EE
+.RE
+.PP
+自己点名装的包有哪些（一万多个包里找东西时很有用）：
+.PP
+.RS 4
+.EX
+$ toolbox\-hub \-l \-\-exp | wc \-l
+$ toolbox\-hub \-l \-\-imp | head
+.EE
+.RE
+.PP
+把配置和数据都放在 U 盘上随身带：
+.PP
+.RS 4
+.EX
+$ toolbox\-hub \-\-config\-dir /mnt/u/tbh/config \\
+              \-\-data\-dir   /mnt/u/tbh/data
+.EE
+.RE
+.SH 退出状态
+0 表示成功；1 表示动作失败（例如安装命令非零退出）；2 表示参数写错了。
+.SH 参见
+.BR pacman (8),
+.BR paru (8),
+.BR paccache (8),
+.BR yazi (1)
+.PP
+项目主页与完整说明见仓库里的
+.IR README.md 。
