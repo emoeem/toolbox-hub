@@ -93,6 +93,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 # 裁剪/GIF 的输出时长不等于输入时长，按 -t 算百分比。
@@ -118,6 +120,7 @@ label = "输入视频"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "要裁剪的视频"
 
@@ -151,7 +154,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/clip.mp4"
+default = "{stem}_clip.{ext}"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 [[action]]
 id = "ffmpeg-trim-exact"
@@ -164,6 +168,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 # 裁剪/GIF 的输出时长不等于输入时长，按 -t 算百分比。
@@ -179,6 +185,7 @@ label = "输入视频"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "要裁剪的视频"
 
@@ -240,7 +247,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/clip.mp4"
+default = "{stem}_clip.{ext}"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 # ── 转码 / 压缩 / 缩放 ───────────────────────────────────────────────────────
 
@@ -255,6 +263,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 install = "sudo pacman -S ffmpeg"
@@ -268,6 +278,7 @@ label = "输入视频"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "要压缩的视频"
 
@@ -340,7 +351,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/small.mp4"
+default = "{stem}_small.mp4"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 [[action]]
 id = "ffmpeg-resize"
@@ -353,6 +365,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 install = "sudo pacman -S ffmpeg"
@@ -366,6 +380,7 @@ label = "输入视频"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "要缩放的视频"
 
@@ -426,7 +441,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/720p.mp4"
+default = "{stem}_resized.mp4"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 [[action]]
 id = "ffmpeg-extract-audio"
@@ -439,6 +455,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 install = "sudo pacman -S ffmpeg"
@@ -452,6 +470,7 @@ label = "输入文件"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "必须有音轨，否则 ffmpeg 会报「Output file does not contain any stream」"
 
@@ -503,7 +522,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/audio.mp3"
+default = "{stem}.mp3"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 # ── 其它常用动作 ────────────────────────────────────────────────────────────
 
@@ -518,6 +538,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 # 裁剪/GIF 的输出时长不等于输入时长，按 -t 算百分比。
@@ -533,6 +555,7 @@ label = "输入视频"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "要转的视频"
 
@@ -585,7 +608,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/out.gif"
+default = "{stem}.gif"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 [[action]]
 id = "ffmpeg-mute"
@@ -598,6 +622,8 @@ program = "ffmpeg"
 # -nostats 关掉 stderr 上那堆 \r 刷屏的统计行。
 base_argv = ["-nostats", "-progress", "pipe:1"]
 mode = "capture"
+# 批量：每个输入各跑一次、各自一个输出。
+foreach = "input"
 # 进度条的总时长从哪儿来：探这个参数的媒体文件。
 duration_from = "input"
 install = "sudo pacman -S ffmpeg"
@@ -611,6 +637,7 @@ label = "输入视频"
 kind = "path"
 flag = "-i"
 required = true
+repeatable = true
 placement = "leading"
 help = "要去掉声音的视频"
 
@@ -646,7 +673,8 @@ key = "output"
 label = "输出文件"
 kind = "path"
 required = true
-help = "例如 /tmp/mute.mp4"
+default = "{stem}_mute.mp4"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板 —— 批量时每个输入各生成一个"
 
 [[action]]
 id = "ffmpeg-merge-av"

@@ -215,6 +215,8 @@ struct ManifestAction {
     #[serde(default)]
     features: Option<String>,
     #[serde(default)]
+    foreach: Option<String>,
+    #[serde(default)]
     duration_from: Option<String>,
     #[serde(default)]
     limit_from: Option<String>,
@@ -287,11 +289,30 @@ impl ManifestAction {
         let mut arguments = Vec::with_capacity(self.argument.len());
         let mut keys: BTreeSet<String> = BTreeSet::new();
         for raw in &self.argument {
-            let argument = raw.build(id)?;
+            let argument = raw.build(id, self.foreach.as_deref())?;
             if !keys.insert(argument.key.clone()) {
                 return Err(complain(&format!("参数 key 重复「{}」", argument.key)));
             }
             arguments.push(argument);
+        }
+
+        // `foreach` 指向的字段必须真能装下多个输入 —— 漏配在**发现阶段**就报出来，
+        // 而不是等你选了两个文件、被选择器拒绝时才发现（实拍踩过一次）。
+        // 注意：带 flag 是允许的（每次跑只有一条值）。
+        if let Some(key) = self
+            .foreach
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            let Some(argument) = arguments.iter().find(|argument| argument.key == key) else {
+                return Err(complain(&format!("foreach 指向的参数「{key}」不存在")));
+            };
+            if !argument.repeatable {
+                return Err(complain(&format!(
+                    "foreach 的字段「{key}」必须写 repeatable = true（每个输入各跑一次，它要装得下多个）"
+                )));
+            }
         }
 
         let program = self.program.trim().to_string();
@@ -337,6 +358,7 @@ impl ManifestAction {
                 arguments,
                 duration_from: self.duration_from.clone(),
                 limit_from: self.limit_from.clone(),
+                foreach: self.foreach.clone(),
             }),
             // 解析成绝对路径，详情区就能说清「到底会跑哪个二进制」。
             path: metadata::resolve_program(&program).unwrap_or_else(|| PathBuf::from(&program)),
@@ -346,7 +368,7 @@ impl ManifestAction {
 }
 
 impl ManifestArgument {
-    fn build(&self, action_id: &str) -> Result<Argument, String> {
+    fn build(&self, action_id: &str, foreach_key: Option<&str>) -> Result<Argument, String> {
         let key = self.key.trim();
         if key.is_empty() {
             return Err(format!("{action_id}: 有个参数缺少 key"));
@@ -378,9 +400,13 @@ impl ManifestArgument {
                 "{action_id}/{key}: toggle 必须给 flag，否则打开了也没有效果"
             ));
         }
-        if self.repeatable && self.flag.is_some() {
+        // 多值 + flag 平时不允许：`-i a -i b` 与 `-i a b` 两种写法语义不同，不替工具猜。
+        // 但 `foreach = "这个字段"` 是例外 —— 那时每次执行只有一条值，
+        // `-i <一个文件>` 毫无歧义（ffmpeg 批量转码正是靠这个）。
+        let is_foreach_field = foreach_key.is_some_and(|key| key == self.key.trim());
+        if self.repeatable && self.flag.is_some() && !is_foreach_field {
             return Err(format!(
-                "{action_id}/{key}: 多值目前只支持位置参数（带 flag 的多值有 `-i a -i b` 与 `-i a b` 两种写法，遇到真的需要它的工具再加）"
+                "{action_id}/{key}: 多值只支持位置参数（带 flag 的多值有 `-i a -i b` 与 `-i a b` 两种写法）；如果它是给 `foreach` 用的批量字段，就在动作上写 foreach = \"{key}\""
             ));
         }
         if self.repeatable && matches!(kind, ArgKind::Choice | ArgKind::Toggle) {
@@ -730,6 +756,85 @@ mod tests {
         }
     }
 
+    /// `foreach` 配错要在发现阶段报出来（实拍踩过一次：字段不是 repeatable，
+    /// 选择器多选被拒，而报错信息完全指不到 manifest）。
+    #[test]
+    fn a_misconfigured_foreach_is_reported() {
+        let dir = temp_dir("manifest-foreach");
+        let write = |name: &str, body: &str| {
+            fs::write(dir.join(name), body).expect("write");
+        };
+
+        // 指向不存在的参数
+        write(
+            "missing.toml",
+            "[[action]]\nid = \"m1\"\nname = \"M\"\nsummary = \"s\"\ndomain = \"媒体\"\nprogram = \"ffmpeg\"\nforeach = \"input\"\n",
+        );
+        // 字段存在但不是 repeatable
+        write(
+            "notrepeat.toml",
+            "[[action]]\nid = \"m2\"\nname = \"M\"\nsummary = \"s\"\ndomain = \"媒体\"\nprogram = \"ffmpeg\"\nforeach = \"input\"\n\n[[action.argument]]\nkey = \"input\"\nlabel = \"输入\"\nkind = \"path\"\n",
+        );
+        // 带 flag 的批量字段是**合法的**（每次跑只有一条值，`-i <一个>` 无歧义）
+        write(
+            "flagged.toml",
+            "[[action]]\nid = \"m3\"\nname = \"M\"\nsummary = \"s\"\ndomain = \"媒体\"\nprogram = \"ffmpeg\"\nforeach = \"input\"\n\n[[action.argument]]\nkey = \"input\"\nlabel = \"输入\"\nkind = \"path\"\nrepeatable = true\nflag = \"-i\"\n",
+        );
+
+        let discovery = ManifestProvider::new(vec![dir.clone()])
+            .discover()
+            .expect("discover");
+
+        assert_eq!(discovery.warnings.len(), 2, "{:#?}", discovery.warnings);
+        assert!(
+            discovery.tools.iter().any(|tool| tool.id == "manifest:m3"),
+            "带 flag 的批量字段应该被接受: {:#?}",
+            discovery.warnings
+        );
+        assert!(
+            discovery
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("不存在")),
+            "{:#?}",
+            discovery.warnings
+        );
+        assert!(
+            discovery
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("repeatable")),
+            "{:#?}",
+            discovery.warnings
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 内置的 foreach 动作必须配得对（真跑时才知道痛，所以这里先钉住）。
+    #[test]
+    fn bundled_foreach_actions_are_configured_correctly() {
+        let discovery = bundled_discovery();
+        let mut found = 0;
+        for tool in &discovery.tools {
+            let Some(action) = tool.action.as_ref() else {
+                continue;
+            };
+            let Some(key) = action.foreach.as_deref() else {
+                continue;
+            };
+            found += 1;
+            let argument = action
+                .arguments
+                .iter()
+                .find(|argument| argument.key == key)
+                .unwrap_or_else(|| panic!("{} 的 foreach 指向了不存在的 {key}", tool.id));
+            assert!(argument.repeatable, "{} 的 {key} 要 repeatable", tool.id);
+            // 带不带 flag 都合法（ffmpeg 的输入就是 `-i`；每次跑只有一条值）。
+        }
+        assert!(found >= 5, "至少应有几个批量动作，实际 {found}");
+    }
+
     /// 该多值的字段必须真的标了多值 —— 否则「一次处理多个文件」会静默失效。
     #[test]
     fn multi_value_actions_are_marked_repeatable() {
@@ -752,7 +857,7 @@ mod tests {
                 .find(|argument| argument.key == key)
                 .unwrap_or_else(|| panic!("{id} 里没有参数 {key}"));
             assert!(argument.repeatable, "{id} 的 {key} 应该是多值");
-            assert!(argument.flag.is_none(), "多值目前只支持位置参数");
+            // 带不带 flag 都合法：ffmpeg 的输入就是 `-i`（每次跑只有一条值）。
         }
     }
 

@@ -153,6 +153,14 @@ pub struct ArgumentValues {
 }
 
 impl ArgumentValues {
+    /// 导出全部取值（键有序，便于落盘与比较）。
+    pub fn pairs(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -186,6 +194,13 @@ pub struct Action {
     /// 「这次只会做 N 秒」从哪个参数取（`limit_from = "duration"`）：
     /// 裁剪类动作的输出时长不等于输入时长，有它就按它算百分比。
     pub limit_from: Option<String>,
+    /// 批量：声明的那个参数**每个取值各跑一次**（`foreach = "input"`）。
+    ///
+    /// 和 `repeatable` 的区别很重要：`repeatable` 是「一条命令塞多个参数」
+    /// （jq 读多个文件就是这样），`foreach` 是「N 条命令、各一个输出」
+    /// （转码一个目录就是这样）。其余字段里的 `{name}`/`{stem}`/`{ext}`/`{dir}`
+    /// 会按当前那个文件替换，所以输出能写成 `{stem}_small.mp4`。
+    pub foreach: Option<String>,
 }
 
 impl Action {
@@ -228,13 +243,26 @@ impl Action {
                 continue;
             }
 
-            // 多值：拆成多个 argv 元素，各占一个位置。
+            // 多值：拆成多个 argv 元素，各占一个位置（带 flag 时每个值都配一个 flag，
+            // 例如 `-i a -i b`）。`foreach` 的批量字段每次只会有一个值，于是就是
+            // `-i <一个文件>` —— 这也是 foreach 字段允许带 flag 的原因。
             if argument.repeatable {
                 let items = argument.split_values(&value);
                 if argument.required && items.is_empty() {
                     return Err(format!("「{}」是必填项", argument.label));
                 }
-                phases[slot].extend(items);
+                for item in items {
+                    match &argument.flag {
+                        Some(flag) if argument.flag_join => {
+                            phases[slot].push(format!("{flag}{item}"));
+                        }
+                        Some(flag) => {
+                            phases[slot].push(flag.clone());
+                            phases[slot].push(item);
+                        }
+                        None => phases[slot].push(item),
+                    }
+                }
                 continue;
             }
 
@@ -319,6 +347,7 @@ mod tests {
             base_argv: vec!["--no-mtime".to_string()],
             duration_from: None,
             limit_from: None,
+            foreach: None,
             arguments: vec![
                 Argument {
                     key: "url".to_string(),
@@ -599,6 +628,26 @@ mod tests {
         );
     }
 
+    /// 多值字段带 flag 时，每个值都要有自己的 flag（`-i a -i b`）。
+    ///
+    /// 这个分支以前直接把 flag 丢了 —— 因为那时「多值 + flag」是禁止的，
+    /// 直到 `foreach` 放开了它（批量转码的 `-i`）才暴露出来。
+    #[test]
+    fn a_repeatable_flagged_argument_repeats_its_flag() {
+        let mut action = action();
+        action.arguments[1].repeatable = true; // quality：带 -f
+        action.arguments[1].separator = String::from("|");
+        let mut values = action.default_values();
+        values.set("url", "a.mp4");
+        values.set("quality", "best|worst");
+        values.set("subtitles", "false");
+
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["--no-mtime", "-f", "best", "-f", "worst", "a.mp4"]
+        );
+    }
+
     #[test]
     fn empty_action_yields_empty_argv() {
         let action = Action {
@@ -607,6 +656,7 @@ mod tests {
             arguments: Vec::new(),
             duration_from: None,
             limit_from: None,
+            foreach: None,
         };
         assert_eq!(action.build_argv(&ArgumentValues::new()), Ok(Vec::new()));
     }

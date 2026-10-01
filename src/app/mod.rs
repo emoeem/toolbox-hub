@@ -106,6 +106,8 @@ const TAIL_LINES: usize = 12;
 /// 交给后台队列的一次执行。
 pub struct CaptureRequest {
     pub tool: ToolDefinition,
+    /// 当时的表单取值（历史「回填再改」用）。
+    pub values: Vec<(String, String)>,
     /// 真正执行的参数。
     pub argv: Vec<String>,
     /// 写进历史的参数（敏感值已替换；程序名由 [`App::enqueue_captures`] 补上）。
@@ -123,6 +125,8 @@ struct PendingJob {
     argv: Vec<String>,
     /// 写进历史的参数（敏感值已替换）。
     record_argv: Vec<String>,
+    /// 当时的表单取值。
+    values: Vec<(String, String)>,
     /// 进度条用的总秒数。
     total_seconds: Option<f64>,
 }
@@ -135,6 +139,7 @@ pub struct RunningJobView {
     tool_id: String,
     tool_name: String,
     record_argv: Vec<String>,
+    values: Vec<(String, String)>,
     /// 最近几行输出（`(是否 stderr, 内容)`）。
     pub tail: VecDeque<(bool, String)>,
     /// 最近一次的进度键值（ffmpeg `-progress` 那种）。
@@ -155,6 +160,7 @@ impl RunningJobView {
             tool_id: String::from("test:job"),
             tool_name: String::from("测试任务"),
             record_argv: Vec::new(),
+            values: Vec::new(),
             tail: tail.into(),
             progress,
         }
@@ -1172,6 +1178,7 @@ impl App {
                 program: tool.path.clone(),
                 argv: request.argv,
                 record_argv,
+                values: request.values,
                 total_seconds: request.total_seconds,
             });
         }
@@ -1197,6 +1204,7 @@ impl App {
                     tool_id: pending.tool_id,
                     tool_name: pending.tool_name,
                     record_argv: pending.record_argv,
+                    values: pending.values,
                     tail: VecDeque::new(),
                     progress: Vec::new(),
                 });
@@ -1250,8 +1258,12 @@ impl App {
         let Some(running) = self.running.take() else {
             return;
         };
-        let (tool_id, tool_name, record_argv) =
-            (running.tool_id, running.tool_name, running.record_argv);
+        let (tool_id, tool_name, record_argv, values) = (
+            running.tool_id,
+            running.tool_name,
+            running.record_argv,
+            running.values,
+        );
 
         let cancelled = captured.cancelled;
         let success = captured.success;
@@ -1259,6 +1271,7 @@ impl App {
             &tool_id,
             &tool_name,
             &record_argv,
+            &values,
             success && !cancelled,
             captured.elapsed.as_millis(),
         );
@@ -1554,8 +1567,82 @@ impl App {
             .cloned()
     }
 
-    /// 把路径写进第 `field` 个字段：单值替换、多值追加。
     /// 把一批路径写进第 `field` 个字段：单值替换、多值追加、已选过的不重复加。
+    /// 把填好的表单展开成**一次或多次**执行。
+    ///
+    /// 动作声明了 `foreach = "input"` 时：那个参数的**每个取值各跑一次**，
+    /// 其余字段里的 `{name}` / `{stem}` / `{ext}` / `{dir}` 按当前那个文件替换 ——
+    /// 所以输出可以写成 `{stem}_small.mp4`，选 3 个文件就得到 3 个输出。
+    ///
+    /// 没声明 `foreach` 就是普通的一次执行（`repeatable` 那种「一条命令塞多个参数」
+    /// 走的是 `build_argv`，不经过这里）。
+    pub fn form_build_runs(&self) -> Result<Vec<(Vec<String>, ArgumentValues)>, String> {
+        let tool = self
+            .form_tool()
+            .ok_or_else(|| String::from("没有打开的表单"))?;
+        let action = tool
+            .action
+            .as_ref()
+            .ok_or_else(|| String::from("这件工具不需要参数"))?;
+        let values = self.form_values().cloned().unwrap_or_default();
+
+        let Some(key) = action.foreach.as_deref() else {
+            return Ok(vec![(action.build_argv(&values)?, values)]);
+        };
+
+        let items = action
+            .arguments
+            .iter()
+            .find(|argument| argument.key == key)
+            .map(|argument| argument.split_values(values.get(key).unwrap_or("")))
+            .unwrap_or_default();
+        if items.is_empty() {
+            return Err(format!("「{key}」是批量字段，至少要填一条"));
+        }
+
+        let mut runs = Vec::with_capacity(items.len());
+        for item in &items {
+            let path = Path::new(item);
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| item.clone());
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone());
+            let ext = path
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let dir = path
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default();
+
+            let mut one = values.clone();
+            for argument in &action.arguments {
+                if argument.key == key {
+                    continue;
+                }
+                let Some(value) = one.get(&argument.key).map(str::to_string) else {
+                    continue;
+                };
+                let replaced = value
+                    .replace("{name}", &name)
+                    .replace("{stem}", &stem)
+                    .replace("{ext}", &ext)
+                    .replace("{dir}", &dir);
+                if replaced != value {
+                    one.set(&argument.key, replaced);
+                }
+            }
+            one.set(key, item.clone());
+            runs.push((action.build_argv(&one)?, one));
+        }
+        Ok(runs)
+    }
+
     fn write_paths_into_form(&mut self, field: usize, paths: &[PathBuf], repeatable: bool) {
         let Some(argument) = self.form_argument(field) else {
             return;
@@ -1743,6 +1830,61 @@ impl App {
         self.history.as_ref()?.selected_entry().cloned()
     }
 
+    /// 把历史里那次的**参数填回表单**（然后改一改再跑）。
+    ///
+    /// 和「原样重跑」是两件事：重跑是把 argv 直接执行一遍，回填是让你接着编辑。
+    pub fn refill_from_history(&mut self) {
+        let Some(entry) = self.history_selected() else {
+            return;
+        };
+
+        let Some(index) = self
+            .registry
+            .tools()
+            .iter()
+            .position(|tool| tool.id == entry.tool_id)
+        else {
+            self.message = format!("这件工具已经不在列表里了（{}）", entry.tool_id);
+            return;
+        };
+
+        // 它可能不在当前视图里，所以先把筛选清掉、切到它所在的域。
+        self.scope = Scope::All;
+        self.query.clear();
+        self.searching = false;
+        let domain = self.registry.tools()[index].domain;
+        self.switch_domain(domain.index());
+
+        let Some(position) = self.filtered.iter().position(|&item| item == index) else {
+            self.message = format!("在列表里找不到 {} —— 换个域或清掉筛选再试", entry.tool_name);
+            return;
+        };
+        self.selected = position;
+        self.table.select(Some(position));
+
+        if !self.open_form() {
+            self.message = format!("{} 不需要填参数，直接重跑就行（Enter）", entry.tool_name);
+            return;
+        }
+
+        // 用当时的值覆盖缺省值
+        let refilled = entry.values.len();
+        if let Some(form) = self.form.as_mut() {
+            for (key, value) in &entry.values {
+                form.values.set(key, value);
+            }
+        }
+        self.close_history();
+        self.message = if refilled == 0 {
+            format!("{} 那次没留下参数（老记录），这里是缺省值", entry.tool_name)
+        } else {
+            format!(
+                "已把 {} 的 {refilled} 个参数填回表单 · 改完 Ctrl-E 执行",
+                entry.tool_name
+            )
+        };
+    }
+
     /// 记一条执行历史，**自动把程序名放在 argv 最前面**。
     ///
     /// 历史里的命令要能直接重跑，所以必须带上程序名 —— 少了它，重跑时会把
@@ -1750,7 +1892,12 @@ impl App {
     pub fn record_run(&self, tool: &ToolDefinition, argv: &[String], success: bool, millis: u128) {
         let mut full = vec![tool.path.display().to_string()];
         full.extend(argv.iter().cloned());
-        self.record_history(&tool.id, &tool.name, &full, success, millis);
+        // 表单还开着的时候顺手把取值抄一份 —— 历史里的「回填再改」全靠它。
+        let values = self
+            .form_values()
+            .map(|values| values.pairs())
+            .unwrap_or_default();
+        self.record_history(&tool.id, &tool.name, &full, &values, success, millis);
     }
 
     /// 记一条执行历史（`argv` 必须已含程序名）。
@@ -1762,6 +1909,7 @@ impl App {
         tool_id: &str,
         tool_name: &str,
         argv: &[String],
+        values: &[(String, String)],
         success: bool,
         millis: u128,
     ) {
@@ -1772,6 +1920,7 @@ impl App {
             argv: argv.to_vec(),
             success,
             millis,
+            values: values.iter().cloned().collect(),
         };
         let written = match self.history_path.as_deref() {
             Some(path) => history::append_to(path, &entry),
@@ -2539,6 +2688,7 @@ mod tests {
         tool.path = PathBuf::from("/usr/bin/printf");
         app.enqueue_captures(vec![CaptureRequest {
             tool,
+            values: Vec::new(),
             argv: vec![String::from("后台输出\\n")],
             record_argv: vec![String::from("后台输出\\n")],
             total_seconds: None,
@@ -2586,6 +2736,7 @@ mod tests {
             arguments: Vec::new(),
             duration_from: Some("input".to_string()),
             limit_from: Some("duration".to_string()),
+            foreach: None,
         };
         let mut values = ArgumentValues::new();
         values.set("duration", "00:00:10");
@@ -2647,6 +2798,7 @@ mod tests {
             }],
             duration_from: None,
             limit_from: Some("duration".to_string()),
+            foreach: None,
         };
         let mut tool = tool("假任务", Domain::Media, &["编辑"]);
         tool.action = Some(action);
@@ -2717,6 +2869,217 @@ mod tests {
 
         press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(!app.is_help_open(), "q 应该关掉帮助");
+    }
+
+    /// 历史「回填再改」：把那次参数填回表单（而不是原样重跑）。
+    #[test]
+    fn history_refills_the_form_with_the_old_values() {
+        use std::collections::BTreeMap;
+
+        let jq = crate::providers::manifest::bundled_tools()
+            .into_iter()
+            .find(|tool| tool.id == "manifest:jq-query")
+            .expect("应有 jq 动作");
+        let mut app = App::new(
+            Registry::from_tools(vec![jq]),
+            PathBuf::from("/tmp/bin"),
+            ReloadReport::default(),
+        );
+        app.switch_domain(Domain::Dev.index());
+        app.apply_filter();
+
+        app.history = Some(super::HistoryView {
+            entries: vec![crate::history::Entry {
+                epoch: crate::history::now_epoch(),
+                tool_id: String::from("manifest:jq-query"),
+                tool_name: String::from("jq 查询 JSON"),
+                argv: vec![String::from("/usr/bin/jq"), String::from(".items[]")],
+                success: true,
+                millis: 12,
+                values: BTreeMap::from([
+                    (String::from("filter"), String::from(".items[]")),
+                    (String::from("file"), String::from("a.json")),
+                    (String::from("compact"), String::from("true")),
+                ]),
+            }],
+            selected: 0,
+        });
+
+        app.refill_from_history();
+
+        assert!(app.history.is_none(), "回填完要把历史关掉");
+        assert!(app.form.is_some(), "应该打开了参数表单");
+        let values = app.form_values().expect("表单取值");
+        assert_eq!(values.get("filter"), Some(".items[]"), "填写入过的表达式");
+        assert_eq!(values.get("file"), Some("a.json"), "填写入过的文件");
+        assert_eq!(values.get("compact"), Some("true"), "开关也要按当时的样子");
+        assert!(app.message.contains("填回表单"), "{}", app.message);
+
+        // 工具已经不在了（改了 id）→ 明确说一句，别静悄悄什么都不做
+        app.close_form();
+        app.history = Some(super::HistoryView {
+            entries: vec![crate::history::Entry {
+                tool_id: String::from("manifest:早就删了"),
+                tool_name: String::from("旧工具"),
+                epoch: 0,
+                argv: Vec::new(),
+                success: true,
+                millis: 0,
+                values: BTreeMap::new(),
+            }],
+            selected: 0,
+        });
+        app.refill_from_history();
+        assert!(app.message.contains("不在列表里"), "{}", app.message);
+    }
+
+    /// 造一件带 `foreach` 的假工具：`touch <输出>`，输入是批量字段。
+    fn foreach_app() -> App {
+        use crate::model::{Action, ArgKind, ArgPlacement, Argument};
+
+        let argument =
+            |key: &str, label: &str, required: bool, repeatable: bool, default: Option<&str>| {
+                Argument {
+                    key: key.to_string(),
+                    label: label.to_string(),
+                    kind: ArgKind::Path,
+                    default: default.map(str::to_string),
+                    choices: Vec::new(),
+                    required,
+                    flag: None,
+                    flag_join: false,
+                    placement: ArgPlacement::Trailing,
+                    sensitive: false,
+                    repeatable,
+                    separator: String::from(","),
+                    dir_only: false,
+                    help: Some(String::from("测试用")),
+                }
+            };
+
+        let mut tool = tool("批量假工具", Domain::Media, &["编辑"]);
+        tool.action = Some(Action {
+            program: String::from("/usr/bin/touch"),
+            base_argv: Vec::new(),
+            arguments: vec![
+                argument("input", "输入", true, true, None),
+                argument("output", "输出", true, false, Some("{stem}_out.mp4")),
+            ],
+            duration_from: None,
+            limit_from: None,
+            foreach: Some(String::from("input")),
+        });
+        tool.path = PathBuf::from("/usr/bin/touch");
+        tool.mode = RunMode::Capture;
+
+        let mut app = App::new(
+            Registry::from_tools(vec![tool]),
+            PathBuf::from("/tmp/bin"),
+            ReloadReport::default(),
+        );
+        app.state = crate::state::State::default();
+        app.state_path = std::env::temp_dir().join(format!(
+            "toolbox-hub-test-state-{}-foreach.toml",
+            std::process::id()
+        ));
+        app.history_path = Some(app.state_path.with_extension("history"));
+        app.apply_filter();
+        assert!(app.open_form());
+        app
+    }
+
+    /// `foreach`：每个输入各跑一次，输出按 `{stem}` 之类的模板替换。
+    #[test]
+    fn foreach_expands_into_one_run_per_input() {
+        let mut app = foreach_app();
+
+        {
+            let form = app.form.as_mut().expect("表单");
+            form.values.set("input", "a.mp4, 素材/我的 片段.mov");
+        }
+
+        let runs = app.form_build_runs().expect("应能展开");
+        assert_eq!(runs.len(), 2, "两个输入 → 两次执行");
+        // 两个字段都是位置参数，所以 argv 里输入在前、输出在后（和 touch 的用法一致）
+        assert_eq!(runs[0].0, vec!["a.mp4", "a_out.mp4"], "第一次的 argv");
+        assert_eq!(
+            runs[1].0,
+            vec!["素材/我的 片段.mov", "我的 片段_out.mp4"],
+            "第二次的 argv（名字里的空格要保住）"
+        );
+        assert_eq!(
+            runs[0].1.get("input"),
+            Some("a.mp4"),
+            "每次只带自己那个输入"
+        );
+        assert_eq!(runs[1].1.get("input"), Some("素材/我的 片段.mov"));
+
+        // 空输入 → 明确报错，不猜
+        app.form.as_mut().expect("表单").values.set("input", "");
+        let error = app.form_build_runs().expect_err("空的批量字段要报错");
+        assert!(error.contains("至少要填一条"), "{error}");
+    }
+
+    /// 其余占位符：`{name}` / `{ext}` / `{dir}`。
+    #[test]
+    fn foreach_placeholders_fill_the_other_fields() {
+        let mut app = foreach_app();
+        {
+            let form = app.form.as_mut().expect("表单");
+            form.values.set("input", "/素材/片子.mp4");
+            form.values.set("output", "{dir}/out/{name}.{ext}");
+        }
+
+        let runs = app.form_build_runs().expect("应能展开");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, vec!["/素材/片子.mp4", "/素材/out/片子.mp4.mp4"]);
+        assert_eq!(runs[0].1.get("output"), Some("/素材/out/片子.mp4.mp4"));
+    }
+
+    /// `foreach` 真的会跑 N 次、产出 N 个文件（走后台队列，用 touch 当假工具）。
+    #[test]
+    fn foreach_runs_every_input_through_the_queue() {
+        let base = std::env::temp_dir().join(format!("toolbox-hub-foreach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let dir = std::fs::canonicalize(&base).expect("canonical");
+
+        let mut app = foreach_app();
+        app.work_dir = dir.clone();
+        {
+            let form = app.form.as_mut().expect("表单");
+            form.values.set("input", "one.mp4, two.mp4, three.mp4");
+        }
+
+        let runs = app.form_build_runs().expect("展开");
+        let requests: Vec<CaptureRequest> = runs
+            .into_iter()
+            .map(|(argv, values)| CaptureRequest {
+                tool: app.registry.tools()[0].clone(),
+                values: values.pairs(),
+                argv,
+                record_argv: Vec::new(),
+                total_seconds: None,
+            })
+            .collect();
+        app.enqueue_captures(requests);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (app.is_running() || !app.job_queue.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_job(&dir);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        for name in ["one_out.mp4", "two_out.mp4", "three_out.mp4"] {
+            assert!(dir.join(name).exists(), "{name} 应该被创建出来");
+        }
+        // 三次执行都要进历史（各自一条）
+        let entries = crate::history::load_from(&app.history_path.clone().expect("路径"), 10);
+        assert_eq!(entries.len(), 3, "三次执行各记一条: {entries:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 文件管理器的反馈怎么决定工作目录：选中过文件用它的目录，否则用退出目录。

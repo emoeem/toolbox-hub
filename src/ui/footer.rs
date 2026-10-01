@@ -29,7 +29,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     } else if app.picker.is_some() {
         "↑↓ 选择 · Enter 选中 · Tab 标记 · ← 上级 · 打字过滤 · Ctrl-U 清空 · Esc 取消"
     } else if app.history.is_some() {
-        "↑↓/jk 选择 · Enter 重跑 · PgUp/PgDn 翻页 · q 关闭"
+        "↑↓ 选择 · Enter 重跑 · e 回填参数再改 · PgUp/PgDn 翻页 · q 关闭"
     } else if app.viewer.is_some() {
         "↑↓/jk 滚动 · PgUp/PgDn 翻页 · g/G 顶/底 · s 保存 · c 复制 · q 关闭"
     } else if app.form.is_some() {

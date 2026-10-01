@@ -248,6 +248,8 @@ fn handle_history_key(
         KeyCode::PageUp => app.history_move(-10),
         KeyCode::PageDown => app.history_move(10),
         KeyCode::Enter => replay_history(app, cwd)?,
+        // e：不是原样重跑，而是把那次参数**填回表单**再改
+        KeyCode::Char('e') => app.refill_from_history(),
         _ => {}
     }
     Ok(false)
@@ -269,11 +271,13 @@ fn replay_history(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::E
     let captured = runtime::run_captured(&PathBuf::from(program), argv, cwd, &entry.tool_name)?;
     app.message = format!("重跑 · {}", captured.summary());
 
-    // 重跑也算一次执行，照样进历史（id / name 沿用原记录）。
+    // 重跑也算一次执行，照样进历史（id / name / 取值沿用原记录）。
+    let values: Vec<(String, String)> = entry.values.clone().into_iter().collect();
     app.record_history(
         &entry.tool_id,
         &entry.tool_name,
         &entry.argv,
+        &values,
         captured.success,
         started.elapsed().as_millis(),
     );
@@ -386,22 +390,44 @@ fn execute_form(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Err
 
     match tool.mode {
         RunMode::Capture => {
-            // 总时长要**在关表单之前**算：关了就取不到表单里的值了
-            // （这个顺序错一次就会让进度条永远不出现）。
-            let total_seconds = app.form_values().and_then(|values| {
-                tool.action
-                    .as_ref()
-                    .and_then(|action| app.total_seconds_for(action, values))
-            });
+            // 展开成一次或多次执行（`foreach` 声明了就是「每个输入各跑一次」）。
+            // 注意：这一步必须在**关表单之前**做 —— 关了就取不到表单里的值了。
+            let runs = match app.form_build_runs() {
+                Ok(runs) => runs,
+                Err(message) => {
+                    app.form_set_error(message);
+                    return Ok(());
+                }
+            };
 
-            // 走后台队列：界面不卡，能看实时输出与进度，也能取消。
+            let count = runs.len();
+            let requests: Vec<crate::app::CaptureRequest> = runs
+                .into_iter()
+                .map(|(argv, values)| {
+                    // 每个输入各自探一次时长（批量裁剪时各文件的时长并不一样）。
+                    let total_seconds = tool
+                        .action
+                        .as_ref()
+                        .and_then(|action| app.total_seconds_for(action, &values));
+                    let record_argv = match tool.action.as_ref() {
+                        Some(action) => action.redacted(&values, &argv),
+                        None => argv.clone(),
+                    };
+                    crate::app::CaptureRequest {
+                        tool: tool.clone(),
+                        values: values.pairs(),
+                        argv,
+                        record_argv,
+                        total_seconds,
+                    }
+                })
+                .collect();
+
             app.close_form();
-            app.enqueue_captures(vec![crate::app::CaptureRequest {
-                tool,
-                argv,
-                record_argv: redacted,
-                total_seconds,
-            }]);
+            app.enqueue_captures(requests);
+            if count > 1 {
+                app.message = format!("{count} 个输入 → 各自一个输出，依次执行中…");
+            }
         }
         RunMode::Interactive => {
             let report = runtime::execute_action(&tool, &argv, cwd)?;
@@ -501,6 +527,7 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
                     tool,
                     argv: Vec::new(),
                     record_argv: Vec::new(),
+                    values: Vec::new(),
                     // 批量走列表路径，没有表单取值可探，所以没有百分比。
                     total_seconds: None,
                 })

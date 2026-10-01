@@ -10,7 +10,10 @@
 //! * 用 `\x1f`（单元分隔符）拼 argv：参数里带空格、制表符也不会串行；
 //! * 标成 `sensitive` 的参数值**在记录前**就被换成 `***`（见
 //!   [`crate::model::Action::redacted`]）；
-//! * 只保留最近 [`MAX_ENTRIES`] 条，超了就重写文件（纯文本，重写代价可忽略）。
+//! * 只保留最近 [`MAX_ENTRIES`] 条，超了就重写文件（纯文本，重写代价可忽略）；
+//! * 除了 argv，还存一份**当时的表单取值**（`key=value`）—— 这样才能「把上次那套
+//!   参数填回表单改一改再跑」，而不只是原样重跑。老记录没有这一列也能读
+//!   （当成空）。
 //!
 //! 读写的核心函数都接受**显式路径**（[`append_to`] / [`load_from`] /
 //! [`save_output_to`]），公开的 [`append`] / [`load`] / [`save_output`] 只是把默认
@@ -20,6 +23,7 @@
 //! 送进系统剪贴板。
 
 use std::{
+    collections::BTreeMap,
     env, fs, io,
     io::Write,
     path::{Path, PathBuf},
@@ -35,6 +39,7 @@ pub const DATA_ENV: &str = "TOOLBOX_HUB_DATA";
 
 const FIELD_SEP: char = '\t';
 const ARG_SEP: char = '\u{1f}';
+const VALUE_SEP: char = '\u{1e}';
 
 /// 一次执行。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +52,8 @@ pub struct Entry {
     pub argv: Vec<String>,
     pub success: bool,
     pub millis: u128,
+    /// 当时的表单取值（参数键 → 值），用于「回填再改」。
+    pub values: BTreeMap<String, String>,
 }
 
 impl Entry {
@@ -73,14 +80,23 @@ impl Entry {
             .collect::<Vec<_>>()
             .join(&ARG_SEP.to_string());
 
+        // 取值列：`key=value` 用另一个分隔符连起来（两个都转义过，值里带分隔符也不怕）。
+        let values = self
+            .values
+            .iter()
+            .map(|(key, value)| format!("{}={}", escape(key), escape(value)))
+            .collect::<Vec<_>>()
+            .join(&VALUE_SEP.to_string());
+
         format!(
-            "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
+            "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
             self.epoch,
             if self.success { "ok" } else { "fail" },
             self.millis,
             escape(&self.tool_id),
             escape(&self.tool_name),
             argv,
+            values,
             sep = FIELD_SEP,
         )
     }
@@ -101,6 +117,15 @@ impl Entry {
             Some(raw) if !raw.is_empty() => raw.split(ARG_SEP).map(unescape).collect(),
             _ => Vec::new(),
         };
+        // 老记录没有这一列 → 空表（照旧能读）。
+        let values = match fields.next() {
+            Some(raw) if !raw.is_empty() => raw
+                .split(VALUE_SEP)
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(key, value)| (unescape(key), unescape(value)))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
 
         Some(Self {
             epoch,
@@ -109,6 +134,7 @@ impl Entry {
             argv,
             success,
             millis,
+            values,
         })
     }
 }
@@ -126,6 +152,7 @@ fn escape(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             ARG_SEP => out.push_str("\\u{1f}"),
+            VALUE_SEP => out.push_str("\\u{1e}"),
             other => out.push(other),
         }
     }
@@ -147,11 +174,18 @@ fn unescape(value: &str) -> String {
             Some('r') => out.push('\r'),
             Some('\\') => out.push('\\'),
             Some('u') => {
-                // `\u{1f}`：跳过 `{1f}`
+                // `\u{1f}`（argv 分隔符）与 `\u{1e}`（取值分隔符）
+                let mut digits = String::new();
                 for _ in 0..4 {
-                    chars.next();
+                    if let Some(ch) = chars.next() {
+                        digits.push(ch);
+                    }
                 }
-                out.push(ARG_SEP);
+                out.push(if digits.contains('e') {
+                    VALUE_SEP
+                } else {
+                    ARG_SEP
+                });
             }
             Some(other) => {
                 out.push('\\');
@@ -301,6 +335,8 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use std::collections::BTreeMap;
+
     use super::{Entry, MAX_ENTRIES, append_to, load_from, now_epoch, save_output_to};
 
     /// 独立的临时目录（不碰环境变量，所以并行测试也安全）。
@@ -326,6 +362,7 @@ mod tests {
             argv: argv.iter().map(|item| (*item).to_string()).collect(),
             success,
             millis: 120,
+            values: BTreeMap::new(),
         }
     }
 
@@ -420,6 +457,45 @@ mod tests {
     fn missing_history_file_reads_as_empty() {
         let file = temp_file("missing").with_extension("nope");
         assert!(load_from(&file, 10).is_empty());
+    }
+
+    /// 表单取值也要能原样回来 —— 「回填再改」全靠它。
+    #[test]
+    fn form_values_survive_a_round_trip() {
+        let file = temp_file("values");
+        let mut item = entry("ffmpeg", &["/usr/bin/ffmpeg", "-i", "a.mp4"], true);
+        item.values = BTreeMap::from([
+            ("input".to_string(), "a.mp4".to_string()),
+            ("crf".to_string(), "28".to_string()),
+            // 值里带分隔符、换行、等号都要能回来
+            ("output".to_string(), "{stem}=改\n用.mp4".to_string()),
+        ]);
+        append_to(&file, &item).expect("append");
+
+        let loaded = load_from(&file, 1);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].values, item.values, "取值必须一字不差地回来");
+
+        fs::remove_dir_all(file.parent().expect("parent")).expect("cleanup");
+    }
+
+    /// 老记录（没有取值这一列）也要能读。
+    #[test]
+    fn an_old_record_without_values_still_parses() {
+        let file = temp_file("legacy");
+        // 老格式：argv 用 \x1f 连起来，没有第 7 列（取值）。
+        fs::write(
+            &file,
+            "1700000000\tok\t120\tmanifest:jq-query\tjq\t/usr/bin/jq\u{1f}.\u{1f}a.json\n",
+        )
+        .expect("write");
+
+        let loaded = load_from(&file, 1);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].values.is_empty(), "老记录没有取值就是空表");
+        assert_eq!(loaded[0].argv.len(), 3);
+
+        fs::remove_dir_all(file.parent().expect("parent")).expect("cleanup");
     }
 
     #[test]

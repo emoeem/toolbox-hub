@@ -561,6 +561,7 @@ mod tests {
                     ],
                     success: true,
                     millis: 1200,
+                    values: std::collections::BTreeMap::new(),
                 },
                 crate::history::Entry {
                     epoch: crate::history::now_epoch(),
@@ -569,6 +570,7 @@ mod tests {
                     argv: vec!["/usr/bin/7z".to_string(), "x".to_string()],
                     success: false,
                     millis: 300,
+                    values: std::collections::BTreeMap::new(),
                 },
             ],
             selected: 0,
