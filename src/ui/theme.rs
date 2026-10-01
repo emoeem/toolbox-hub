@@ -45,6 +45,8 @@ pub fn domain_color(domain: Domain) -> Color {
         Domain::Network => CYAN,
         Domain::Dev => PURPLE,
         Domain::Tools => TEXT,
+        // 包管理用琥珀色：和开发紫、系统蓝区分得开，又不像危险色那样刺眼。
+        Domain::Packages => YELLOW,
     }
 }
 

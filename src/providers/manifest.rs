@@ -52,6 +52,10 @@ const BUNDLED: &[(&str, &str)] = &[
     ("7zip.toml", include_str!("../../manifests/7zip.toml")),
     ("aria2c.toml", include_str!("../../manifests/aria2c.toml")),
     ("ffmpeg.toml", include_str!("../../manifests/ffmpeg.toml")),
+    (
+        "packages.toml",
+        include_str!("../../manifests/packages.toml"),
+    ),
 ];
 
 /// 内置动作总数。
@@ -59,7 +63,7 @@ const BUNDLED: &[(&str, &str)] = &[
 /// **加/删 `manifests/*.toml` 里的动作后要更新这里**：测试拿它对账，
 /// 某个 manifest 悄悄解析失败时（例如拼错一个键），工具数会立刻对不上。
 #[cfg(test)]
-const BUNDLED_ACTION_COUNT: usize = 19;
+const BUNDLED_ACTION_COUNT: usize = 34;
 
 pub struct ManifestProvider {
     /// 用户 manifest 目录，按顺序读；先读到的占住 id。
@@ -216,6 +220,12 @@ struct ManifestAction {
     features: Option<String>,
     #[serde(default)]
     foreach: Option<String>,
+    /// 允许不带参数运行（见 [`crate::model::Action::allow_empty`]）。
+    #[serde(default)]
+    allow_empty: bool,
+    /// 哪些退出码算成功（见 [`crate::model::Action::ok_exit_codes`]）。
+    #[serde(default)]
+    ok_exit_codes: Option<Vec<i32>>,
     #[serde(default)]
     duration_from: Option<String>,
     #[serde(default)]
@@ -250,6 +260,10 @@ struct ManifestArgument {
     sensitive: bool,
     #[serde(default)]
     repeatable: bool,
+    /// 带 flag 的多值：`true` = 每个值配一个 flag（`-i a -i b`）；
+    /// 缺省 = flag 一次、值平铺（`-S a b c`）。
+    #[serde(default)]
+    repeat_flag: bool,
     #[serde(default)]
     dir_only: bool,
     #[serde(default)]
@@ -289,7 +303,7 @@ impl ManifestAction {
         let mut arguments = Vec::with_capacity(self.argument.len());
         let mut keys: BTreeSet<String> = BTreeSet::new();
         for raw in &self.argument {
-            let argument = raw.build(id, self.foreach.as_deref())?;
+            let argument = raw.build(id)?;
             if !keys.insert(argument.key.clone()) {
                 return Err(complain(&format!("参数 key 重复「{}」", argument.key)));
             }
@@ -359,6 +373,8 @@ impl ManifestAction {
                 duration_from: self.duration_from.clone(),
                 limit_from: self.limit_from.clone(),
                 foreach: self.foreach.clone(),
+                allow_empty: self.allow_empty,
+                ok_exit_codes: self.ok_exit_codes.clone().unwrap_or_else(|| vec![0]),
             }),
             // 解析成绝对路径，详情区就能说清「到底会跑哪个二进制」。
             path: metadata::resolve_program(&program).unwrap_or_else(|| PathBuf::from(&program)),
@@ -368,7 +384,7 @@ impl ManifestAction {
 }
 
 impl ManifestArgument {
-    fn build(&self, action_id: &str, foreach_key: Option<&str>) -> Result<Argument, String> {
+    fn build(&self, action_id: &str) -> Result<Argument, String> {
         let key = self.key.trim();
         if key.is_empty() {
             return Err(format!("{action_id}: 有个参数缺少 key"));
@@ -400,15 +416,8 @@ impl ManifestArgument {
                 "{action_id}/{key}: toggle 必须给 flag，否则打开了也没有效果"
             ));
         }
-        // 多值 + flag 平时不允许：`-i a -i b` 与 `-i a b` 两种写法语义不同，不替工具猜。
-        // 但 `foreach = "这个字段"` 是例外 —— 那时每次执行只有一条值，
-        // `-i <一个文件>` 毫无歧义（ffmpeg 批量转码正是靠这个）。
-        let is_foreach_field = foreach_key.is_some_and(|key| key == self.key.trim());
-        if self.repeatable && self.flag.is_some() && !is_foreach_field {
-            return Err(format!(
-                "{action_id}/{key}: 多值只支持位置参数（带 flag 的多值有 `-i a -i b` 与 `-i a b` 两种写法）；如果它是给 `foreach` 用的批量字段，就在动作上写 foreach = \"{key}\""
-            ));
-        }
+        // 多值 + flag 是允许的：默认「flag 一次、值平铺」（`-S a b c`），
+        // 想「每个值一个 flag」（`-i a -i b`）就写 repeat_flag = true。
         if self.repeatable && matches!(kind, ArgKind::Choice | ArgKind::Toggle) {
             return Err(format!(
                 "{action_id}/{key}: 只有 text / path 能多值，choice 与 toggle 不行"
@@ -457,6 +466,7 @@ impl ManifestArgument {
             placement,
             sensitive: self.sensitive,
             repeatable: self.repeatable,
+            repeat_flag: self.repeat_flag,
             dir_only: self.dir_only,
             separator: self.separator.clone().unwrap_or_else(|| String::from(",")),
             help: self.help.clone(),
@@ -577,7 +587,17 @@ mod tests {
                 "{} 的 base_argv 没排在前面: {argv:?}",
                 tool.id
             );
-            assert!(!argv.is_empty(), "{} 构建出了空 argv", tool.id);
+            // 默认取值不该构建出空 argv —— 除非这个动作**本来就没有参数**
+            // （`checkupdates` 这种无参命令合法）。
+            //
+            // 这条断言抓到过真漏配：`pacman -Qdt` 与 `paru -Syu` 忘了写进 base_argv，
+            // 结果是光跑 `pacman`、`paru`（打印用法就退出）。
+            assert!(
+                !argv.is_empty() || action.allow_empty || action.arguments.is_empty(),
+                "{} 构建出了空 argv —— 本体命令（base_argv）是不是忘了写？\n\
+                 确实允许空 argv 的话，就在动作里写 allow_empty = true",
+                tool.id
+            );
         }
     }
 
@@ -585,7 +605,7 @@ mod tests {
     fn app_and_ui_tests_get_real_actions_from_here() {
         let tools = super::bundled_tools();
         assert_eq!(tools.len(), BUNDLED_ACTION_COUNT);
-        assert!(tools.iter().all(|tool| tool.needs_arguments()));
+        assert!(tools.iter().all(|tool| tool.action.is_some()));
     }
 
     /// 实测：`magick in.png -resize … out.webp` 才行，
@@ -811,6 +831,52 @@ mod tests {
         fs::remove_dir_all(&dir).expect("cleanup");
     }
 
+    /// 会改系统的包管理动作必须标 `danger = "caution"`。
+    ///
+    /// 这是一条**策略**测试：以后再加安装/卸载/更新类的动作，忘了标危险度就会红。
+    #[test]
+    fn destructive_package_actions_are_marked_caution() {
+        let discovery = bundled_discovery();
+        let destructive = [
+            "manifest:pkg-install",
+            "manifest:pkg-remove",
+            "manifest:pkg-upgrade",
+            "manifest:pkg-clean-cache",
+            "manifest:pac-browse",
+            "manifest:pacsea",
+        ];
+
+        for id in destructive {
+            let tool = by_id(&discovery, id);
+            assert_eq!(
+                tool.danger,
+                crate::model::Danger::Caution,
+                "{id} 会改系统，必须标 caution"
+            );
+            // 而且要接管终端：sudo 密码、Y/n 都得你自己回答
+            assert_eq!(
+                tool.mode,
+                crate::model::RunMode::Interactive,
+                "{id} 要 sudo / 要确认，必须 interactive"
+            );
+        }
+
+        // 只读的那些反过来：不该打扰用户
+        for id in [
+            "manifest:pkg-search",
+            "manifest:pkg-updates",
+            "manifest:pkg-orphans",
+        ] {
+            let tool = by_id(&discovery, id);
+            assert_eq!(tool.danger, crate::model::Danger::Safe, "{id} 是只读的");
+            assert_eq!(
+                tool.mode,
+                crate::model::RunMode::Capture,
+                "{id} 该留在界面里"
+            );
+        }
+    }
+
     /// 内置的 foreach 动作必须配得对（真跑时才知道痛，所以这里先钉住）。
     #[test]
     fn bundled_foreach_actions_are_configured_correctly() {
@@ -998,6 +1064,63 @@ help = "随便"
     ///
     /// 形状测试只能说明「argv 长这样」，这个测试说明「命令真的能跑」。
     /// 默认不跑（会写临时文件、真的调用外部程序）：
+    /// 包管理那批**只读**动作真跑一遍（安装/卸载/更新绝不实跑）。
+    ///
+    /// 抓的是「本体命令忘写进 base_argv」这类漏配：`pacman -Qdt` 少写就变成光跑
+    /// `pacman`（打印用法、退出码非 0）—— 只有真跑才看得见。
+    #[test]
+    #[ignore = "真的执行 pacman/paru/checkupdates（只读），默认跳过"]
+    fn smoke_run_package_queries() {
+        let discovery = bundled_discovery();
+
+        // (动作 id, 要填的值, 输出是否必须非空)
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], bool);
+        let cases: &[Case] = &[
+            ("manifest:pkg-search", &[("query", "fzf")], true),
+            ("manifest:pkg-info", &[("package", "fzf")], true),
+            ("manifest:aur-search", &[("query", "pacsea")], true),
+            ("manifest:aur-info", &[("package", "pacsea-bin")], true),
+            ("manifest:pkg-owner", &[("file", "/usr/bin/pac")], true),
+            ("manifest:pkg-files", &[("package", "pacman")], true),
+            // 孤儿包完全可能是 0 个，所以只要求跑通
+            ("manifest:pkg-orphans", &[], false),
+            ("manifest:pkg-cache-size", &[], true),
+        ];
+
+        for (id, values, needs_output) in cases {
+            let captured = run_built(&discovery, id, values, std::path::Path::new("/tmp"));
+            // 用动作自己声明的退出码白名单判定：`pacman -Qdt` 没孤儿包时退 1，
+            // 那是「没匹配到」而不是失败（这条是真跑之后才加上的）。
+            let action = by_id(&discovery, id).action.as_ref().expect("带动作");
+            assert!(
+                action
+                    .ok_exit_codes
+                    .contains(&captured.status.code().unwrap_or(i32::MIN)),
+                "{id} 真跑失败（本体命令写对了吗？）: {}",
+                captured.status
+            );
+            if *needs_output {
+                assert!(
+                    !String::from_utf8_lossy(&captured.stdout).trim().is_empty(),
+                    "{id} 没有输出 —— base_argv 是不是漏了？"
+                );
+            }
+        }
+
+        // checkupdates 要读数据库，慢一点，单独跑；有没有更新都算成功。
+        let updates = run_built(
+            &discovery,
+            "manifest:pkg-updates",
+            &[],
+            std::path::Path::new("/tmp"),
+        );
+        assert!(
+            updates.status.success() || updates.status.code() == Some(2),
+            "checkupdates 退出码 {}（2 = 没有更新，也算正常）",
+            updates.status
+        );
+    }
+
     /// `cargo test -- --ignored --nocapture smoke_run_bundled_actions`
     /// 按表单的值构建 argv 并**真的执行**；打印实际跑的命令。
     ///

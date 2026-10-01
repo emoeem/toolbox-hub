@@ -1,0 +1,347 @@
+# 包管理：pacman / paru / pac 家族
+#
+# 为什么单独成域：这些都是「参数多、记不住、还改系统」的命令，
+# 查询类留在界面里看（capture），操作类必须接管终端（interactive）——
+# 因为 `paru -S` / `pacman -Rns` 要 sudo 密码、还要你回一次 Y/n。
+# 操作类一律 danger = "caution"：按两次 Ctrl-E 才真跑。
+#
+# 参考了两个同类前端的分工（pac 的模糊搜索安装、pacsea 的搜索/检视/排队），
+# 它们自己作为 TUI 也在这里可以直接启动。
+
+# ── 查询：只读，留在界面里看 ────────────────────────────────────────────────
+
+[[action]]
+id = "pkg-search"
+name = "搜索官方源"
+summary = "pacman -Ss：官方源里有这个包吗（已安装的会标出来）"
+domain = "包管理"
+tags = ["搜索"]
+program = "pacman"
+mode = "capture"
+install = "自带（pacman）"
+input = "关键词"
+output = "匹配的包"
+features = "官方源；正则可用；标出 [已安装]"
+
+[[action.argument]]
+key = "query"
+label = "关键词"
+kind = "text"
+flag = "-Ss"
+required = true
+help = "包名或描述里的词；支持正则，例如 ^fzf$"
+
+[[action]]
+id = "pkg-info"
+name = "看官方源包信息"
+summary = "pacman -Sii：版本、依赖、大小、仓库、可选依赖"
+domain = "包管理"
+tags = ["信息"]
+program = "pacman"
+mode = "capture"
+install = "自带（pacman）"
+input = "包名"
+output = "详细信息"
+features = "-Sii 比 -Si 多出「必需者 / 可选者 / 安装原因」"
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+flag = "-Sii"
+required = true
+help = "要查的包名，例如 fzf"
+
+[[action]]
+id = "aur-search"
+name = "搜索官方源 + AUR"
+summary = "paru -Ss：一次搜两处，AUR 的也列出来"
+domain = "包管理"
+tags = ["搜索", "AUR"]
+program = "paru"
+mode = "capture"
+install = "sudo pacman -S paru"
+input = "关键词"
+output = "两边的匹配"
+features = "官方源 + AUR；AUR 包会标出得票"
+
+[[action.argument]]
+key = "query"
+label = "关键词"
+kind = "text"
+flag = "-Ss"
+required = true
+help = "包名或描述里的词"
+
+[[action]]
+id = "aur-info"
+name = "看 AUR 包信息"
+summary = "paru -Sii：维护者、得票、依赖、快照地址（装之前先看这个）"
+domain = "包管理"
+tags = ["信息", "AUR"]
+program = "paru"
+mode = "capture"
+install = "sudo pacman -S paru"
+input = "包名"
+output = "AUR 元数据"
+features = "维护者 / 得票 / 最后更新 / 快照 URL；装 AUR 包前该看的就是它"
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+flag = "-Sii"
+required = true
+help = "AUR 包名，例如 pacsea-bin"
+
+[[action]]
+id = "pkg-owner"
+name = "这个文件属于哪个包"
+summary = "pacman -Qo：某个可执行文件 / 配置文件是哪个包装的"
+domain = "包管理"
+tags = ["信息"]
+program = "pacman"
+mode = "capture"
+install = "自带（pacman）"
+input = "文件路径"
+output = "所属包"
+features = "查“这个命令哪来的”最快的一条"
+
+[[action.argument]]
+key = "file"
+label = "文件"
+kind = "path"
+flag = "-Qo"
+required = true
+help = "要查的文件路径，例如 /usr/bin/pac"
+
+[[action]]
+id = "pkg-files"
+name = "这个包装了哪些文件"
+summary = "pacman -Ql：列出已安装包的全部文件"
+domain = "包管理"
+tags = ["信息"]
+program = "pacman"
+mode = "capture"
+install = "自带（pacman）"
+input = "包名"
+output = "文件清单"
+features = "找文档、找配置文件位置很方便"
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+flag = "-Ql"
+required = true
+help = "必须是**已安装**的包"
+
+[[action]]
+id = "pkg-orphans"
+name = "孤儿包"
+summary = "pacman -Qdt：装了但没有任何包依赖它们（可以清掉）"
+domain = "包管理"
+tags = ["清理"]
+program = "pacman"
+# -Qdt 是这个动作的本体（查：已安装、无人依赖、且不是显式安装的）
+base_argv = ["-Qdt"]
+# 没有孤儿包时 pacman 退出码是 1 —— 「没匹配到」不是失败
+ok_exit_codes = [0, 1]
+mode = "capture"
+install = "自带（pacman）"
+input = "无"
+output = "孤儿包列表"
+features = "只列出，不动手；要删就用下面的「卸载包」"
+
+[[action.argument]]
+key = "quiet"
+label = "只看包名"
+kind = "toggle"
+flag = "-q"
+help = "打开的话输出只有包名，方便复制粘贴"
+
+[[action]]
+id = "pkg-updates"
+name = "有哪些更新"
+summary = "checkupdates：不动系统，只列出官方源里能更新的包"
+domain = "包管理"
+tags = ["更新"]
+program = "checkupdates"
+# 没有更新时 checkupdates 退出码是 2
+ok_exit_codes = [0, 2]
+mode = "capture"
+install = "sudo pacman -S pacman-contrib"
+input = "无"
+output = "待更新的包"
+features = "只查不装，问「有多少更新」最安全的一条"
+
+[[action]]
+id = "pkg-cache-size"
+name = "包缓存占多大"
+summary = "du -sh：/var/cache/pacman/pkg 现在占了多少磁盘"
+domain = "包管理"
+tags = ["清理"]
+program = "du"
+mode = "capture"
+install = "自带（coreutils）"
+input = "无"
+output = "占用大小"
+features = "清理之前先看一眼值不值得清"
+
+[[action.argument]]
+key = "human"
+label = "人类可读"
+kind = "toggle"
+flag = "-h"
+default = "true"
+help = "输出 3.2G 这种而不是一串字节数"
+
+[[action.argument]]
+key = "summarize"
+label = "只报总量"
+kind = "toggle"
+flag = "-s"
+default = "true"
+help = "只给一行总数，不列每个文件"
+
+[[action.argument]]
+key = "path"
+label = "目录"
+kind = "path"
+placement = "trailing"
+default = "/var/cache/pacman/pkg"
+help = "默认是 pacman 的包缓存目录"
+
+# ── 操作：会改系统，接管终端（sudo / Y-n 都要你自己回答）────────────────────
+
+[[action]]
+id = "pkg-install"
+name = "安装包（含 AUR）"
+summary = "paru -S：官方源没有就自动找 AUR；sudo 密码在这里输入"
+domain = "包管理"
+tags = ["安装"]
+program = "paru"
+mode = "interactive"
+danger = "caution"
+install = "sudo pacman -S paru"
+input = "包名"
+output = "装好的包"
+features = "官方源 + AUR；会把要装的东西列给你确认，按 Y/n"
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+flag = "-S"
+required = true
+repeatable = true
+separator = " "
+help = "多个包用空格分隔；AUR 包会先编译（可能要一会儿）"
+
+[[action]]
+id = "pkg-remove"
+name = "卸载包（连依赖与配置）"
+summary = "pacman -Rns：把包、它的依赖、以及 /etc 下的配置一起删掉"
+domain = "包管理"
+tags = ["卸载"]
+program = "pacman"
+mode = "interactive"
+danger = "caution"
+install = "自带（pacman）"
+input = "包名"
+output = "已卸载"
+features = "**会删配置**，删之前先看清楚列表"
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+flag = "-Rns"
+required = true
+repeatable = true
+separator = " "
+help = "多个包用空格分隔；想保留配置就用 pacman -R"
+
+[[action]]
+id = "pkg-upgrade"
+name = "全系统更新"
+summary = "paru -Syu：先同步数据库，再更新官方源与 AUR 的全部包"
+domain = "包管理"
+tags = ["更新"]
+program = "paru"
+# -Syu 是这个动作的本体（同步数据库 + 更新全部）
+base_argv = ["-Syu"]
+mode = "interactive"
+danger = "caution"
+install = "sudo pacman -S paru"
+input = "无"
+output = "更新后的系统"
+features = "更新前建议先看「有哪些更新」；AUR 包会重新编译"
+
+[[action.argument]]
+key = "devel"
+label = "含开发版（-git）"
+kind = "toggle"
+flag = "--devel"
+help = "打开的话 -git / -svn 这类包也会一起更新"
+
+[[action]]
+id = "pkg-clean-cache"
+name = "清理旧包缓存"
+summary = "paccache -rk1：每个包只留最近一个版本（能腾出不少空间）"
+domain = "包管理"
+tags = ["清理"]
+program = "paccache"
+mode = "interactive"
+danger = "caution"
+install = "sudo pacman -S pacman-contrib"
+input = "无"
+output = "腾出来的空间"
+features = "保留策略可改；默认只删旧版本，不会动当前装的"
+
+[[action.argument]]
+key = "keep"
+label = "每个包保留几个版本"
+kind = "text"
+flag = "-rk"
+flag_join = true          # paccache 认 -rk1 这种连写
+required = true
+default = "1"
+help = "默认 1（只留最新）；想保守点就写 2 或 3"
+
+[[action]]
+id = "pac-browse"
+name = "pac：模糊搜索并安装"
+summary = "fzf 界面里搜（官方 + AUR），选中即装；AUR 会先做 AI 审查"
+domain = "包管理"
+tags = ["安装", "AUR"]
+program = "pac"
+# 不带参数就是「列出全部」—— 这是有意为之的合法空 argv
+allow_empty = true
+mode = "interactive"
+danger = "caution"
+install = "paru -S shorin-pac-git"
+input = "关键词"
+output = "选中的包装好"
+features = "模糊搜索；已安装标记；官方蓝 / AUR 紫；Ctrl+R 刷新；装 AUR 前审 PKGBUILD"
+
+[[action.argument]]
+key = "query"
+label = "关键词"
+kind = "text"
+placement = "trailing"
+help = "留空就是列出全部；例如 firefox"
+
+[[action]]
+id = "pacsea"
+name = "pacsea：包浏览器"
+summary = "另一个 TUI：搜索 / 检视 / 排队，最后一次性安装"
+domain = "包管理"
+tags = ["安装", "AUR"]
+program = "pacsea"
+mode = "interactive"
+danger = "caution"
+install = "paru -S pacsea-bin"
+input = "无"
+output = "排队装好的包"
+features = "统一搜索官方 + AUR；先排队、看清楚再一起装"

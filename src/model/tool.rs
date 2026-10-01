@@ -117,6 +117,7 @@ impl ToolDefinition {
             Domain::Network => "URL / 目标地址",
             Domain::Dev => "项目目录 / 源码文件",
             Domain::Tools => "按工具提示选择输入",
+            Domain::Packages => "包名 / 文件路径 / 关键词",
         })
     }
 
@@ -129,6 +130,7 @@ impl ToolDefinition {
             Domain::Network => "下载或传输结果",
             Domain::Dev => "构建产物 / 命令输出",
             Domain::Tools => "按工具操作流程生成",
+            Domain::Packages => "包信息 / 安装结果",
         })
     }
 
@@ -168,8 +170,15 @@ impl ToolDefinition {
     }
 
     /// 这件工具是不是「要先填参数」的动作。
-    pub fn needs_arguments(&self) -> bool {
-        self.action.is_some()
+    /// 是不是**有字段要填**（表单有意义）。
+    ///
+    /// 和 [`ToolDefinition::has_action`] 的区别很实在：`checkupdates` 有动作
+    /// 但一个参数也没有 —— 给它弹一个空表单是纯粹的困惑（实拍踩到过），
+    /// 它应该直接跑。
+    pub fn needs_form(&self) -> bool {
+        self.action
+            .as_ref()
+            .is_some_and(|action| !action.arguments.is_empty())
     }
 
     /// 表格「状态」列与详情区的状态文本。

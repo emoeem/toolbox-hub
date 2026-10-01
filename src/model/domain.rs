@@ -17,17 +17,21 @@ pub enum Domain {
     Dev,
     /// 未归类的通用脚本。
     Tools,
+    /// pacman / AUR 包管理（安装、卸载、更新、清理、查信息）。
+    Packages,
 }
 
 impl Domain {
     /// 域的展示顺序，等于 Tabs 的顺序。
-    pub const ALL: [Domain; 6] = [
+    pub const ALL: [Domain; 7] = [
         Domain::Media,
         Domain::Image,
         Domain::System,
         Domain::Network,
         Domain::Dev,
         Domain::Tools,
+        // 放在最后是为了**保住你已经习惯的数字键 1-6**：包管理是 7。
+        Domain::Packages,
     ];
 
     /// Tabs 上的短标签。
@@ -39,6 +43,7 @@ impl Domain {
             Domain::Network => "网络",
             Domain::Dev => "开发",
             Domain::Tools => "工具",
+            Domain::Packages => "包管理",
         }
     }
 
@@ -51,6 +56,7 @@ impl Domain {
             Domain::Network => "下载 / 传输 / 网络诊断",
             Domain::Dev => "开发工具 / 构建 / 仓库",
             Domain::Tools => "未归类的通用脚本",
+            Domain::Packages => "pacman / AUR 包管理",
         }
     }
 
@@ -63,6 +69,7 @@ impl Domain {
             Domain::Network => "network",
             Domain::Dev => "dev",
             Domain::Tools => "tools",
+            Domain::Packages => "packages",
         }
     }
 
@@ -123,9 +130,14 @@ mod tests {
     #[test]
     fn digit_keys_map_to_all_domains_and_reject_the_rest() {
         assert_eq!(Domain::from_digit('1'), Some(Domain::Media));
-        assert_eq!(Domain::from_digit('6'), Some(Domain::Tools));
+        for (index, domain) in Domain::ALL.iter().enumerate() {
+            let digit = char::from_digit(index as u32 + 1, 10).expect("数字");
+            assert_eq!(Domain::from_digit(digit), Some(*domain), "{digit}");
+        }
         assert_eq!(Domain::from_digit('0'), None);
-        assert_eq!(Domain::from_digit('7'), None);
+        // 超出域数量的数字要落空（现在是 7 个域，所以 8 不行）
+        let beyond = char::from_digit(Domain::ALL.len() as u32 + 1, 10).expect("数字");
+        assert_eq!(Domain::from_digit(beyond), None);
         assert_eq!(Domain::from_digit('x'), None);
     }
 

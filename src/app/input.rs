@@ -415,6 +415,11 @@ fn execute_form(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Err
                     };
                     crate::app::CaptureRequest {
                         tool: tool.clone(),
+                        ok_exit_codes: tool
+                            .action
+                            .as_ref()
+                            .map(|action| action.ok_exit_codes.clone())
+                            .unwrap_or_else(|| vec![0]),
                         values: values.pairs(),
                         argv,
                         record_argv,
@@ -496,7 +501,7 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
         let Some(tool) = app.registry.tools().get(index) else {
             continue;
         };
-        if tool.needs_arguments() {
+        if tool.needs_form() {
             needs_form += 1;
             continue;
         }
@@ -528,6 +533,7 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
                     argv: Vec::new(),
                     record_argv: Vec::new(),
                     values: Vec::new(),
+                    ok_exit_codes: vec![0],
                     // 批量走列表路径，没有表单取值可探，所以没有百分比。
                     total_seconds: None,
                 })

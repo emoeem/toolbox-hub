@@ -106,6 +106,8 @@ const TAIL_LINES: usize = 12;
 /// 交给后台队列的一次执行。
 pub struct CaptureRequest {
     pub tool: ToolDefinition,
+    /// 哪些退出码算成功（从动作抄来；`poll_job` 收尾时用它判定）。
+    pub ok_exit_codes: Vec<i32>,
     /// 当时的表单取值（历史「回填再改」用）。
     pub values: Vec<(String, String)>,
     /// 真正执行的参数。
@@ -127,6 +129,7 @@ struct PendingJob {
     record_argv: Vec<String>,
     /// 当时的表单取值。
     values: Vec<(String, String)>,
+    ok_exit_codes: Vec<i32>,
     /// 进度条用的总秒数。
     total_seconds: Option<f64>,
 }
@@ -140,6 +143,7 @@ pub struct RunningJobView {
     tool_name: String,
     record_argv: Vec<String>,
     values: Vec<(String, String)>,
+    ok_exit_codes: Vec<i32>,
     /// 最近几行输出（`(是否 stderr, 内容)`）。
     pub tail: VecDeque<(bool, String)>,
     /// 最近一次的进度键值（ffmpeg `-progress` 那种）。
@@ -161,6 +165,7 @@ impl RunningJobView {
             tool_name: String::from("测试任务"),
             record_argv: Vec::new(),
             values: Vec::new(),
+            ok_exit_codes: vec![0],
             tail: tail.into(),
             progress,
         }
@@ -667,6 +672,11 @@ impl App {
         let Some(action) = self.registry.tools()[index].action.clone() else {
             return false;
         };
+        // 一个字段都没有的动作不用进表单：空表单只会让人以为漏了什么
+        // （「有哪些更新」这类无参命令就属于这种，直接跑更对）。
+        if action.arguments.is_empty() {
+            return false;
+        }
 
         self.form = Some(FormState {
             tool: index,
@@ -1179,6 +1189,7 @@ impl App {
                 argv: request.argv,
                 record_argv,
                 values: request.values,
+                ok_exit_codes: request.ok_exit_codes,
                 total_seconds: request.total_seconds,
             });
         }
@@ -1205,6 +1216,7 @@ impl App {
                     tool_name: pending.tool_name,
                     record_argv: pending.record_argv,
                     values: pending.values,
+                    ok_exit_codes: pending.ok_exit_codes,
                     tail: VecDeque::new(),
                     progress: Vec::new(),
                 });
@@ -1258,14 +1270,19 @@ impl App {
         let Some(running) = self.running.take() else {
             return;
         };
-        let (tool_id, tool_name, record_argv, values) = (
+        let (tool_id, tool_name, record_argv, values, ok_exit_codes) = (
             running.tool_id,
             running.tool_name,
             running.record_argv,
             running.values,
+            running.ok_exit_codes,
         );
 
         let cancelled = captured.cancelled;
+        // 「没匹配到」不等于「失败」：退出码白名单在这里生效
+        // （`pacman -Qdt` 没孤儿包时退 1、`checkupdates` 没更新时退 2）。
+        let mut captured = captured;
+        captured.success = ok_exit_codes.contains(&captured.status.unwrap_or(i32::MIN));
         let success = captured.success;
         self.record_history(
             &tool_id,
@@ -2688,6 +2705,7 @@ mod tests {
         tool.path = PathBuf::from("/usr/bin/printf");
         app.enqueue_captures(vec![CaptureRequest {
             tool,
+            ok_exit_codes: vec![0],
             values: Vec::new(),
             argv: vec![String::from("后台输出\\n")],
             record_argv: vec![String::from("后台输出\\n")],
@@ -2737,6 +2755,8 @@ mod tests {
             duration_from: Some("input".to_string()),
             limit_from: Some("duration".to_string()),
             foreach: None,
+            allow_empty: false,
+            ok_exit_codes: vec![0],
         };
         let mut values = ArgumentValues::new();
         values.set("duration", "00:00:10");
@@ -2792,6 +2812,7 @@ mod tests {
                 placement: crate::model::ArgPlacement::Trailing,
                 sensitive: false,
                 repeatable: false,
+                repeat_flag: false,
                 separator: String::from(","),
                 dir_only: false,
                 help: Some("跑多久".to_string()),
@@ -2799,6 +2820,8 @@ mod tests {
             duration_from: None,
             limit_from: Some("duration".to_string()),
             foreach: None,
+            allow_empty: false,
+            ok_exit_codes: vec![0],
         };
         let mut tool = tool("假任务", Domain::Media, &["编辑"]);
         tool.action = Some(action);
@@ -2951,6 +2974,7 @@ mod tests {
                     placement: ArgPlacement::Trailing,
                     sensitive: false,
                     repeatable,
+                    repeat_flag: false,
                     separator: String::from(","),
                     dir_only: false,
                     help: Some(String::from("测试用")),
@@ -2968,6 +2992,8 @@ mod tests {
             duration_from: None,
             limit_from: None,
             foreach: Some(String::from("input")),
+            allow_empty: false,
+            ok_exit_codes: vec![0],
         });
         tool.path = PathBuf::from("/usr/bin/touch");
         tool.mode = RunMode::Capture;
@@ -3056,6 +3082,7 @@ mod tests {
             .into_iter()
             .map(|(argv, values)| CaptureRequest {
                 tool: app.registry.tools()[0].clone(),
+                ok_exit_codes: vec![0],
                 values: values.pairs(),
                 argv,
                 record_argv: Vec::new(),
@@ -3080,6 +3107,82 @@ mod tests {
         assert_eq!(entries.len(), 3, "三次执行各记一条: {entries:?}");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 退出码白名单走完真队列：`/usr/bin/false` 退 1，但动作声明了 1 算成功。
+    ///
+    /// 这条盯着的是「`pacman -Qdt` 没孤儿包时退 1，界面却报失败」那个坑
+    /// （真跑才发现的）。
+    #[test]
+    fn a_whitelisted_exit_code_counts_as_success() {
+        let argument = |key: &str, label: &str, flag: &str| crate::model::Argument {
+            key: key.to_string(),
+            label: label.to_string(),
+            kind: crate::model::ArgKind::Toggle,
+            default: Some(String::from("true")),
+            choices: Vec::new(),
+            required: false,
+            flag: Some(flag.to_string()),
+            flag_join: false,
+            repeat_flag: false,
+            placement: crate::model::ArgPlacement::Trailing,
+            sensitive: false,
+            repeatable: false,
+            separator: String::from(","),
+            dir_only: false,
+            help: Some(String::from("测试用")),
+        };
+
+        let mut tool = tool("假查询", Domain::Packages, &["信息"]);
+        tool.path = PathBuf::from("/usr/bin/false");
+        tool.mode = RunMode::Capture;
+        tool.action = Some(crate::model::Action {
+            program: String::from("/usr/bin/false"),
+            base_argv: Vec::new(),
+            arguments: vec![argument("always", "总是退出 1", "--x")],
+            duration_from: None,
+            limit_from: None,
+            foreach: None,
+            ok_exit_codes: vec![0, 1], // ← 关键：1 也算成功
+            allow_empty: false,
+        });
+
+        let mut app = App::new(
+            Registry::from_tools(vec![tool.clone()]),
+            PathBuf::from("/tmp/bin"),
+            ReloadReport::default(),
+        );
+        app.state = crate::state::State::default();
+        app.state_path =
+            std::env::temp_dir().join(format!("toolbox-hub-okcode-{}.toml", std::process::id()));
+        app.history_path = Some(app.state_path.with_extension("history"));
+        let cwd = std::env::temp_dir();
+
+        app.enqueue_captures(vec![CaptureRequest {
+            tool,
+            ok_exit_codes: vec![0, 1],
+            values: Vec::new(),
+            argv: Vec::new(),
+            record_argv: Vec::new(),
+            total_seconds: None,
+        }]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (app.is_running() || !app.job_queue.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_job(&cwd);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let entries = crate::history::load_from(&app.history_path.clone().expect("路径"), 5);
+        assert_eq!(entries.len(), 1, "应该记了一条");
+        assert!(entries[0].success, "退 1 在白名单里，历史应记成功");
+        assert!(
+            app.message.contains("失败 0") || app.message.contains("完成"),
+            "{}",
+            app.message
+        );
     }
 
     /// 文件管理器的反馈怎么决定工作目录：选中过文件用它的目录，否则用退出目录。
@@ -3300,10 +3403,14 @@ mod tests {
         assert_eq!(app.filtered.len(), 1);
         assert!(!app.has_sub_tabs(), "无标签的域不该出现筛选条");
 
-        // 从第一个域往左绕回最后一个域。
+        // 从第一个域往左绕回最后一个域（最后一个域会变，所以不写死名字）。
         app.switch_domain(Domain::Media.index());
         app.switch_domain(app.domain + Domain::ALL.len() - 1);
-        assert_eq!(app.current_domain(), Domain::Tools);
+        assert_eq!(
+            app.current_domain(),
+            Domain::ALL[Domain::ALL.len() - 1],
+            "往左绕回应落到最后一个域"
+        );
     }
 
     #[test]

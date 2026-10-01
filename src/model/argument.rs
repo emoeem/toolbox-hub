@@ -95,11 +95,20 @@ pub struct Argument {
     pub placement: ArgPlacement,
     /// 敏感参数（密码、带 token 的地址…）：**记录历史前**它的值会被换成 `***`。
     pub sensitive: bool,
-    /// 多值：这一项可以填多条，**每条各占一个 argv 元素**。
+    /// 多值：这一项可以填多条（用 `separator` 分隔）。
     ///
-    /// 只对位置参数开放（带 flag 的多值有两种写法 —— `-i a -i b` 与 `-i a b` ——
-    /// 在真的遇到需要它的工具之前，不先造一个没人验证过的开关）。
+    /// 带 flag 时有**两种真实存在的写法**，所以由 [`Argument::repeat_flag`] 显式选：
+    /// 位置参数每条各占一个元素；带 flag 时默认「flag 一次、值平铺」。
     pub repeatable: bool,
+    /// 带 flag 的多值怎么展开：
+    ///
+    /// * `false`（默认）：**flag 只出现一次，值平铺在后面** —— `-S a b c`
+    ///   （`paru -S`、`pacman -Rns`、`apt install` 都是这个形状）。
+    /// * `true`：**每个值配一个 flag** —— `-i a -i b`（ffmpeg 那种）。
+    ///
+    /// 两种写法真的都存在，猜错代价是命令跑不起来，所以做成显式选择；
+    /// 选错了在表单的命令预览里一眼就能看出来。
+    pub repeat_flag: bool,
     /// 多值之间的分隔符，`repeatable` 为真时才有意义。默认逗号。
     pub separator: String,
     /// 这个字段要填的是**目录**（例如 aria2c 的保存目录）：
@@ -194,6 +203,18 @@ pub struct Action {
     /// 「这次只会做 N 秒」从哪个参数取（`limit_from = "duration"`）：
     /// 裁剪类动作的输出时长不等于输入时长，有它就按它算百分比。
     pub limit_from: Option<String>,
+    /// 哪些退出码算「成功」。默认只有 `0`。
+    ///
+    /// 真跑抓到过：`pacman -Qdt` 在**没有孤儿包**时退出码是 1 ——
+    /// 「没匹配到」是正常结果，不该在界面上报成失败。同理 `checkupdates`
+    /// 没有更新时退 2、`grep` 没匹配时退 1。
+    pub ok_exit_codes: Vec<i32>,
+    /// 允许**不带任何参数**运行（`allow_empty = true`）。
+    ///
+    /// 绝大多数动作都要带点东西（子命令、查询词），所以「默认 argv 是空的」
+    /// 通常意味着忘了写 `base_argv`（`pacman -Qdt` 那种本体命令漏了会变成光跑
+    /// `pacman`）。真要允许空 argv 就在这里明说，例如 `pac` 不带参数＝列出全部。
+    pub allow_empty: bool,
     /// 批量：声明的那个参数**每个取值各跑一次**（`foreach = "input"`）。
     ///
     /// 和 `repeatable` 的区别很重要：`repeatable` 是「一条命令塞多个参数」
@@ -243,25 +264,32 @@ impl Action {
                 continue;
             }
 
-            // 多值：拆成多个 argv 元素，各占一个位置（带 flag 时每个值都配一个 flag，
-            // 例如 `-i a -i b`）。`foreach` 的批量字段每次只会有一个值，于是就是
-            // `-i <一个文件>` —— 这也是 foreach 字段允许带 flag 的原因。
+            // 多值：拆成多个 argv 元素。带 flag 时按 `repeat_flag` 决定是
+            // 「一个 flag 后面平铺」（`-S a b c`）还是「每个值一个 flag」（`-i a -i b`）。
+            // `foreach` 的批量字段每次只有一个值，两种写法都会得到 `-S <一个>`。
             if argument.repeatable {
                 let items = argument.split_values(&value);
                 if argument.required && items.is_empty() {
                     return Err(format!("「{}」是必填项", argument.label));
                 }
-                for item in items {
-                    match &argument.flag {
-                        Some(flag) if argument.flag_join => {
+
+                match &argument.flag {
+                    Some(flag) if argument.flag_join => {
+                        for item in items {
                             phases[slot].push(format!("{flag}{item}"));
                         }
-                        Some(flag) => {
+                    }
+                    Some(flag) if argument.repeat_flag => {
+                        for item in items {
                             phases[slot].push(flag.clone());
                             phases[slot].push(item);
                         }
-                        None => phases[slot].push(item),
                     }
+                    Some(flag) => {
+                        phases[slot].push(flag.clone());
+                        phases[slot].extend(items);
+                    }
+                    None => phases[slot].extend(items),
                 }
                 continue;
             }
@@ -348,6 +376,8 @@ mod tests {
             duration_from: None,
             limit_from: None,
             foreach: None,
+            ok_exit_codes: vec![0],
+            allow_empty: false,
             arguments: vec![
                 Argument {
                     key: "url".to_string(),
@@ -359,6 +389,7 @@ mod tests {
                     flag: None,
                     flag_join: false,
                     repeatable: false,
+                    repeat_flag: false,
                     separator: String::from(","),
                     dir_only: false,
                     placement: ArgPlacement::Trailing,
@@ -378,6 +409,7 @@ mod tests {
                     flag: Some("-f".to_string()),
                     flag_join: false,
                     repeatable: false,
+                    repeat_flag: false,
                     separator: String::from(","),
                     dir_only: false,
                     placement: ArgPlacement::Middle,
@@ -394,6 +426,7 @@ mod tests {
                     flag: Some("--write-subs".to_string()),
                     flag_join: false,
                     repeatable: false,
+                    repeat_flag: false,
                     separator: String::from(","),
                     dir_only: false,
                     placement: ArgPlacement::Middle,
@@ -632,10 +665,29 @@ mod tests {
     ///
     /// 这个分支以前直接把 flag 丢了 —— 因为那时「多值 + flag」是禁止的，
     /// 直到 `foreach` 放开了它（批量转码的 `-i`）才暴露出来。
+    /// 默认写法：**flag 只出现一次，值平铺后面** —— `paru -S a b c` 的形状。
+    #[test]
+    fn a_repeatable_flagged_argument_defaults_to_one_flag() {
+        let mut action = action();
+        action.arguments[1].repeatable = true; // quality：带 -f
+        action.arguments[1].separator = String::from("|");
+        let mut values = action.default_values();
+        values.set("url", "a.mp4");
+        values.set("quality", "best|worst");
+        values.set("subtitles", "false");
+
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["--no-mtime", "-f", "best", "worst", "a.mp4"],
+            "flag 一次、值平铺"
+        );
+    }
+
     #[test]
     fn a_repeatable_flagged_argument_repeats_its_flag() {
         let mut action = action();
         action.arguments[1].repeatable = true; // quality：带 -f
+        action.arguments[1].repeat_flag = true; // 每个值配一个 flag
         action.arguments[1].separator = String::from("|");
         let mut values = action.default_values();
         values.set("url", "a.mp4");
@@ -657,6 +709,8 @@ mod tests {
             duration_from: None,
             limit_from: None,
             foreach: None,
+            ok_exit_codes: vec![0],
+            allow_empty: true, // 「不带参数也合法」的声明位
         };
         assert_eq!(action.build_argv(&ArgumentValues::new()), Ok(Vec::new()));
     }
