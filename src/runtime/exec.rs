@@ -13,6 +13,7 @@ use std::{
 };
 
 use ratatui::crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -637,13 +638,13 @@ fn run_batch(jobs: &[Job], cwd: &Path) -> io::Result<ExecReport> {
 /// 离开备用屏幕并恢复规范终端模式，把终端交给子进程。
 fn suspend_terminal() -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 
 /// 重新进入备用屏幕并打开 raw mode。
 fn resume_terminal() -> io::Result<()> {
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     enable_raw_mode()?;
     Ok(())
 }

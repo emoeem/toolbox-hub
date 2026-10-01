@@ -4,9 +4,10 @@
 **可发现、可填表、可回看**的 TUI 工具箱。
 
 **它不是桌面应用启动器**：GUI/TUI 只是 CLI 的交互层，真正干活的一直是那些命令行工具本身。
+同一个二进制也是**命令行工具**：`toolbox-hub -s fzf` / `-i fzf` / `-u` / `-l --exp` 都能直接用。
 
 ```text
-媒体 44 │ 图像 3 │ 系统 5 │ 网络 2 │ 开发 4 │ 工具 2 │ 包管理 15
+媒体 44 │ 图像 3 │ 系统 5 │ 网络 2 │ 开发 4 │ 工具 2 │ 包管理 13
 ──────────────────────────────────────────────────────
  全部 · 转码 · 编辑 · 媒体 · 字幕 · 分析 · 工具 · 下载
 ──────────────────────────────────────────────────────
@@ -29,8 +30,8 @@ cargo build --release && ./target/release/toolbox-hub    # 更快
 
 | 场景 | 键 |
 | --- | --- |
-| 列表 | `↑↓`/`jk` 选择 · `Enter` 执行 · `/` 搜索（跨域） · `←→`/`1-7` 域 · `h`/`l` 分类 · `Tab` 标记 · `f` 收藏 · `v` 视图 · `H` 历史 · **`F` 看文件** · **`y` 文件管理器** · **`p` 包管理** · **`d` 改工作目录** · `Ctrl-R` 重扫 · `?` 帮助 · `q` 退出 |
-| 包管理（`p`） | 打字+`Enter` 搜官方源+AUR · `1-9`/`0` 仓库标签 · `Space` 排队 · `Tab` 结果⇄队列 · `Enter` 安装（按两次） · `Ctrl+X` PKGBUILD · `Ctrl+N` 新闻 · `Ctrl+E`/`Ctrl+I` 导出/导入队列 · `o` 浏览器看 AUR 页 |
+| 列表 | `↑↓`/`jk` 选择 · **鼠标左键选择 / 双击执行 / 滚轮滚动** · `Enter` 执行 · `/` 搜索（跨域） · `←→`/`1-7` 域 · `h`/`l` 分类 · `Tab` 标记 · `f` 收藏 · `v` 视图 · `H` 历史 · **`F` 看文件** · **`y` 文件管理器** · **`p` 包管理** · **鼠标点击包结果 / 双击加入队列** · `d` 改工作目录 · `Ctrl-R` 重扫 · `?` 帮助 · `q` 退出 |
+| 软件包中心（`p`） | `←→`/鼠标切模式：搜索 · 已安装 · 新闻 · 打字即本地模糊筛 · `Enter` 上网搜 / 读本地 / 抓新闻 · `↑↓` 选择 · `Tab` 换面板（结果→安装清单→包信息） · `1-9`/`0` 标签开关 · `s` 排序菜单 · `Space` 排队 · **`Enter` 先看命令、再按一次才执行** · `m` 安装/卸载/仅下载 · `U` 更新 · `c` 清缓存 · `O` 清孤儿 · `D` 演练模式 · `Ctrl+X` PKGBUILD · `Ctrl+K` 检查 · `Ctrl+E`/`Ctrl+I` 导出/导入 · `Ctrl+D` 清空 |
 | 表单 | `↑↓` 换字段 · `←→` 改选项 · `Enter` 编辑 · **`Ctrl-F` 挑文件** · `Ctrl-E` 执行（危险动作按两次） · `Esc` 返回 |
 | 输出视图 | `↑↓` 滚动 · `g`/`G` 顶底 · `s` 保存 · `c` 复制 · `q` 关闭 |
 | 执行中 | `q` 取消（先 SIGTERM 让工具收尾） · 其余按键照常可用 |
@@ -88,6 +89,8 @@ foreach = "input"                          # 每个输入各跑一次
 | `~/.config/toolbox-hub/tools.d/` | 你的 manifest（**同 id 覆盖内置**） |
 | `~/.config/toolbox-hub/state.toml` | 收藏 · 工作目录 · 最近目录 |
 | `~/.local/share/toolbox-hub/history.log` | 执行历史（纯文本，可直接看/改） |
+| `~/.local/share/toolbox-hub/install-queue.txt` | 安装清单（一行一个 `仓库/包名 版本`） |
+| `~/.local/share/toolbox-hub/news-read.log` | 已读新闻（一行一个链接，删一行就等于标回未读） |
 | `~/.local/share/toolbox-hub/output/` | 输出视图里按 `s` 保存的文件 |
 | `manifests/*.toml`（项目内） | 内置动作，编译进二进制 |
 
@@ -95,28 +98,59 @@ foreach = "input"                          # 每个输入各跑一次
 `TOOLBOX_HUB_WORKDIR`（启动工作目录）、`TOOLBOX_HUB_FILE_MANAGER`（默认 `yazi`）、
 `TOOLBOX_HUB_DATA`、`TOOLBOX_HUB_STATE`。
 
-## 原生包管理（`p`）
+## 软件包中心（`p`）
 
-照 [pacsea](https://github.com/Firstp1ck/Pacsea) 的布局自己实现的一个包管理界面 ——
-**不是**去启动 `pac`/`pacsea`，搜索、解析、筛选、队列、状态全在这个 Rust 程序里；
-只有「真正改系统」的那一下交给 `paru -S`（pacsea 也是这么做的）。
+Hub 自己的统一包入口，三块屏共用一套版式（pacseek 那个意思）：
 
-| 数据 | 来源 |
-| --- | --- |
-| 官方源搜索 / 信息 | `LC_ALL=C pacman -Ss` / `-Sii`（锁 locale 是因为标记会本地化成 `[已安装]`） |
-| AUR 搜索 / 信息 | AUR 官方 RPC + `serde_json`：得票、热度、维护者、是否过期、依赖 |
-| 已安装集合 | `pacman -Qq` 一次拿全 |
-| PKGBUILD | `paru -Gp`，拿输出视图看 |
-| Arch 新闻 | `archlinux.org/feeds/news/`，并对比 `pacman.log` 里最后一次全系统更新，提醒未读 |
+| 模式 | 看什么 | 主要来源 |
+| --- | --- | --- |
+| **搜索** | 官方源 + AUR 的搜索结果、仓库标签带条数、排序菜单 | `LC_ALL=C pacman -Ss` · AUR RPC |
+| **已安装** | 全部 / 显式 / 依赖 / 外来 / 孤儿，可直接排队卸载 | `pacman -Q` `-Qe` `-Qd` `-Qm` `-Qtd` |
+| **新闻** | 未读 / 已读 / 全部，`★` 标出「上次升级之后发布的」 | `archlinux.org/feeds/news/` + `pacman.log` |
+
+它不再启动 `pac` / `pacsea` 这类独立 TUI；真正改系统时才交给 `pacman` / `paru`。
+
+**任何会改系统的动作都先摆到确认面板上**：那条命令就是马上要跑的那条（同一个
+`command_preview()` 算出来的），要看清楚了再按第二次 `Enter`。`D` 打开演练模式后，
+确认也只会把命令写进状态行，不动系统（等于 pacsea 的 `--dry-run`）。
+
+**提权**：`pacman` / `paccache` 必须以 root 跑，非 root 时命令前面会自动补 `sudo`
+（`paru` 自己会调 sudo，所以不加）—— 确认面板上看到的就是带 `sudo` 的那条。
 
 ```text
-┌ 结果 128 条 · [core✓][extra✓][aur✓] · 队列 2 · 「fzf」128 个结果 ──────────┐
-│ > extra  fzf        0.74.4-1  Command-line fuzzy finder    ✓ 已安装       │
-│   aur    fzf-git    0.74.4…   fzf from git                 票 12·0.31    │
-├ 搜索 fzf▏                     Enter 搜索 · Esc 退出输入                  │
-├ 包信息 fzf                    Depends On  glibc  …                       │
-└ Space 排队 · Enter 安装 · Tab 队列 · Ctrl+X PKGBUILD · Ctrl+N 新闻 …     ┘
+┌ 软件包中心 ─────────────────────────────────────────────────────────────────┐
+│ 结果 128   排序 相关度▾   操作 安装   队列 2   待更新 12   新闻 3 未读        │
+│ [ 搜索 ][ 已安装 ][ 新闻 ] │ [core 42✓] [extra 61✓] [aur 14✓]               │
+│ ➤ extra  fzf     0.74.4-1  Command-line fuzzy finder   ✓ 已安装 │ 包信息 fzf  │
+│   aur    ● sysz  1.4.3-1   fzf terminal UI …  票 23·1.50        │ Depends On  │
+│ 搜索 fzf▏                    Enter 上网搜 · Esc 退出输入         │ glibc       │
+│ ┌ 安装清单 (2) ───────────────────────────────────────────────┐ │ Download    │
+│ │ aur   sysz   1.4.3-1                                        │ │ 0.5 MiB     │
+│ └─────────────────────────────────────────────────────────────┘ │             │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+队列（安装清单）会落盘：关掉界面再打开还在。搜索结果里排过队的包名字前有 `●`。
+
+## 命令行模式（不进 TUI）
+
+带动作参数就干完即退，能写进脚本、绑到快捷键、丢进管道：
+
+```bash
+toolbox-hub -s fzf                 # 搜官方源 + AUR
+toolbox-hub -i fzf ripgrep         # 装（队列里出现 AUR 就自动走 paru）
+toolbox-hub --dry-run -i fzf       # 只打印将要执行的命令，不动系统
+toolbox-hub -r fzf                 # 卸（-Rns，非 root 自动补 sudo）
+toolbox-hub -u                     # 系统更新
+toolbox-hub -n --unread            # 只看没读过的 Arch 新闻
+toolbox-hub -l --exp               # 自己点名装的包
+toolbox-hub -l --imp | wc -l       # 被依赖拖进来的有多少个
+toolbox-hub --orphans              # 孤儿包
+toolbox-hub --clear-cache          # 清包缓存（paccache -rk1）
+```
+
+`toolbox-hub --help` 是权威列表。CLI 与 TUI **共用同一份命令翻译**
+（`packages::PackageOperation` + `escalate`），不会出现两边算出来的命令不一样。
 
 ## 工作目录：脚本找不到文件的根因
 
@@ -130,9 +164,12 @@ FFTools 那批脚本是在**工作目录**里扫文件的（`fd … .`）。从�
 ## 架构（依赖方向自上而下，没有环）
 
 ```text
-main ─► app ─► registry ─► providers ─► model
+main ─► cli ──► packages ──► probe        （命令行模式：不进 TUI，干完即退）
+  │
+  └──► app ─► registry ─► providers ─► model
         │                    │
         ├─► ui（只读 App）    └─► metadata（依赖探测 / 路径解析）
+        ├─► packages ───────► probe        （软件包中心：搜索 / 已安装 / 新闻）
         └─► runtime ────────► model        （执行：只传 argv，永不经 shell）
             media                          （工作目录里的媒体文件）
             history / state                （历史与配置，纯文本落盘）
@@ -145,6 +182,8 @@ main ─► app ─► registry ─► providers ─► model
 | `registry` | Provider 聚合、发现、重载、跨域搜索、收藏与最近 |
 | `app` | 界面状态与按键（列表 / 表单 / 选择器 / 文件 / 历史 / 输出 / 帮助） |
 | `ui` | 纯渲染 |
+| `packages` | 软件包中心的数据层：解析、队列、已读新闻、命令翻译（`argv` 而不是 shell 串） |
+| `cli` | 命令行模式：`-s/-i/-r/-u/-n/-l/--clear-cache`，与 TUI 共用同一份命令翻译 |
 | `runtime` | 交互式接管终端；捕获式后台任务（实时输出 / 进度 / 取消） |
 | `media` | 工作目录里的媒体文件扫描 |
 

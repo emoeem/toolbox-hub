@@ -1,7 +1,7 @@
 //! 原生包管理的数据层：搜索、包信息、安装队列、搜索历史、Arch 新闻。
 //!
-//! 为什么是「原生」而不是启动 pac/pacsea：界面、解析、筛选、队列、状态全在这里，
-//! 只有**真正改系统**的那一下交给包管理器（`paru -S`）—— pacsea 也是这么做的。
+//! 为什么是「原生」：界面、解析、筛选、队列、状态全在 Toolbox Hub 里，
+//! 只有**真正改系统**的那一下交给 pacman / paru，终端接管负责 sudo 与交互确认。
 //!
 //! 数据来源与理由：
 //!
@@ -103,7 +103,7 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     Some(score)
 }
 
-/// 结果排序方式（pacsea 顶栏那个 `Sort v`）。
+/// 结果排序方式（pacseek 顶栏那个 `Sort v`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
     /// 相关度：服务器给的顺序 + 本地模糊分数。
@@ -112,28 +112,19 @@ pub enum SortMode {
     Repo,
     /// AUR 的得票（官方源没有票，排后面）。
     Votes,
+    /// 版本号（已安装列表用；搜索结果的版本排序意义不大，但留着无妨）。
+    Version,
 }
 
 impl SortMode {
-    pub const ALL: [SortMode; 4] = [
-        SortMode::Relevance,
-        SortMode::Name,
-        SortMode::Repo,
-        SortMode::Votes,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             SortMode::Relevance => "相关度",
             SortMode::Name => "名字",
             SortMode::Repo => "仓库",
             SortMode::Votes => "得票",
+            SortMode::Version => "版本",
         }
-    }
-
-    pub fn next(self) -> Self {
-        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
     }
 }
 
@@ -548,6 +539,292 @@ pub fn load_queue_from(path: &Path) -> Vec<QueuedPackage> {
         .unwrap_or_default()
 }
 
+// ── 执行什么：把「操作 + 队列」翻译成一条真实命令 ────────────────────────────
+//
+// 这一层**只生成 argv，绝不执行**。两个理由：
+//
+// 1. dry-run：界面要把「马上要跑的那条命令」原样给你看（pacsea 的 --dry-run 就是
+//    这个意思），确认面板上显示的命令必须**逐字**等于真跑的命令；
+// 2. 复用：TUI 的确认面板与 `toolbox-hub -i` 的命令行模式共用同一份翻译，
+//    不会出现「界面里写的东西」和「CLI 里写的东西」各跑各的。
+
+/// 队列要执行的操作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageOperation {
+    Install,
+    Remove,
+    Download,
+}
+
+impl PackageOperation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Install => "安装",
+            Self::Remove => "卸载",
+            Self::Download => "仅下载",
+        }
+    }
+
+    /// 更长的说明，给确认面板用（`仅下载` 两个字说不清会发生什么）。
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Install => "下载并安装（缺的依赖会一起装）",
+            Self::Remove => "卸载，并清掉只被它们依赖的依赖（-Rns）",
+            Self::Download => "只下到 pacman 缓存，不安装",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Install => Self::Remove,
+            Self::Remove => Self::Download,
+            Self::Download => Self::Install,
+        }
+    }
+
+    /// 哪个程序来干这活。
+    ///
+    /// 只有**队列里真有 AUR 包**时才请 paru —— 官方源的事 pacman 就够，
+    /// 少一层包装少一份意外；`--needed` 这类保护也由我们显式写出来。
+    pub fn program(self, uses_aur: bool) -> &'static str {
+        if uses_aur && self != Self::Download {
+            "paru"
+        } else {
+            "pacman"
+        }
+    }
+
+    /// 包名之外的开关。
+    pub fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Install => &["-S", "--needed"],
+            Self::Remove => &["-Rns"],
+            // `-Sw` 是「只下载」；AUR 包走的是源码快照，这个开关对它没意义，
+            // 所以 program() 在这一档**不会**切到 paru（免得看着像能下 AUR 一样）。
+            Self::Download => &["-Sw", "--needed"],
+        }
+    }
+
+    pub fn argv(self, names: &[String]) -> Vec<String> {
+        let mut argv: Vec<String> = self
+            .flags()
+            .iter()
+            .map(|flag| (*flag).to_string())
+            .collect();
+        argv.extend(names.iter().cloned());
+        argv
+    }
+}
+
+/// 系统更新的开关（paru 与 pacman 都认）。
+pub const UPGRADE_FLAG: &str = "-Syu";
+
+/// 当前进程是不是 root（读 `/proc/self/status` 的 `Uid:` 行，不引 libc）。
+///
+/// 为什么需要它：`pacman` / `paccache` **必须**以 root 跑，而 `paru` / `yay`
+/// 自己会去调 sudo（而且它们**必须**保持非 root，否则拒绝干活）。搞混这两种
+/// 语义的后果很实在 —— 界面里显示 `pacman -S fzf`、按下去却回一句
+/// 「you cannot perform this operation unless you are root」。
+pub fn is_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .map(|text| {
+            text.lines()
+                .any(|line| line.starts_with("Uid:") && line.split_whitespace().nth(1) == Some("0"))
+        })
+        .unwrap_or(false)
+}
+
+/// 这个程序自己管提权吗（paru / yay 会自己 sudo，前面再加一层反而出错）。
+fn handles_own_escalation(program: &str) -> bool {
+    matches!(program, "paru" | "yay")
+}
+
+/// 把「程序 + argv」变成**最终真的要执行**的那条命令：需要时补上 `sudo`。
+///
+/// 提权结果会一路带到确认面板上，所以你在界面上看到的那条命令
+/// （`sudo pacman -S --needed fzf`）和真正跑的完全一致。
+pub fn escalate(program: &str, argv: &[String]) -> (String, Vec<String>) {
+    if !handles_own_escalation(program) && !is_root() {
+        let mut escalated = Vec::with_capacity(argv.len() + 1);
+        escalated.push(program.to_string());
+        escalated.extend(argv.iter().cloned());
+        (String::from("sudo"), escalated)
+    } else {
+        (program.to_string(), argv.to_vec())
+    }
+}
+
+/// 把 `program + argv` 渲染成能直接粘进 shell 的一行。
+///
+/// dry-run 与确认面板都用它：**看到的就是跑的**。
+pub fn command_preview(program: &str, argv: &[String]) -> String {
+    let mut out = String::from(program);
+    for arg in argv {
+        out.push(' ');
+        out.push_str(&shell_quote(arg));
+    }
+    out
+}
+
+/// 只在必要时加引号：命令预览是给人看的，满屏引号反而看不清重点。
+fn shell_quote(raw: &str) -> String {
+    let plain = !raw.is_empty()
+        && raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "-_./@%+=:,".contains(ch));
+    if plain {
+        raw.to_string()
+    } else {
+        format!("'{}'", raw.replace('\'', r"'\''"))
+    }
+}
+
+/// 清下载缓存：优先 `paccache`（能只留最近 N 个版本），没有就退到 `pacman -Sc`。
+///
+/// 为什么不是 `pacman -Sc` 打头：它会把**当前仓库里已经没有的包**全删掉，
+/// 而 paccache 只动版本历史，两种语义差别很大 —— 默认走温和的那种。
+pub fn cache_command(keep: u8, has_paccache: bool) -> (String, Vec<String>) {
+    if has_paccache {
+        (
+            String::from("paccache"),
+            vec![format!("-rk{}", keep.clamp(1, 9))],
+        )
+    } else {
+        (String::from("pacman"), vec![String::from("-Sc")])
+    }
+}
+
+/// 卸载孤儿包的命令（`pacman -Qtdq` 拿名单，这里只负责拼 argv）。
+pub fn orphan_remove_command(names: &[String]) -> (String, Vec<String>) {
+    let mut argv = vec![String::from("-Rns")];
+    argv.extend(names.iter().cloned());
+    (String::from("pacman"), argv)
+}
+
+// ── 已安装包浏览器（pacsea 的 --list / --exp / --imp / --all）────────────────
+
+/// 本地已安装包的一行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledPackage {
+    pub name: String,
+    pub version: String,
+    /// `pacman -Qe`：你自己点名装的（对立面是「被依赖拖进来」）。
+    pub explicit: bool,
+    /// `pacman -Qm`：不在官方源里（AUR、手工编译、本地包）。
+    pub foreign: bool,
+    /// `pacman -Qtd`：没人依赖、你也不是点名装的 —— 可以清的孤儿。
+    pub orphan: bool,
+}
+
+impl InstalledPackage {
+    /// 列表右边那一列标记，一眼能分出四类。
+    pub fn tag(&self) -> &'static str {
+        if self.orphan {
+            "孤儿"
+        } else if self.foreign {
+            "外来"
+        } else if self.explicit {
+            "显式"
+        } else {
+            "依赖"
+        }
+    }
+}
+
+/// 已安装列表的筛选项（对应 pacsea 的 `--exp` / `--imp` / `--all`，另加孤儿与外来）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstalledFilter {
+    All,
+    Explicit,
+    Dependency,
+    Foreign,
+    Orphan,
+}
+
+impl InstalledFilter {
+    pub const ALL: [InstalledFilter; 5] = [
+        Self::All,
+        Self::Explicit,
+        Self::Dependency,
+        Self::Foreign,
+        Self::Orphan,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Explicit => "显式",
+            Self::Dependency => "依赖",
+            Self::Foreign => "外来",
+            Self::Orphan => "孤儿",
+        }
+    }
+
+    pub fn matches(self, package: &InstalledPackage) -> bool {
+        match self {
+            Self::All => true,
+            // 孤儿虽然也算「显式装的」，看「显式」时不该把它混进来 —— 那正是想清掉的那堆。
+            Self::Explicit => package.explicit && !package.orphan,
+            Self::Dependency => !package.explicit,
+            Self::Foreign => package.foreign,
+            Self::Orphan => package.orphan,
+        }
+    }
+}
+
+/// `pacman -Q` 那种 `名字 版本`（一行一条）。
+pub fn parse_installed_versions(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            match line.rsplit_once(' ') {
+                Some((name, version)) => Some((name.to_string(), version.to_string())),
+                // 只有名字（理论上不会有，但别把整行吃掉）
+                None => Some((line.to_string(), String::new())),
+            }
+        })
+        .collect()
+}
+
+/// 把 `pacman -Q` / `-Qe` / `-Qm` / `-Qtd` 四次查询拼成浏览器要的数据。
+///
+/// 纯函数：查是 [`probe`] 的事，这里只做集合运算，好在测试里钉住。
+pub fn parse_installed_packages(
+    versions: &str,
+    explicit: &str,
+    foreign: &str,
+    orphans: &str,
+) -> Vec<InstalledPackage> {
+    // `-Qe` / `-Qm` / `-Qtd` 的输出是 `名字 版本`，不是纯名字（`-Qeq` 才是纯名字，
+    // 但那样要多跑一次进程）。统一取每行第一个字段 —— 实拍踩过：拿整行去和 `-Q`
+    // 的名字比对，结果是「显式 0 个、外来 0 个」，整张表全被标成「依赖」。
+    let names = |text: &str| -> BTreeSet<String> {
+        parse_installed_versions(text)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    let explicit_set = names(explicit);
+    let foreign_set = names(foreign);
+    let orphan_set = names(orphans);
+
+    let mut packages: Vec<InstalledPackage> = parse_installed_versions(versions)
+        .into_iter()
+        .map(|(name, version)| InstalledPackage {
+            explicit: explicit_set.contains(&name),
+            foreign: foreign_set.contains(&name),
+            orphan: orphan_set.contains(&name),
+            name,
+            version,
+        })
+        .collect();
+    packages.sort_by(|a, b| a.name.cmp(&b.name));
+    packages
+}
+
 // ── 搜索历史 ─────────────────────────────────────────────────────────────────
 
 /// 搜索历史最多记多少条。
@@ -749,16 +1026,95 @@ pub fn parse_iso8601(raw: &str) -> Option<u64> {
     (total >= 0).then_some(total as u64)
 }
 
-/// 哪些新闻是「升级之后才出现的」（需要你看一眼）。
-pub fn unread_news(items: &[NewsItem], last_upgrade: Option<u64>) -> usize {
+/// 哪些新闻是「升级之后才发布的」（**建议看一眼**，不等于未读）。
+///
+/// 这是 pacsea 的 Arch Status 那个意思：真正的未读靠 [`load_read_news`] 记，
+/// 而「升级之后」只是提醒「这条可能和刚才那次升级有关」。
+pub fn news_published_since(items: &[NewsItem], last_upgrade: Option<u64>) -> usize {
     match last_upgrade {
         Some(mark) => items
             .iter()
             .filter(|item| item.epoch.is_some_and(|epoch| epoch > mark))
             .count(),
-        // 不知道上次升级时间：就当全都可能没读过（宁可多提醒）
+        // 不知道上次升级时间：就当全都可能相关（宁可多提醒）
         None => items.len(),
     }
+}
+
+// ── 新闻已读状态（pacsea 的 --unread / --read / --all-news）──────────────────
+//
+// 只拿 `pacman.log` 猜「升级之后」是不够的：你昨天看过的那条今天还会被算成新的。
+// 所以额外落一份**已读集合**，`r` 就是「这条我看过了」。
+
+/// 一条新闻的唯一键：链接最稳（标题偶尔会被改）。
+pub fn news_key(item: &NewsItem) -> String {
+    if item.link.trim().is_empty() {
+        item.title.clone()
+    } else {
+        item.link.clone()
+    }
+}
+
+/// 新闻筛选：未读 / 已读 / 全部。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewsFilter {
+    Unread,
+    Read,
+    All,
+}
+
+impl NewsFilter {
+    pub const ALL: [NewsFilter; 3] = [Self::Unread, Self::Read, Self::All];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unread => "未读",
+            Self::Read => "已读",
+            Self::All => "全部",
+        }
+    }
+
+    pub fn matches(self, item: &NewsItem, read: &BTreeSet<String>) -> bool {
+        let is_read = read.contains(&news_key(item));
+        match self {
+            Self::Unread => !is_read,
+            Self::Read => is_read,
+            Self::All => true,
+        }
+    }
+}
+
+pub fn read_news_path() -> PathBuf {
+    data_dir().join("news-read.log")
+}
+
+/// 读已读集合（一行一个键，纯文本，能直接看/改）。
+///
+/// 开头的 `#` 注释行要跳过：文件头部有一行说明，不跳的话它会被当成
+/// 「有一条叫这个名字的新闻已经读过了」。
+pub fn load_read_news(path: &Path) -> BTreeSet<String> {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 写已读集合。`BTreeSet` 保证输出稳定，diff 不会因为顺序乱跳。
+pub fn save_read_news(path: &Path, read: &BTreeSet<String>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut body = String::from("# toolbox-hub 已读新闻（一行一个链接）\n");
+    for key in read {
+        body.push_str(&key.replace(['\n', '\r'], " "));
+        body.push('\n');
+    }
+    fs::write(path, body)
 }
 
 /// 数据文件放哪儿（队列、搜索历史）。
@@ -828,13 +1184,12 @@ Download Size   : 2030.16 KiB
     }
 
     #[test]
-    fn sort_modes_cycle_through_all_of_them() {
-        let mut mode = SortMode::Relevance;
-        for _ in 0..SortMode::ALL.len() {
-            mode = mode.next();
-        }
-        assert_eq!(mode, SortMode::Relevance, "转一圈回到起点");
+    fn sort_modes_are_labelled_for_the_menu() {
         assert_eq!(SortMode::Votes.label(), "得票");
+        assert_eq!(SortMode::Version.label(), "版本");
+        assert_eq!(PackageOperation::Remove.label(), "卸载");
+        assert_eq!(PackageOperation::Install.next(), PackageOperation::Remove);
+        assert_eq!(PackageOperation::Download.next(), PackageOperation::Install);
     }
 
     #[test]
@@ -979,7 +1334,7 @@ Download Size   : 2030.16 KiB
     }
 
     #[test]
-    fn unread_news_counts_only_what_came_after_the_upgrade() {
+    fn news_published_since_upgrade_counts_only_the_new_ones() {
         let xml = r#"<rss><channel>
 <item><title>New kernel &amp; you</title><pubDate>Sat, 05 Apr 2025 12:00:00 +0000</pubDate><link>https://a.example/1</link></item>
 <item><title>Old news</title><pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate><link>https://a.example/2</link></item>
@@ -991,11 +1346,15 @@ Download Size   : 2030.16 KiB
 
         let after_old = parse_rfc2822("Mon, 01 Jan 2024 00:00:00 +0000").expect("时间");
         assert_eq!(
-            unread_news(&items, Some(after_old)),
+            news_published_since(&items, Some(after_old)),
             1,
-            "只有新的一条算未读"
+            "只有升级之后发布的那条算「新的」"
         );
-        assert_eq!(unread_news(&items, None), 2, "不知道就全提醒");
+        assert_eq!(
+            news_published_since(&items, None),
+            2,
+            "不知道上次升级时间就全提醒"
+        );
     }
 
     #[test]
@@ -1045,5 +1404,160 @@ Download Size   : 2030.16 KiB
         }
         assert_eq!(history.len(), MAX_SEARCHES, "有上限");
         assert_eq!(history[0], format!("term{}", MAX_SEARCHES + 4));
+    }
+
+    /// 命令翻译：官方源只用 pacman，只有队列里真有 AUR 才换 paru。
+    #[test]
+    fn operations_translate_to_the_right_program() {
+        let names = vec![String::from("fzf"), String::from("ripgrep")];
+
+        assert_eq!(
+            PackageOperation::Install.argv(&names),
+            vec!["-S", "--needed", "fzf", "ripgrep"]
+        );
+        assert_eq!(PackageOperation::Install.program(false), "pacman");
+        assert_eq!(PackageOperation::Install.program(true), "paru");
+        assert_eq!(PackageOperation::Remove.program(true), "paru");
+        assert_eq!(
+            PackageOperation::Remove.argv(&names),
+            vec!["-Rns", "fzf", "ripgrep"]
+        );
+        // 仅下载永远走 pacman：`paru -Sw` 对 AUR 的语义不是「下载源码」
+        assert_eq!(PackageOperation::Download.program(true), "pacman");
+        assert_eq!(
+            PackageOperation::Download.argv(&names),
+            vec!["-Sw", "--needed", "fzf", "ripgrep"]
+        );
+    }
+
+    /// 预览的那条命令要能直接粘进 shell（该加引号的地方要加）。
+    #[test]
+    fn command_preview_is_pasteable() {
+        let argv = vec![
+            String::from("-S"),
+            String::from("fzf"),
+            String::from("weird name"),
+            String::from("it's"),
+        ];
+        assert_eq!(
+            command_preview("paru", &argv),
+            // 注意这是**原始字符串**：命令预览里那个 `\` 是 POSIX 转义的一部分
+            // （`'it'\''s'`），写成普通字符串会被 Rust 先吃掉一层。
+            r"paru -S fzf 'weird name' 'it'\''s'"
+        );
+        assert_eq!(command_preview("pacman", &[]), "pacman");
+        // 版本号里的 `-` `.` `:` 不该被引号包起来（预览给人看，越干净越好）
+        assert_eq!(
+            command_preview("pacman", &[String::from("0.74.4-1")]),
+            "pacman 0.74.4-1"
+        );
+    }
+
+    /// 清缓存：有 paccache 就温和，没有才退到 `pacman -Sc`。
+    #[test]
+    fn cache_command_prefers_paccache() {
+        assert_eq!(
+            cache_command(1, true),
+            (String::from("paccache"), vec![String::from("-rk1")])
+        );
+        assert_eq!(
+            cache_command(3, true),
+            (String::from("paccache"), vec![String::from("-rk3")])
+        );
+        // 越界要夹住：`-rk0` 会把所有版本都删掉，不能让它出现
+        assert_eq!(
+            cache_command(0, true),
+            (String::from("paccache"), vec![String::from("-rk1")])
+        );
+        assert_eq!(
+            cache_command(1, false),
+            (String::from("pacman"), vec![String::from("-Sc")])
+        );
+    }
+
+    #[test]
+    fn orphan_removal_builds_a_plain_pacman_command() {
+        let (program, argv) = orphan_remove_command(&[String::from("a"), String::from("b")]);
+        assert_eq!(program, "pacman");
+        assert_eq!(argv, vec!["-Rns", "a", "b"]);
+    }
+
+    /// 已安装包浏览器：四张名单拼成 显式/依赖/外来/孤儿。
+    #[test]
+    fn installed_browser_joins_the_four_lists() {
+        let packages = parse_installed_packages(
+            "bash 5.3-1\nreadline 8.2-1\naur-thing 1.0-1\nstale-lib 0.1-1\n",
+            // 四个输入都按 pacman 真实输出的形状写：`-Qe/-Qm/-Qtd` 也是 `名字 版本`
+            "bash 5.3-1\naur-thing 1.0-1\nstale-lib 0.1-1\n",
+            "aur-thing 1.0-1\n",
+            "stale-lib 0.1-1\n",
+        );
+
+        assert_eq!(packages.len(), 4);
+        let get = |name: &str| {
+            packages
+                .iter()
+                .find(|package| package.name == name)
+                .expect("有这个包")
+        };
+        assert_eq!(get("bash").tag(), "显式");
+        assert_eq!(get("readline").tag(), "依赖");
+        assert_eq!(get("aur-thing").tag(), "外来");
+        assert_eq!(get("stale-lib").tag(), "孤儿");
+        assert_eq!(get("readline").version, "8.2-1");
+
+        // 筛选：孤儿不算进「显式」—— 那正是你想清掉的那堆
+        assert_eq!(
+            packages
+                .iter()
+                .filter(|package| InstalledFilter::Explicit.matches(package))
+                .count(),
+            2
+        );
+        assert_eq!(
+            packages
+                .iter()
+                .filter(|package| InstalledFilter::Dependency.matches(package))
+                .count(),
+            1
+        );
+        assert!(
+            InstalledFilter::Orphan.matches(get("stale-lib")),
+            "孤儿筛选要认得出来"
+        );
+    }
+
+    /// 已读新闻：落盘再读回来要一模一样。
+    #[test]
+    fn read_news_round_trips() {
+        let path =
+            std::env::temp_dir().join(format!("toolbox-hub-news-{}.log", std::process::id()));
+        let mut read = BTreeSet::new();
+        read.insert(String::from("https://a/2"));
+        read.insert(String::from("https://a/1"));
+
+        save_read_news(&path, &read).expect("写得进去");
+        assert_eq!(load_read_news(&path), read, "读回来要一样");
+        // 注释行不该被当成链接
+        assert!(!load_read_news(&path).contains("# toolbox-hub 已读新闻（一行一个链接）"));
+
+        let item = NewsItem {
+            title: String::from("标题"),
+            published: String::new(),
+            link: String::from("https://a/1"),
+            epoch: Some(1),
+        };
+        assert_eq!(news_key(&item), "https://a/1");
+        assert!(NewsFilter::Read.matches(&item, &read));
+        assert!(!NewsFilter::Unread.matches(&item, &read));
+
+        // 没链接就退回标题（RSS 偶尔会缺 link）
+        let bare = NewsItem {
+            link: String::new(),
+            ..item
+        };
+        assert_eq!(news_key(&bare), "标题");
+
+        let _ = fs::remove_file(&path);
     }
 }

@@ -9,8 +9,9 @@
 use std::{collections::BTreeSet, process::Command};
 
 use super::{
-    NewsItem, PackageHit, aur_info_url, aur_search_url, parse_aur_info, parse_aur_search,
-    parse_info, parse_installed, parse_news_rss, parse_official_search,
+    InstalledPackage, NewsItem, PackageHit, aur_info_url, aur_search_url, parse_aur_info,
+    parse_aur_search, parse_info, parse_installed, parse_installed_packages, parse_news_rss,
+    parse_official_search,
 };
 
 /// 一次搜索的结果（官方源 + AUR 合并）。
@@ -65,6 +66,115 @@ pub fn installed_names() -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// 已安装包浏览器要的数据：`-Q` 拿版本，`-Qe` / `-Qm` / `-Qtd` 拿三张名单。
+///
+/// `-Qm`（外来包）和 `-Qtd`（孤儿）在**一个都没有时退出码是 1**，那不是错误 ——
+/// 所以走 `run_ok_codes`，否则一台干净的机器会永远报「查询失败」。
+pub fn installed_packages() -> Result<Vec<InstalledPackage>, String> {
+    let versions = run("pacman", &["-Q"])?;
+    let explicit = run("pacman", &["-Qe"])?;
+    let foreign = run_ok_codes("pacman", &["-Qm"], &[0, 1]).unwrap_or_default();
+    let orphans = run_ok_codes("pacman", &["-Qtd"], &[0, 1]).unwrap_or_default();
+    Ok(parse_installed_packages(
+        &versions, &explicit, &foreign, &orphans,
+    ))
+}
+
+/// 孤儿包名单（`pacman -Qtdq`）；一个都没有就是空表。
+pub fn orphan_names() -> Vec<String> {
+    run_ok_codes("pacman", &["-Qtdq"], &[0, 1])
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 本地包信息（`pacman -Qi`）—— 已安装浏览器用它。
+///
+/// 注意和 [`info`] 的分工：那个查的是**仓库里**的包（`-Sii`），外来包（AUR、手工装的）
+/// 在同步库里根本不存在，只能查本地这一份。
+pub fn local_info(name: &str) -> InfoOutcome {
+    match run("pacman", &["-Qi", name]) {
+        Ok(text) => InfoOutcome {
+            name: name.to_string(),
+            fields: parse_info(&text),
+            error: None,
+        },
+        Err(error) => InfoOutcome {
+            name: name.to_string(),
+            fields: Vec::new(),
+            error: Some(error),
+        },
+    }
+}
+
+/// `paccache` 在不在（`pacman-contrib` 带的缓存清理工具）。
+pub fn has_paccache() -> bool {
+    on_path("paccache")
+}
+
+/// `paru` 在不在（系统更新走 `paru -Syu` 才能把 AUR 包一起升上去）。
+pub fn has_paru() -> bool {
+    on_path("paru")
+}
+
+/// 扫 `PATH` 判断命令在不在。
+///
+/// 不走 `sh -c 'command -v …'`：后者每次要 spawn 一个 shell（约 20ms），而这里
+/// 只是给「清缓存 / 更新」挑条路，不值得多花那个钱
+/// （`providers::metadata` 里对这个坑有更详细的记录）。
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+/// 卸载前的影响分析：这些包正被谁依赖着。
+///
+/// 为什么必须先摆出来：`-Rns` 会**连带删掉**依赖它们的包（pacman 只问一句 Y/n，
+/// 而那一问在长输出里极易被按过去）。这里先算出名单，确认面板上给你看清楚。
+///
+/// 队列内部互相依赖的不算（它们本来就要一起走）。
+pub fn removal_report(names: &[String]) -> Vec<String> {
+    let asked: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    let mut dependents: BTreeSet<String> = BTreeSet::new();
+
+    for name in names {
+        let Ok(text) = run("pacman", &["-Qi", name]) else {
+            continue;
+        };
+        for (key, value) in parse_info(&text) {
+            if key != "Required By" {
+                continue;
+            }
+            for dependent in value.split_whitespace() {
+                if !asked.contains(dependent) {
+                    dependents.insert(dependent.to_string());
+                }
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    if !dependents.is_empty() {
+        let sample: Vec<&str> = dependents.iter().take(12).map(String::as_str).collect();
+        lines.push(format!(
+            "有 {} 个已安装的包依赖它们：{}{}",
+            dependents.len(),
+            sample.join("  "),
+            if dependents.len() > sample.len() {
+                " …"
+            } else {
+                ""
+            }
+        ));
+    }
+    lines
+}
+
 /// 官方源搜索（`pacman -Ss`）。
 pub fn official_search(term: &str) -> Result<Vec<PackageHit>, String> {
     // 1 = 没有匹配（不是失败）
@@ -86,13 +196,26 @@ pub fn aur_search(term: &str) -> Result<Vec<PackageHit>, String> {
 /// 搜索：官方源 + AUR 各取一路，合并后按「已安装 → 相关性」排一下。
 pub fn search(term: &str) -> SearchOutcome {
     let installed = installed_names();
-    let mut outcome = SearchOutcome::default();
 
-    match official_search(term) {
+    // 两路网络/进程查询并行：AUR 网络慢时不会拖住 pacman，反之亦然。
+    let (official, aur) = std::thread::scope(|scope| {
+        let official = scope.spawn(|| official_search(term));
+        let aur = scope.spawn(|| aur_search(term));
+        (
+            official
+                .join()
+                .unwrap_or_else(|_| Err(String::from("官方源搜索线程异常退出"))),
+            aur.join()
+                .unwrap_or_else(|_| Err(String::from("AUR 搜索线程异常退出"))),
+        )
+    });
+
+    let mut outcome = SearchOutcome::default();
+    match official {
         Ok(hits) => outcome.hits.extend(hits),
         Err(error) => outcome.errors.push(format!("官方源：{error}")),
     }
-    match aur_search(term) {
+    match aur {
         Ok(hits) => outcome.hits.extend(hits),
         Err(error) => outcome.errors.push(format!("AUR：{error}")),
     }
@@ -325,7 +448,7 @@ mod tests {
                 println!("最新新闻：{}", items[0].title);
                 println!(
                     "未读（升级之后发布的）：{:?}",
-                    Some(super::super::unread_news(&items, last_upgrade()))
+                    Some(super::super::news_published_since(&items, last_upgrade()))
                 );
             }
             Err(error) => println!("抓新闻失败（网络问题可接受）：{error}"),

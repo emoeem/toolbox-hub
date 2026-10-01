@@ -63,7 +63,7 @@ const BUNDLED: &[(&str, &str)] = &[
 /// **加/删 `manifests/*.toml` 里的动作后要更新这里**：测试拿它对账，
 /// 某个 manifest 悄悄解析失败时（例如拼错一个键），工具数会立刻对不上。
 #[cfg(test)]
-const BUNDLED_ACTION_COUNT: usize = 34;
+const BUNDLED_ACTION_COUNT: usize = 32;
 
 pub struct ManifestProvider {
     /// 用户 manifest 目录，按顺序读；先读到的占住 id。
@@ -637,6 +637,37 @@ mod tests {
         );
     }
 
+    /// 需要 root 的两个动作：`sudo` 必须打头，而且 `-Rns` 只能出现一次。
+    ///
+    /// 这条抓到过真问题：`program` 从 `pacman` 改成 `sudo` 之后，参数里那个
+    /// `flag = "-Rns"` 会和 `base_argv` 里的撞车，变成 `sudo pacman -Rns -Rns bash`。
+    #[test]
+    fn root_actions_put_sudo_first_and_do_not_repeat_flags() {
+        let discovery = bundled_discovery();
+
+        let remove = by_id(&discovery, "manifest:pkg-remove");
+        let action = remove.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("package", "fzf bash");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["pacman", "-Rns", "fzf", "bash"],
+            "sudo 是程序，pacman -Rns 在后面，包名最后"
+        );
+        assert_eq!(action.program, "sudo");
+
+        let cache = by_id(&discovery, "manifest:pkg-clean-cache");
+        let action = cache.action.as_ref().expect("带动作");
+        assert_eq!(action.program, "sudo");
+        assert_eq!(
+            action
+                .build_argv(&action.default_values())
+                .expect("应能构建"),
+            vec!["paccache", "-rk1"],
+            "paccache 认 -rk1 这种连写"
+        );
+    }
+
     #[test]
     fn jq_keeps_the_expression_before_the_file() {
         let discovery = bundled_discovery();
@@ -842,8 +873,6 @@ mod tests {
             "manifest:pkg-remove",
             "manifest:pkg-upgrade",
             "manifest:pkg-clean-cache",
-            "manifest:pac-browse",
-            "manifest:pacsea",
         ];
 
         for id in destructive {

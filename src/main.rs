@@ -11,6 +11,7 @@
 //! * [`runtime`]   —— 工具执行（保持 Toolbox 启动时的原始工作目录）
 
 mod app;
+mod cli;
 mod history;
 mod media;
 mod model;
@@ -28,7 +29,7 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor,
-        event::{self, Event},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
@@ -39,7 +40,26 @@ use crate::{app::App, registry::Registry};
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bin_dir = resolve_bin_dir();
+    // 先看这次是「命令行模式」还是「进 TUI」：带动作参数时干完就退，
+    // 一个终端都不进（`toolbox-hub -s fzf | head` 要能在管道里安静地跑）。
+    let invocation = match cli::parse(env::args().skip(1)) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            eprintln!("toolbox-hub: {error}");
+            std::process::exit(2);
+        }
+    };
+    let bin_dir = match invocation {
+        cli::Invocation::Tui { bin_dir } => resolve_bin_dir(bin_dir),
+        cli::Invocation::Command(options) => {
+            if let Err(error) = cli::run(&options) {
+                eprintln!("toolbox-hub: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    };
+
     let (registry, report) = Registry::discover(&bin_dir);
     let mut app = App::new(registry, bin_dir, report);
     // 工作目录决定工具在哪儿找文件（FFTools 那批脚本尤其依赖它），
@@ -59,11 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// 工具目录解析顺序：`argv[1]` > `FZF_FFTOOLS_BIN_DIR` > `$HOME/.local/bin`。
-fn resolve_bin_dir() -> PathBuf {
-    env::args()
-        .nth(1)
-        .map(PathBuf::from)
+/// 工具目录解析顺序：命令行给的位置参数 > `FZF_FFTOOLS_BIN_DIR` > `$HOME/.local/bin`。
+fn resolve_bin_dir(from_args: Option<PathBuf>) -> PathBuf {
+    from_args
         .or_else(|| env::var_os("FZF_FFTOOLS_BIN_DIR").map(PathBuf::from))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin")))
         .unwrap_or_else(|| PathBuf::from(".local/bin"))
@@ -76,7 +94,12 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            cursor::Show
+        );
         original(info);
     }));
 }
@@ -84,13 +107,17 @@ fn install_panic_hook() {
 fn setup_terminal() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()
 }
 
@@ -108,11 +135,12 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
 
         // 尺寸变化不做特殊处理：下一帧 draw 会按新的 area 重新布局。
         // 有按键就处理；没有按键也**不能** continue（后台事件还得取）。
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && app::handle_key(app, key, &cwd)?
-        {
-            break;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if app::handle_key(app, key, &cwd)? => break,
+                Event::Mouse(mouse) => app::handle_mouse(app, mouse, &cwd)?,
+                _ => {}
+            }
         }
 
         // 后台任务的事件每帧都要取一次：

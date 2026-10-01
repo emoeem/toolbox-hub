@@ -20,7 +20,7 @@ mod form;
 mod header;
 mod help;
 mod history;
-mod packages;
+pub mod packages;
 mod picker;
 mod run;
 mod table;
@@ -323,6 +323,125 @@ mod tests {
             }
         }
         text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// 软件包中心：pacseek 那套版式该有的块都要画出来。
+    ///
+    /// 渲染层的回归测试比键盘测试更值钱 —— 布局是**算坐标**的，改一处约束就可能
+    /// 让某块彻底消失（这在我这儿真发生过：包信息面板被挤成 0 宽）。
+    #[test]
+    fn the_package_center_draws_every_panel() {
+        use crate::app::package_view::{PackageMode, PackageView};
+        use crate::packages::QueuedPackage;
+
+        let mut app = app();
+        let mut view = PackageView::new(Vec::new());
+        view.mode = PackageMode::Search;
+        view.query = String::from("fzf");
+        view.hits = vec![
+            crate::packages::PackageHit {
+                repo: String::from("extra"),
+                name: String::from("fzf"),
+                version: String::from("0.74.4-1"),
+                description: String::from("Command-line fuzzy finder"),
+                installed: true,
+                installed_version: None,
+                votes: None,
+                popularity: None,
+                maintainer: None,
+                out_of_date: false,
+            },
+            crate::packages::PackageHit {
+                repo: String::from("aur"),
+                name: String::from("sysz"),
+                version: String::from("1.4.3-1"),
+                description: String::from("fzf terminal UI for systemctl"),
+                installed: false,
+                installed_version: None,
+                votes: Some(23),
+                popularity: Some(1.5),
+                maintainer: None,
+                out_of_date: false,
+            },
+        ];
+        view.repos = vec![
+            crate::app::package_view::RepoChip {
+                name: String::from("extra"),
+                enabled: true,
+                count: 1,
+            },
+            crate::app::package_view::RepoChip {
+                name: String::from("aur"),
+                enabled: true,
+                count: 1,
+            },
+        ];
+        view.apply_filter();
+        view.queue.push(QueuedPackage {
+            name: String::from("sysz"),
+            origin: String::from("aur"),
+            version: String::from("1.4.3-1"),
+        });
+        view.info = Some((
+            String::from("fzf"),
+            vec![
+                (String::from("Depends On"), String::from("glibc")),
+                (String::from("Download Size"), String::from("0.5 MiB")),
+            ],
+        ));
+        view.message = String::from("2 个结果");
+        app.packages = Some(view);
+
+        let screen = render_compact(&mut app, 160, 40);
+        for wanted in [
+            "软件包中心",
+            "搜索",
+            "已安装",
+            "新闻",
+            "extra",
+            "fzf",
+            "排序",
+            "安装清单",
+            "sysz",
+            "包信息",
+            "DependsOn",
+            "DownloadSize",
+            "2个结果",
+        ] {
+            assert!(screen.contains(wanted), "屏幕上少了 {wanted}：\n{screen}");
+        }
+
+        // 模式标签也跟着走：切到已安装就不再画仓库标签，
+        // 而且输入框里的词要在**新列表**上重新生效（这里先清掉，好看到全部）
+        if let Some(view) = app.packages.as_mut() {
+            view.query.clear();
+            view.mode = PackageMode::Installed;
+            view.installed_loaded = true;
+            view.installed = vec![crate::packages::InstalledPackage {
+                name: String::from("bash"),
+                version: String::from("5.3-1"),
+                explicit: true,
+                foreign: false,
+                orphan: false,
+            }];
+            view.apply_installed_filter();
+        }
+        let screen = render_compact(&mut app, 160, 40);
+        for wanted in ["全部", "显式", "依赖", "外来", "孤儿", "bash"] {
+            assert!(
+                screen.contains(wanted),
+                "已安装模式少了 {wanted}：\n{screen}"
+            );
+        }
+
+        // 输入框的词在已安装模式里也是本地过滤（三种模式共用一个输入框）
+        if let Some(view) = app.packages.as_mut() {
+            view.query = String::from("zzz");
+            view.refilter();
+        }
+        let screen = render_compact(&mut app, 160, 40);
+        assert!(!screen.contains("bash"), "过滤后不该还看得见 bash");
+        assert!(screen.contains("这个分类里没有包"), "该提示被筛空了");
     }
 
     /// 回归测试：这正是「跑完一个交互式脚本回来，界面只剩一行字」的真凶。

@@ -1,12 +1,12 @@
-# 包管理：pacman / paru / pac 家族
+# 包管理：pacman / paru 相关的系统包操作。
 #
-# 为什么单独成域：这些都是「参数多、记不住、还改系统」的命令，
-# 查询类留在界面里看（capture），操作类必须接管终端（interactive）——
-# 因为 `paru -S` / `pacman -Rns` 要 sudo 密码、还要你回一次 Y/n。
-# 操作类一律 danger = "caution"：按两次 Ctrl-E 才真跑。
+# 搜索、信息、安装队列由 Toolbox Hub 自己的软件包中心（列表里按 p）统一承载，
+# 这里不再重复注册 pac / pacsea 这类独立 TUI；只保留需要直接调用 CLI 的专业动作
+# （单条查询、以及不经过队列的一次性操作）。
 #
-# 参考了两个同类前端的分工（pac 的模糊搜索安装、pacsea 的搜索/检视/排队），
-# 它们自己作为 TUI 也在这里可以直接启动。
+# 会改系统的动作统一标 danger = "caution"，执行时接管终端处理 sudo / Y-n。
+# **需要 root 的动作把 program 写成 sudo**：pacman / paccache 自己不会提权，
+# 直接跑只会回一句 “unless you are root”。
 
 # ── 查询：只读，留在界面里看 ────────────────────────────────────────────────
 
@@ -228,7 +228,7 @@ danger = "caution"
 install = "sudo pacman -S paru"
 input = "包名"
 output = "装好的包"
-features = "官方源 + AUR；会把要装的东西列给你确认，按 Y/n"
+features = "官方源 + AUR；会把要装的东西列给你确认，按 Y/n。界面上按 p 更顺手：能搜、能看依赖、能排队，还能先看要跑的命令"
 
 [[action.argument]]
 key = "package"
@@ -243,22 +243,27 @@ help = "多个包用空格分隔；AUR 包会先编译（可能要一会儿）"
 [[action]]
 id = "pkg-remove"
 name = "卸载包（连依赖与配置）"
-summary = "pacman -Rns：把包、它的依赖、以及 /etc 下的配置一起删掉"
+summary = "sudo pacman -Rns：把包、它的依赖、以及 /etc 下的配置一起删掉"
 domain = "包管理"
 tags = ["卸载"]
-program = "pacman"
+# 为什么 program 是 sudo 而不是 pacman：pacman **必须**以 root 跑，直接执行只会
+# 得到一句 “you cannot perform this operation unless you are root”。
+# 软件包中心那边走 packages::escalate()，是同一套判断。
+program = "sudo"
+base_argv = ["pacman", "-Rns"]
 mode = "interactive"
 danger = "caution"
 install = "自带（pacman）"
 input = "包名"
 output = "已卸载"
-features = "**会删配置**，删之前先看清楚列表"
+features = "**会删配置**，删之前先看清楚列表；软件包中心（p）里会先列出谁依赖它"
 
 [[action.argument]]
 key = "package"
 label = "包名"
 kind = "text"
-flag = "-Rns"
+# **不给 flag**：`-Rns` 已经写在 base_argv 里了，这里再写一遍会变成
+# `sudo pacman -Rns -Rns bash`。不带 flag 的参数就是追在后面的位置参数。
 required = true
 repeatable = true
 separator = " "
@@ -290,10 +295,12 @@ help = "打开的话 -git / -svn 这类包也会一起更新"
 [[action]]
 id = "pkg-clean-cache"
 name = "清理旧包缓存"
-summary = "paccache -rk1：每个包只留最近一个版本（能腾出不少空间）"
+summary = "sudo paccache -rk1：每个包只留最近一个版本（能腾出不少空间）"
 domain = "包管理"
 tags = ["清理"]
-program = "paccache"
+# 同上：paccache 要写 /var/cache/pacman/pkg，非 root 跑不动
+program = "sudo"
+base_argv = ["paccache"]
 mode = "interactive"
 danger = "caution"
 install = "sudo pacman -S pacman-contrib"
@@ -310,40 +317,3 @@ flag_join = true          # paccache 认 -rk1 这种连写
 required = true
 default = "1"
 help = "默认 1（只留最新）；想保守点就写 2 或 3"
-
-[[action]]
-id = "pac-browse"
-name = "pac：模糊搜索并安装"
-summary = "fzf 界面里搜（官方 + AUR），选中即装；AUR 会先做 AI 审查"
-domain = "包管理"
-tags = ["安装", "AUR"]
-program = "pac"
-# 不带参数就是「列出全部」—— 这是有意为之的合法空 argv
-allow_empty = true
-mode = "interactive"
-danger = "caution"
-install = "paru -S shorin-pac-git"
-input = "关键词"
-output = "选中的包装好"
-features = "模糊搜索；已安装标记；官方蓝 / AUR 紫；Ctrl+R 刷新；装 AUR 前审 PKGBUILD"
-
-[[action.argument]]
-key = "query"
-label = "关键词"
-kind = "text"
-placement = "trailing"
-help = "留空就是列出全部；例如 firefox"
-
-[[action]]
-id = "pacsea"
-name = "pacsea：包浏览器"
-summary = "另一个 TUI：搜索 / 检视 / 排队，最后一次性安装"
-domain = "包管理"
-tags = ["安装", "AUR"]
-program = "pacsea"
-mode = "interactive"
-danger = "caution"
-install = "paru -S pacsea-bin"
-input = "无"
-output = "排队装好的包"
-features = "统一搜索官方 + AUR；先排队、看清楚再一起装"

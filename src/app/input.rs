@@ -16,13 +16,338 @@
 
 use std::{path::Path, path::PathBuf, time::Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    crossterm::terminal::size,
+    layout::{Constraint, Layout, Position, Rect},
+};
 
 use crate::{
-    app::{App, Viewer},
+    app::{
+        App, Scope, Viewer,
+        package_view::{ConfirmAction, PackageMode, Pane},
+    },
     model::{Domain, RunMode},
     runtime,
 };
+
+/// 处理鼠标输入。
+///
+/// 第一阶段只覆盖高价值交互：主列表点击/双击、滚轮、域 Tabs、包中心结果/队列。
+/// 命中区域与渲染布局保持同一套约束，避免“画在这里、点到那里”。
+pub fn handle_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    cwd: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if app.is_help_open() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.close_help();
+        }
+        return Ok(());
+    }
+
+    if app.packages.is_some() {
+        return handle_packages_mouse(app, mouse, cwd);
+    }
+
+    if app.files.is_some()
+        || app.history.is_some()
+        || app.viewer.is_some()
+        || app.picker.is_some()
+        || app.form.is_some()
+        || app.is_editing_dir()
+    {
+        return Ok(());
+    }
+
+    let (width, height) = size().unwrap_or((80, 24));
+    let screen = Rect::new(0, 0, width, height);
+    let (domains, list) = main_mouse_areas(app, screen);
+    let point = Position::new(mouse.column, mouse.row);
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.move_selection(-3),
+        MouseEventKind::ScrollDown => app.move_selection(3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            if domains.contains(point) {
+                if let Some(index) = domain_at(domains, mouse.column, app) {
+                    app.switch_domain(index);
+                }
+                return Ok(());
+            }
+
+            if list.contains(point) {
+                let inner = Rect::new(
+                    list.x.saturating_add(1),
+                    list.y.saturating_add(1),
+                    list.width.saturating_sub(2),
+                    list.height.saturating_sub(2),
+                );
+                if inner.contains(point) {
+                    let row = mouse.row.saturating_sub(inner.y) as usize;
+                    if row < app.filtered.len() {
+                        app.selected = row;
+                        app.table.select(Some(row));
+                        if is_double_click(mouse) {
+                            execute_or_open_form(app, cwd)?;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// 主界面的可点击区域。这里刻意只复用布局约束，不依赖渲染状态。
+fn main_mouse_areas(app: &App, screen: Rect) -> (Rect, Rect) {
+    let show_sub = app.viewer.is_none()
+        && app.history.is_none()
+        && app.files.is_none()
+        && app.packages.is_none()
+        && app.picker.is_none()
+        && app.form.is_none()
+        && (app.is_global_search() || app.scope != Scope::All || app.has_sub_tabs());
+
+    let mut constraints = vec![Constraint::Length(4), Constraint::Length(2)];
+    if show_sub {
+        constraints.push(Constraint::Length(2));
+    }
+    let (table_min, detail_height) = if screen.height >= 30 { (9, 10) } else { (6, 8) };
+    constraints.push(Constraint::Min(table_min));
+    constraints.push(Constraint::Length(detail_height));
+    constraints.push(Constraint::Length(2));
+
+    let chunks = Layout::vertical(constraints).split(screen);
+    let domains = chunks.get(1).copied().unwrap_or_default();
+    let list_index = if show_sub { 3 } else { 2 };
+    let list = chunks.get(list_index).copied().unwrap_or_default();
+    (domains, list)
+}
+
+/// 从当前鼠标事件中获得一个稳定的双击判定。
+///
+/// Crossterm 本身不会替我们把两个终端 MouseEvent 组合成双击，所以用一个很小的
+/// 时间/位置窗口完成。状态放在 App 之外会导致跨实例串扰，因此只使用进程级轻量状态。
+fn is_double_click(mouse: MouseEvent) -> bool {
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+    static LAST: OnceLock<std::sync::Mutex<Option<(Instant, u16, u16)>>> = OnceLock::new();
+
+    let last = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let Ok(mut state) = last.lock() else {
+        return false;
+    };
+    let doubled = state.is_some_and(|(time, x, y)| {
+        time.elapsed() < Duration::from_millis(450)
+            && x.abs_diff(mouse.column) <= 2
+            && y.abs_diff(mouse.row) <= 1
+    });
+    *state = if doubled {
+        None
+    } else {
+        Some((Instant::now(), mouse.column, mouse.row))
+    };
+    doubled
+}
+
+fn domain_at(area: Rect, x: u16, app: &App) -> Option<usize> {
+    let mut cursor = area.x;
+    for (index, domain) in Domain::ALL.iter().enumerate() {
+        let count = app.registry.tool_count_in(*domain);
+        let label = if count == 0 {
+            format!(" {} ", domain.label())
+        } else {
+            format!(" {} {} ", domain.label(), count)
+        };
+        let width = label.encode_utf16().count() as u16;
+        let end = cursor.saturating_add(width);
+        if x >= cursor && x < end {
+            return Some(index);
+        }
+        cursor = end.saturating_add(1);
+        if cursor >= area.right() {
+            break;
+        }
+    }
+    None
+}
+
+fn package_panel_area(app: &App, screen: Rect) -> Rect {
+    let show_sub = false;
+    let (table_min, detail_height) = if screen.height >= 30 { (9, 10) } else { (6, 8) };
+    let mut constraints = vec![Constraint::Length(4), Constraint::Length(2)];
+    if show_sub {
+        constraints.push(Constraint::Length(2));
+    }
+    constraints.push(Constraint::Min(table_min));
+    constraints.push(Constraint::Length(detail_height));
+    constraints.push(Constraint::Length(2));
+    let chunks = Layout::vertical(constraints).split(screen);
+    let list_index = if show_sub { 3 } else { 2 };
+    let list = chunks.get(list_index).copied().unwrap_or_default();
+    let detail = chunks.get(list_index + 1).copied().unwrap_or_default();
+    let _ = app;
+    list.union(detail)
+}
+
+fn handle_packages_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    _cwd: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if app.packages.is_none() {
+        return Ok(());
+    }
+
+    // 浮层开着的时候鼠标不参与：确认面板上「点一下」的语义太危险
+    // （你以为在选，它可能在执行），统一留给键盘。
+    if app
+        .packages
+        .as_ref()
+        .is_some_and(|view| view.confirm.is_some() || view.sort_menu.is_some())
+    {
+        return Ok(());
+    }
+
+    if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+        if let Some(view) = app.packages.as_mut() {
+            view.move_selection(-3);
+        }
+        return Ok(());
+    }
+    if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+        if let Some(view) = app.packages.as_mut() {
+            view.move_selection(3);
+        }
+        return Ok(());
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(());
+    }
+
+    // 软件包中心自己拥有一套布局：外层面板与渲染保持一致，内层由
+    // ui::packages::layout() 统一提供状态栏 / 标签栏 / 结果 / 搜索 / 队列 / 信息区，
+    // 标签的命中区也来自同一个 tab_hits()。
+    let (width, height) = size().unwrap_or((80, 24));
+    let screen = Rect::new(0, 0, width, height);
+    let area = package_panel_area(app, screen);
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let areas = crate::ui::packages::layout(inner);
+    let point = Position::new(mouse.column, mouse.row);
+
+    // 标签栏：模式标签与筛选标签共用一套命中区。
+    if areas.tabs.contains(point) {
+        let hits = app
+            .packages
+            .as_ref()
+            .map(|view| crate::ui::packages::tab_hits(view, areas.tabs))
+            .unwrap_or_default();
+        for (rect, target) in hits {
+            if !rect.contains(point) {
+                continue;
+            }
+            match target {
+                crate::ui::packages::TabTarget::Mode(index) => {
+                    if let Some(mode) = PackageMode::ALL.get(index).copied()
+                        && let Some(view) = app.packages.as_mut()
+                    {
+                        view.editing = false;
+                        view.set_mode(mode);
+                    }
+                }
+                crate::ui::packages::TabTarget::Filter(index) => {
+                    if let Some(view) = app.packages.as_mut() {
+                        view.editing = false;
+                        view.toggle_chip(index);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        return Ok(());
+    }
+
+    if areas.search.contains(point) {
+        if let Some(view) = app.packages.as_mut() {
+            view.editing = true;
+            view.pane = Pane::Rows;
+            view.message = String::from("输入关键词，Enter 搜索");
+        }
+        return Ok(());
+    }
+
+    // 排序标签（顶栏里那个 `排序 相关度▾`）也点得动：直接开菜单，键盘来选。
+    if areas.status.contains(point) {
+        let sorts_open = app
+            .packages
+            .as_ref()
+            .is_some_and(|view| view.sort_menu.is_some());
+        if sorts_open {
+            return Ok(());
+        }
+        if let Some(view) = app.packages.as_mut() {
+            view.editing = false;
+            view.open_sort_menu();
+        }
+        return Ok(());
+    }
+
+    if areas.info.contains(point) {
+        if let Some(view) = app.packages.as_mut() {
+            view.editing = false;
+            view.pane = Pane::Info;
+        }
+        return Ok(());
+    }
+
+    let double = is_double_click(mouse);
+
+    if areas.queue.contains(point) {
+        if let Some(view) = app.packages.as_mut() {
+            view.editing = false;
+            view.pane = Pane::Queue;
+            // 面板有一圈边框，行号要减掉它
+            let row = point.y.saturating_sub(areas.queue.y).saturating_sub(1) as usize;
+            if row < view.queue.len() {
+                view.queue_selected = row;
+            } else {
+                view.queue_selected = view.queue.len().saturating_sub(1);
+            }
+            if double {
+                view.toggle_queue();
+            }
+        }
+        return Ok(());
+    }
+
+    if !areas.results.contains(point) {
+        return Ok(());
+    }
+
+    // 结果表第一行是表头，行号要减 1。
+    let row = point.y.saturating_sub(areas.results.y).saturating_sub(1) as usize;
+    if let Some(view) = app.packages.as_mut() {
+        view.editing = false;
+        view.pane = Pane::Rows;
+        if row < view.rows_len() {
+            let delta = row as isize - view.rows_selected() as isize;
+            view.move_row(delta);
+            if double {
+                view.toggle_queue();
+            }
+        }
+    }
+    Ok(())
+}
 
 /// 处理一次按键。返回 `Ok(true)` 表示请求退出主循环。
 pub fn handle_key(
@@ -491,7 +816,11 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// 包管理视图的按键（它自己管搜索框与队列两种焦点）。
+/// 软件包中心的按键。
+///
+/// 优先级从高到低：**确认面板** > **排序菜单** > 搜索框输入 > 常规操作。
+/// 面板开着的两层都只认很少几个键，其余一律忽略 —— 会改系统的界面上，
+/// 「按错一个键就执行」是最不能接受的失败方式。
 fn handle_packages_key(
     app: &mut App,
     key: KeyEvent,
@@ -499,14 +828,68 @@ fn handle_packages_key(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let editing = app.packages.as_ref().is_some_and(|view| view.editing);
-    let focus_queue = app.packages.as_ref().is_some_and(|view| view.focus_queue);
 
-    // 除了 Enter（安装确认）与 Space 之外，任何按键都解除危险确认
-    if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
-        && let Some(view) = app.packages.as_mut()
-    {
-        view.install_armed = false;
+    // ── 第一优先：确认面板 ──
+    if let Some(confirm) = app.packages.as_ref().and_then(|view| view.confirm.clone()) {
+        match key.code {
+            KeyCode::Enter => app.run_confirm(cwd)?,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.cancel_confirm();
+                }
+            }
+            // 清缓存保留几个版本，当场就能调（别的动作没有可调项）
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                if let ConfirmAction::Cache(keep) = confirm.action {
+                    let next = if key.code == KeyCode::Char('[') {
+                        keep.saturating_sub(1).max(1)
+                    } else {
+                        (keep + 1).min(9)
+                    };
+                    app.arm_cache(next);
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
     }
+
+    // ── 第二优先：排序菜单 ──
+    if app
+        .packages
+        .as_ref()
+        .is_some_and(|view| view.sort_menu.is_some())
+    {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.sort_menu_step(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.sort_menu_step(1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.apply_sort_menu();
+                }
+            }
+            _ => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.close_sort_menu();
+                }
+            }
+        }
+        return Ok(false);
+    }
+
+    let mode = app
+        .packages
+        .as_ref()
+        .map(|view| view.mode)
+        .unwrap_or(PackageMode::Search);
 
     match key.code {
         // 关掉视图（q / Esc）；在输入状态时 Esc 只是退出输入
@@ -523,28 +906,32 @@ fn handle_packages_key(
         KeyCode::Char('q') if !ctrl && !editing => app.close_packages(),
         KeyCode::Char('c') if ctrl => app.close_packages(),
 
-        // 搜索框
+        // ── 搜索框 ──
         KeyCode::Enter if editing => {
             if let Some(view) = app.packages.as_mut() {
-                view.start_search();
+                match view.mode {
+                    PackageMode::Search => view.start_search(),
+                    PackageMode::Installed => view.start_installed(),
+                    PackageMode::News => view.start_news(),
+                }
             }
         }
         KeyCode::Char(ch) if editing && !ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.query.push(ch);
-                view.apply_filter(); // 本地模糊过滤：键入即筛
+                view.refilter(); // 本地模糊过滤：键入即筛
             }
         }
         KeyCode::Backspace if editing => {
             if let Some(view) = app.packages.as_mut() {
                 view.query.pop();
-                view.apply_filter();
+                view.refilter();
             }
         }
         KeyCode::Char('u') if editing && ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.query.clear();
-                view.apply_filter();
+                view.refilter();
             }
         }
         KeyCode::Up if editing => {
@@ -558,13 +945,13 @@ fn handle_packages_key(
             }
         }
 
-        // 结果 / 队列
-        KeyCode::Up => {
+        // ── 移动 ──
+        KeyCode::Up | KeyCode::Char('k') if !editing && !ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.move_selection(-1);
             }
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') if !editing && !ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.move_selection(1);
             }
@@ -579,22 +966,36 @@ fn handle_packages_key(
                 view.move_selection(10);
             }
         }
-        KeyCode::Home => {
+        KeyCode::Home | KeyCode::Char('g') if !editing && !ctrl => {
             if let Some(view) = app.packages.as_mut() {
-                if view.focus_queue {
-                    view.queue_selected = 0;
-                } else {
-                    view.selected = 0;
+                while view.rows_selected() > 0 {
+                    view.move_row(-1);
+                }
+                view.info_scroll = 0;
+            }
+        }
+        KeyCode::End | KeyCode::Char('G') if !editing && !ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                let last = view.rows_len().saturating_sub(1);
+                while view.rows_selected() < last {
+                    view.move_row(1);
                 }
             }
         }
-        KeyCode::End => {
+
+        // ── 模式与焦点 ──
+        KeyCode::Left if !editing => {
             if let Some(view) = app.packages.as_mut() {
-                if view.focus_queue {
-                    view.queue_selected = view.queue.len().saturating_sub(1);
-                } else {
-                    view.selected = view.visible_len().saturating_sub(1);
-                }
+                view.set_mode(match mode {
+                    PackageMode::Search => PackageMode::News,
+                    PackageMode::Installed => PackageMode::Search,
+                    PackageMode::News => PackageMode::Installed,
+                });
+            }
+        }
+        KeyCode::Right if !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.cycle_mode();
             }
         }
         KeyCode::Tab => {
@@ -602,7 +1003,14 @@ fn handle_packages_key(
                 view.toggle_focus();
             }
         }
+
+        // ── 队列 ──
         KeyCode::Char(' ') if !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_queue();
+            }
+        }
+        KeyCode::Delete if !editing => {
             if let Some(view) = app.packages.as_mut() {
                 view.toggle_queue();
             }
@@ -610,27 +1018,6 @@ fn handle_packages_key(
         KeyCode::Char('d') if ctrl => {
             if let Some(view) = app.packages.as_mut() {
                 view.clear_queue();
-            }
-        }
-        KeyCode::Delete if !editing && focus_queue => {
-            if let Some(view) = app.packages.as_mut() {
-                view.toggle_queue();
-            }
-        }
-        KeyCode::Enter if !editing => app.install_queue(cwd)?,
-        KeyCode::Char('i') | KeyCode::Char('/') if !ctrl && !editing => {
-            if let Some(view) = app.packages.as_mut() {
-                view.editing = true;
-            }
-        }
-        KeyCode::Char('r') if ctrl => {
-            if let Some(view) = app.packages.as_mut() {
-                view.start_search();
-            }
-        }
-        KeyCode::Char('n') if ctrl => {
-            if let Some(view) = app.packages.as_mut() {
-                view.start_news();
             }
         }
         KeyCode::Char('e') if ctrl => {
@@ -645,34 +1032,100 @@ fn handle_packages_key(
                 view.import_queue(&path);
             }
         }
-        KeyCode::Char('x') if ctrl => app.show_pkgbuild(cwd)?,
-        // Ctrl+K：PKGBUILD 检查（shellcheck + namcap），三段一起进输出视图
-        KeyCode::Char('k') if ctrl => app.check_pkgbuild(cwd)?,
-        // Ctrl+A：借 pac 自己的 AI 审查（它认得你配的供应商）
-        KeyCode::Char('a') if ctrl => app.review_aur_with_pac(cwd)?,
-        // s：轮换排序（相关度 / 名字 / 仓库 / 得票）
-        KeyCode::Char('s') if !ctrl && !editing => {
+
+        // ── 执行（一律先摆命令，再确认）──
+        KeyCode::Enter if !editing => match mode {
+            PackageMode::Search => app.arm_queue(),
+            PackageMode::Installed => {
+                let loaded = app
+                    .packages
+                    .as_ref()
+                    .is_some_and(|view| view.installed_loaded);
+                if loaded {
+                    app.arm_queue();
+                } else if let Some(view) = app.packages.as_mut() {
+                    view.start_installed();
+                }
+            }
+            PackageMode::News => {
+                let has_news = app
+                    .packages
+                    .as_ref()
+                    .is_some_and(|view| !view.news.is_empty());
+                if has_news {
+                    app.open_news_link();
+                } else if let Some(view) = app.packages.as_mut() {
+                    view.start_news();
+                }
+            }
+        },
+        KeyCode::Char('m') if !ctrl && !editing => {
             if let Some(view) = app.packages.as_mut() {
-                view.cycle_sort();
+                view.cycle_operation();
             }
         }
+        KeyCode::Char('U') if !ctrl && !editing => app.arm_upgrade(),
+        KeyCode::Char('c') if !ctrl && !editing => app.arm_cache(1),
+        KeyCode::Char('O') if !ctrl && !editing => app.arm_orphans(),
+        KeyCode::Char('D') if !ctrl && !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_dry_run();
+            }
+        }
+
+        // ── 搜索 / 排序 / 刷新 ──
+        KeyCode::Char('i') | KeyCode::Char('/') if !ctrl && !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.editing = true;
+            }
+        }
+        KeyCode::Char('s') if !ctrl && !editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.open_sort_menu();
+            }
+        }
+        KeyCode::Char('r') if ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                match view.mode {
+                    PackageMode::Search => view.start_search(),
+                    PackageMode::Installed => view.start_installed(),
+                    PackageMode::News => view.start_news(),
+                }
+            }
+        }
+        KeyCode::Char('n') if ctrl => {
+            if let Some(view) = app.packages.as_mut() {
+                view.start_news();
+            }
+        }
+
+        // ── 新闻 ──
+        KeyCode::Char('r') if !ctrl && !editing && mode == PackageMode::News => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_news_read();
+            }
+        }
+        KeyCode::Char('R') if !ctrl && !editing && mode == PackageMode::News => {
+            if let Some(view) = app.packages.as_mut() {
+                view.mark_visible_news_read();
+            }
+        }
+
+        // ── AUR 专用 ──
+        KeyCode::Char('x') if ctrl => app.show_pkgbuild(cwd)?,
+        KeyCode::Char('k') if ctrl => app.check_pkgbuild(cwd)?,
         KeyCode::Char('o') if !ctrl && !editing => app.open_aur_page(),
-        // 数字键切换仓库标签（1-9），0 = 全开
+
+        // ── 标签开关：1-9 直接点，0 全开 ──
         KeyCode::Char(digit @ '1'..='9') if !editing => {
             let index = digit as usize - '1' as usize;
             if let Some(view) = app.packages.as_mut() {
-                view.toggle_repo(index);
+                view.toggle_chip(index);
             }
         }
         KeyCode::Char('0') if !editing => {
             if let Some(view) = app.packages.as_mut() {
-                let total = view.repos.len();
-                for index in 0..total {
-                    if !view.repos[index].1 {
-                        view.toggle_repo(index);
-                    }
-                }
-                view.message = String::from("仓库标签全开");
+                view.enable_all_chips();
             }
         }
         _ => {}

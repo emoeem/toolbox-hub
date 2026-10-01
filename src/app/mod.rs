@@ -7,7 +7,7 @@ mod input;
 pub mod package_view;
 mod picker;
 
-pub use input::handle_key;
+pub use input::{handle_key, handle_mouse};
 pub use picker::Picker;
 
 use std::{
@@ -20,7 +20,7 @@ use std::{
 use ratatui::widgets::TableState;
 
 use crate::{
-    app::package_view::PackageView,
+    app::package_view::{ConfirmAction, PackageOperation, PackageView},
     history, media,
     model::{ArgKind, Argument, ArgumentValues, Domain, ToolDefinition},
     packages,
@@ -28,6 +28,25 @@ use crate::{
     runtime::{self, Captured, RunningJob},
     state::{self, State, WORK_DIR_ENV},
 };
+
+/// 确认面板按 Enter 之后到底要跑什么（算完就松开 `PackageView` 的借用再执行）。
+enum Plan {
+    Queue {
+        operation: PackageOperation,
+        uses_aur: bool,
+        names: Vec<String>,
+    },
+    Upgrade {
+        program: &'static str,
+    },
+    Cache {
+        program: String,
+        argv: Vec<String>,
+    },
+    Orphans {
+        names: Vec<String>,
+    },
+}
 
 /// 秒 → `mm:ss` / `h:mm:ss`（进度行用）。
 fn short_time(seconds: f64) -> String {
@@ -1003,70 +1022,160 @@ impl App {
         }
     }
 
-    /// `Enter`：装队列里的包（先确认一次）。
-    pub fn install_queue(&mut self, cwd: &Path) -> io::Result<()> {
+    /// `Enter`：把队列马上要跑的命令摆到确认面板上（再按一次 Enter 才真跑）。
+    ///
+    /// 这一步**不执行任何东西**：dry-run 的意义就在于「先看清楚」。
+    pub fn arm_queue(&mut self) {
+        if let Some(view) = self.packages.as_mut() {
+            view.arm_queue();
+        }
+    }
+
+    /// `U`：系统更新的确认面板。
+    pub fn arm_upgrade(&mut self) {
+        if let Some(view) = self.packages.as_mut() {
+            view.arm_upgrade();
+        }
+    }
+
+    /// `C`：清缓存的确认面板（保留几个版本由 `keep` 决定，`[` `]` 可当场调）。
+    pub fn arm_cache(&mut self, keep: u8) {
+        if let Some(view) = self.packages.as_mut() {
+            view.arm_cache(keep);
+        }
+    }
+
+    /// `O`：清孤儿的确认面板（名单现查，`pacman -Qtdq`）。
+    pub fn arm_orphans(&mut self) {
+        if let Some(view) = self.packages.as_mut() {
+            view.arm_orphans();
+        }
+    }
+
+    /// 确认面板上按 Enter：真的跑。演练模式下只把命令写进消息。
+    pub fn run_confirm(&mut self, cwd: &Path) -> io::Result<()> {
         let Some(view) = self.packages.as_mut() else {
             return Ok(());
         };
-        if view.queue.is_empty() {
-            view.message = String::from("队列是空的：Space 把包加进来");
+        let Some(confirm) = view.take_confirm() else {
+            return Ok(());
+        };
+
+        if view.dry_run {
+            view.message = format!("演练（没有执行）：{}", confirm.command);
             return Ok(());
         }
-        if !view.install_armed {
-            view.install_armed = true;
-            view.message = format!(
-                "要装 {} 个包（{}）—— 再按一次 Enter 真的开始",
-                view.queue.len(),
-                if view.queue_has_aur() {
-                    "含 AUR，要编译"
-                } else {
-                    "只有官方源"
+
+        // 先把要跑的东西算出来，之后就得松开对 view 的借用（执行要 &mut self）。
+        let plan = match &confirm.action {
+            ConfirmAction::Queue(operation) => {
+                let names = view.queue_names();
+                if names.is_empty() {
+                    view.message = String::from("队列是空的");
+                    return Ok(());
                 }
-            );
-            return Ok(());
+                Plan::Queue {
+                    operation: *operation,
+                    uses_aur: view.queue_has_aur(),
+                    names,
+                }
+            }
+            ConfirmAction::Upgrade => Plan::Upgrade {
+                program: if packages::probe::has_paru() {
+                    "paru"
+                } else {
+                    "pacman"
+                },
+            },
+            ConfirmAction::Cache(keep) => {
+                let (program, argv) =
+                    packages::cache_command(*keep, packages::probe::has_paccache());
+                let (program, argv) = packages::escalate(&program, &argv);
+                Plan::Cache { program, argv }
+            }
+            ConfirmAction::Orphans(names) => Plan::Orphans {
+                names: names.clone(),
+            },
+        };
+
+        match plan {
+            Plan::Queue {
+                operation,
+                uses_aur,
+                names,
+            } => {
+                let (program, argv) =
+                    packages::escalate(operation.program(uses_aur), &operation.argv(&names));
+                let done = format!("{} 个包已{}", names.len(), operation.label());
+                if self.run_system_command(&program, &argv, cwd, &done)? {
+                    if let Some(view) = self.packages.as_mut() {
+                        view.clear_queue();
+                        // 装/卸都改变了本地状态：已安装列表作废，搜索结果重标一次
+                        view.installed_loaded = false;
+                        if matches!(
+                            operation,
+                            PackageOperation::Install | PackageOperation::Remove
+                        ) {
+                            view.start_installed();
+                            if view.searched.is_some() {
+                                view.start_search();
+                            }
+                        }
+                    }
+                    let _ = packages::save_queue_to(&packages::queue_path(), &[]);
+                }
+            }
+            Plan::Upgrade { program } => {
+                let (program, argv) =
+                    packages::escalate(program, &[String::from(packages::UPGRADE_FLAG)]);
+                if self.run_system_command(&program, &argv, cwd, "系统更新完成")?
+                    && let Some(view) = self.packages.as_mut()
+                {
+                    view.pending_updates = Some(0);
+                }
+            }
+            Plan::Cache { program, argv } => {
+                self.run_system_command(&program, &argv, cwd, "缓存清理完成")?;
+            }
+            Plan::Orphans { names } => {
+                let (program, argv) = packages::orphan_remove_command(&names);
+                let (program, argv) = packages::escalate(&program, &argv);
+                let done = format!("{} 个孤儿包已卸载", names.len());
+                if self.run_system_command(&program, &argv, cwd, &done)?
+                    && let Some(view) = self.packages.as_mut()
+                {
+                    view.installed_loaded = false;
+                    view.start_installed();
+                }
+            }
         }
+        Ok(())
+    }
 
-        let names = view.queue_names();
-        view.install_armed = false;
-        view.message = format!("正在装 {} 个包…", names.len());
-
-        let mut argv = vec![String::from("-S")];
-        argv.extend(names.iter().cloned());
-        let program = String::from("paru");
-
-        let result = runtime::run_in_terminal(&program, &argv, cwd);
+    /// 跑一条**会改系统**的命令：把终端交给它（sudo 与 Y/n 都在那里回），
+    /// 回来后整屏重画并把结果写进状态行。返回是否成功。
+    fn run_system_command(
+        &mut self,
+        program: &str,
+        argv: &[String],
+        cwd: &Path,
+        done: &str,
+    ) -> io::Result<bool> {
+        let result = runtime::run_in_terminal(program, argv, cwd);
         // 它接管过终端：回来必须整屏重画。
         self.request_full_redraw();
 
-        match result {
-            Ok(_) => {
-                let count = names.len();
-                if let Some(view) = self.packages.as_mut() {
-                    view.queue.clear();
-                    view.queue_selected = 0;
-                    view.focus_queue = false;
-                    view.message = format!("{count} 个包装完了（失败的话终端里有原因）");
-                    // 装完以后「已安装」标记得刷新，所以顺手重搜一次
-                    if view.searched.is_some() {
-                        view.start_search();
-                    }
-                }
-                let _ = packages::save_queue_to(&packages::queue_path(), &[]);
-                Ok(())
-            }
+        let (ok, message) = match result {
+            Ok(_) => (true, done.to_string()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if let Some(view) = self.packages.as_mut() {
-                    view.message = String::from("没装 paru（装包要用它）");
-                }
-                Ok(())
+                (false, format!("系统里没有 {program}"))
             }
-            Err(error) => {
-                if let Some(view) = self.packages.as_mut() {
-                    view.message = format!("装包失败：{error}");
-                }
-                Ok(())
-            }
+            Err(error) => (false, format!("{program} 跑失败：{error}")),
+        };
+        if let Some(view) = self.packages.as_mut() {
+            view.message = message;
         }
+        Ok(ok)
     }
 
     /// `Ctrl+X`：把 AUR 的 PKGBUILD 拉下来，用输出视图看（装之前该瞄一眼）。
@@ -1169,52 +1278,6 @@ impl App {
         Ok(())
     }
 
-    /// `Ctrl+A`：借 `pac --check` 做 AUR 的 AI 审查。
-    ///
-    /// 为什么是「借」：审查用的是**你自己在 pac 里配好的 AI 供应商**
-    /// （`pac config`），工具箱不该假装自己实现了那套东西 —— 但也别让人为此切出去。
-    pub fn review_aur_with_pac(&mut self, cwd: &Path) -> io::Result<()> {
-        let Some(hit) = self
-            .packages
-            .as_ref()
-            .and_then(|view| view.selected_hit().cloned())
-        else {
-            return Ok(());
-        };
-
-        if !hit.is_aur() {
-            if let Some(view) = self.packages.as_mut() {
-                view.message = format!("{} 来自 {}，不是 AUR 包", hit.name, hit.repo);
-            }
-            return Ok(());
-        }
-
-        if let Some(view) = self.packages.as_mut() {
-            view.message = format!("把 {} 交给 pac 做 AI 审查…", hit.name);
-        }
-
-        // `--check` 只审查、不安装
-        let result =
-            runtime::run_in_terminal("pac", &[String::from("--check"), hit.name.clone()], cwd);
-        self.request_full_redraw();
-
-        match result {
-            Ok(_) => {
-                if let Some(view) = self.packages.as_mut() {
-                    view.message = format!("{} 的 AI 审查结束（结论在上面）", hit.name);
-                }
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if let Some(view) = self.packages.as_mut() {
-                    view.message = String::from("没装 pac —— AI 审查要靠它配好的供应商");
-                }
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     /// `o`：在浏览器里打开 AUR 页面（评论、投票、看依赖都在那儿，需要你的登录）。
     pub fn open_aur_page(&mut self) {
         let Some(name) = self
@@ -1227,6 +1290,30 @@ impl App {
         let url = format!("https://aur.archlinux.org/packages/{name}");
         let message = match packages::probe::open_in_browser(&url) {
             Ok(()) => format!("已在浏览器打开 {url}"),
+            Err(error) => error,
+        };
+        if let Some(view) = self.packages.as_mut() {
+            view.message = message;
+        }
+    }
+
+    /// 新闻模式按 Enter：在浏览器里打开选中的那条。
+    pub fn open_news_link(&mut self) {
+        let Some(item) = self
+            .packages
+            .as_ref()
+            .and_then(|view| view.selected_news().cloned())
+        else {
+            return;
+        };
+        if item.link.trim().is_empty() {
+            if let Some(view) = self.packages.as_mut() {
+                view.message = String::from("这条新闻没有链接");
+            }
+            return;
+        }
+        let message = match packages::probe::open_in_browser(&item.link) {
+            Ok(()) => format!("已打开 {}", item.link),
             Err(error) => error,
         };
         if let Some(view) = self.packages.as_mut() {
