@@ -501,6 +501,39 @@ mod tests {
         assert!(screen.contains("这个分类里没有包"), "该提示被筛空了");
     }
 
+    /// F 视图右半边是图片预览：面板要在、标题要说清用的是什么画图方式、
+    /// 不是图片的文件要给一句人话（而不是留一块空白让人以为坏了）。
+    #[test]
+    fn the_files_view_shows_a_preview_pane() {
+        use std::fs;
+
+        let dir =
+            std::env::temp_dir().join(format!("toolbox-hub-preview-ui-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("建目录");
+        fs::write(dir.join("clip.mp4"), vec![0u8; 32]).expect("写文件");
+
+        let mut app = app();
+        app.work_dir = dir.clone();
+        app.open_files();
+        // 测试里不探测终端（那会写查询序列并等 1 秒），直接用半块
+        app.preview = crate::preview::Preview::halfblocks_for_test();
+
+        let screen = render_compact(&mut app, 160, 40);
+        assert!(screen.contains("预览"), "没有预览面板：\n{screen}");
+        assert!(
+            screen.contains("半块字符（测试）"),
+            "标题该说清用什么画图：\n{screen}"
+        );
+        assert!(
+            screen.contains("这个类型不预览"),
+            "视频不该留一块空白：\n{screen}"
+        );
+
+        app.close_files();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 粘贴：终端开了 bracketed paste 之后，多行文本是**一个事件**。
     ///
     /// 关键断言是「没有回车」——以前粘一条带换行的命令，那串换行会被当成

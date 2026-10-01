@@ -419,6 +419,8 @@ pub struct App {
     pub media_root: PathBuf,
     /// 文件视图；`Some` 表示开着。
     pub files: Option<FilesView>,
+    /// 图片预览（F 视图右半边）。懒探测、后台解码，见 [`crate::preview`]。
+    pub preview: crate::preview::Preview,
     /// 原生包管理视图；`Some` 表示开着。
     pub packages: Option<PackageView>,
     /// 正在跑的后台任务。
@@ -462,6 +464,7 @@ impl App {
             media: media::ScanResult::default(),
             media_root: PathBuf::new(),
             files: None,
+            preview: crate::preview::Preview::new(),
             packages: None,
             running: None,
             job_queue: VecDeque::new(),
@@ -1026,6 +1029,11 @@ impl App {
     }
 
     /// 每帧收一次包管理的后台结果（搜索、包信息、新闻）。
+    /// 收一次图片解码的结果（F 视图用）。返回 `true` 表示该重画。
+    pub fn poll_preview(&mut self) -> bool {
+        self.preview.poll()
+    }
+
     /// 收包管理的后台结果。返回 `true` 表示收到了东西（该重画了）。
     pub fn poll_packages(&mut self) -> bool {
         let Some(view) = self.packages.as_mut() else {
@@ -1518,6 +1526,8 @@ impl App {
 
     pub fn close_files(&mut self) {
         self.files = None;
+        // 解码后的位图可能几十 MB，关掉视图就放掉它
+        self.preview.clear();
         self.message = String::from("已关闭文件视图");
     }
 

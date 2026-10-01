@@ -18,4 +18,8 @@ serde_json = "1.0.151"
 # 之前是每次 spawn 一个 `curl`：进程之间不可能复用连接，于是**每一次**都要付冷
 # TLS 握手的钱（实测 16.3s 冷 / 1.46s 热）。常驻一个 agent 就只付第一次。
 ureq = "3"
+# 终端里画图片（F 视图的预览）。支持的协议由终端决定：kitty / sixel / iTerm2，
+# 都不是就退化成半块字符。探测懒执行，见 src/preview.rs。
+ratatui-image = "11"
+image = "0.25"
 toml = "1.1.6"

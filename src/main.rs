@@ -17,6 +17,7 @@ mod history;
 mod media;
 mod model;
 mod packages;
+mod preview;
 mod providers;
 mod registry;
 mod runtime;
@@ -187,6 +188,9 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
             dirty = true;
         }
         if app.poll_packages() {
+            dirty = true;
+        }
+        if app.poll_preview() {
             dirty = true;
         }
     }

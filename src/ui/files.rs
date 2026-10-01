@@ -11,13 +11,16 @@ use ratatui::{
     widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
+use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+
 use crate::{
     app::App,
     media::human_size,
+    preview::Preview,
     ui::{short_path, theme},
 };
 
-pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(view) = app.files.as_ref() else {
         return;
     };
@@ -27,8 +30,18 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
-    let (Some(head), Some(list)) = (rows.first().copied(), rows.get(1).copied()) else {
+    let (Some(head), Some(body)) = (rows.first().copied(), rows.get(1).copied()) else {
         return;
+    };
+
+    // 右边分一块给预览：只在够宽够高时才分（窄终端下把列表挤成一条更糟）
+    let preview_here = Preview::worth_showing(body.width / 2, body.height);
+    let (list, preview_area) = if preview_here {
+        let columns = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(body);
+        (columns[0], Some(columns[1]))
+    } else {
+        (body, None)
     };
 
     let mut status = vec![
@@ -111,4 +124,66 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let mut state = TableState::default().with_selected(Some(view.selected));
     frame.render_stateful_widget(table, list, &mut state);
+
+    if let Some(area) = preview_area {
+        draw_preview(frame, app, area);
+    }
+}
+
+/// 右半边：图片预览。
+///
+/// 三种情况都要说人话：能画就画；在解码就说「解码中」；不是图片就说清楚
+/// 「这个类型不预览」—— 免得看着一块空白以为坏了。
+fn draw_preview(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let selected = app
+        .files
+        .as_ref()
+        .and_then(|view| view.entry(view.selected))
+        .map(|file| (file.name.clone(), file.path.clone()));
+
+    let Some((name, path)) = selected else {
+        return;
+    };
+
+    // 选中项一变就登记一次（内部会去重 + 后台解码）
+    app.preview.request(&path);
+
+    let title = format!(" 预览 · {} ", app.preview.protocol());
+    let block = theme::panel(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if let Some(protocol) = app.preview.protocol_state() {
+        // 图已经好了：把它画进去（StatefulImage 自己按区域缩放）
+        // 泛型要写出来：StatefulImage<T> 的 T 单靠 new() 推不出来
+        frame.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), inner, protocol);
+        return;
+    }
+
+    let hint = if app.preview.is_decoding() {
+        format!(
+            "解码中…
+{name}"
+        )
+    } else if let Some(problem) = app.preview.problem.clone() {
+        format!(
+            "看不了这张：
+{problem}"
+        )
+    } else if crate::preview::looks_like_image(&path) {
+        String::from("等一下，正在准备预览")
+    } else {
+        format!(
+            "{name}
+
+这个类型不预览（只画图片）。\n要看内容就用别的工具打开它。"
+        )
+    };
+
+    frame.render_widget(
+        Paragraph::new(hint)
+            .style(Style::default().fg(theme::FAINT))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
