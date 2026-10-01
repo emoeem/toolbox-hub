@@ -1,7 +1,7 @@
-# 构建产物（784M，绝不入库）
 /target
 
-# 编辑器 / 系统杂物
-*.swp
-*~
-.DS_Store
+# makepkg 的工作目录与产物：都能重新生成，不进仓库
+/packaging/src/
+/packaging/pkg/
+/packaging/*.pkg.tar.*
+/packaging/*.tar.gz

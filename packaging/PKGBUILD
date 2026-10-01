@@ -29,6 +29,15 @@ sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
+
+  # makepkg 默认给 CFLAGS 带上 `-flto=auto -ffat-lto-objects`（那是给 C/C++ 项目
+  # 准备的），而 ureq 的 TLS 后端 `ring` 里有一段汇编：在这两个选项下链接会缺
+  #   undefined symbol: ring_core_0_17_14__bn_neg_inv_mod_r_u64  …
+  # 这类符号。Rust 这边不需要它们（cargo 自己管优化），所以本地去掉。
+  # 这是**实拍**踩出来的：`makepkg -f` 第一次跑就是这么失败的。
+  export CFLAGS="${CFLAGS//-ffat-lto-objects/}"
+  export CFLAGS="${CFLAGS//-flto=auto/}"
+
   # --locked：用仓库里的 Cargo.lock 构建，避免“在我机器上是好的”。
   cargo build --release --locked
 }

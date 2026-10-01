@@ -284,6 +284,23 @@ main ─► cli ──► packages ──► libalpm       （命令行模式：
 - 二进制**动态链接 libalpm**：只支持 Arch（这个工具箱本来就一半是 pacman / paru）；
 - 「可更新数」按本地同步库算，库旧了会偏小（状态行会说出来）。
 
+## 打包与分发
+
+`packaging/` 里有 PKGBUILD、手册页（roff）和源码包脚本：
+
+```bash
+packaging/make-source-tarball.sh     # git archive 出一个只含已提交内容的 tar.gz
+cd packaging && makepkg -f           # 打 Arch 包
+sudo pacman -U toolbox-hub-*.pkg.tar.zst
+```
+
+装上之后有 `toolbox-hub(1)` 手册页和 fish 补全；细节（含**交 AUR 的两步**）见
+[`packaging/README.md`](packaging/README.md)。
+
+一个实拍踩到的坑记在这儿：makepkg 默认给 `CFLAGS` 带 `-flto=auto -ffat-lto-objects`，
+而 `ureq` 的 TLS 后端 `ring` 里有一段汇编，在这两个选项下链接会缺
+`ring_core_0_17_14_*` 符号。PKGBUILD 的 `build()` 里把这两个选项摘掉了。
+
 ## 开发
 
 ```bash
