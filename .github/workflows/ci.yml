@@ -1,0 +1,42 @@
+# 三件事：格式、lint、测试。仓库里已经有 210+ 个测试，但没有一条自动门。
+#
+# 为什么跑在 Arch 容器里而不是 ubuntu 上：这个二进制**链接 libalpm**
+# （包数据层直连 pacman 的库，见 src/packages/libalpm.rs）。ubuntu 上没有它，
+# 连编译都过不去。Arch 镜像里 pacman 包自带 libalpm.so 与 libalpm.pc。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 格式
+        run: cargo fmt --check
+
+      - name: lint（警告即错误）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test

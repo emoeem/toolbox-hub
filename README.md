@@ -24,6 +24,10 @@ cargo run                    # 开发版
 cargo build --release && ./target/release/toolbox-hub    # 更快
 ```
 
+**构建前提**：`pacman`（提供 `libalpm.so` 与 `libalpm.pc`，Arch 上本来就有）+ `pkgconf`。
+二进制**动态链接 libalpm** —— 包数据层是直连 pacman 的库，不是解析它的输出（见下）。
+非 Arch 系统上编译过不去，这也是有意的：这个工具箱里一半的动作本来就是 pacman / paru。
+
 可选：`toolbox-hub [脚本目录]`（默认 `$FZF_FFTOOLS_BIN_DIR`，再默认 `~/.local/bin`）。
 
 ## 按键（进界面按 `?` 看全部）
@@ -104,9 +108,17 @@ Hub 自己的统一包入口，三块屏共用一套版式（pacseek 那个意�
 
 | 模式 | 看什么 | 主要来源 |
 | --- | --- | --- |
-| **搜索** | 官方源 + AUR 的搜索结果、仓库标签带条数、排序菜单 | `LC_ALL=C pacman -Ss` · AUR RPC |
-| **已安装** | 全部 / 显式 / 依赖 / 外来 / 孤儿，可直接排队卸载 | `pacman -Q` `-Qe` `-Qd` `-Qm` `-Qtd` |
+| **搜索** | 官方源 + AUR 的搜索结果、仓库标签带条数、排序菜单 | **libalpm 直连** · AUR RPC（ureq） |
+| **已安装** | 全部 / 显式 / 依赖 / 外来 / 孤儿，可直接排队卸载 | libalpm（本地库 + 一次扫完的依赖索引） |
 | **新闻** | 未读 / 已读 / 全部，`★` 标出「上次升级之后发布的」 | `archlinux.org/feeds/news/` + `pacman.log` |
+
+**两路各回各的**：官方源一到就上屏，AUR 晚几秒回来再补进去（实测按 Enter 后
+0.7 秒屏上已有官方结果，状态行写着「搜索中…」）。以前是两路都回来才算数，
+于是一屏空等 AUR 十几秒。
+
+**「待更新」是按本地同步库算的**（和 `pacman -Qu` 同一口径），所以它可能比
+`checkupdates` 少 —— 后者每次都重新下载数据库，代价是 18 秒。库超过一天没同步，
+状态行会直接标出来（`待更新 27（库 3 天没同步）`）。
 
 它不再启动 `pac` / `pacsea` 这类独立 TUI；真正改系统时才交给 `pacman` / `paru`。
 
@@ -164,12 +176,12 @@ FFTools 那批脚本是在**工作目录**里扫文件的（`fd … .`）。从�
 ## 架构（依赖方向自上而下，没有环）
 
 ```text
-main ─► cli ──► packages ──► probe        （命令行模式：不进 TUI，干完即退）
-  │
+main ─► cli ──► packages ──► libalpm       （命令行模式：不进 TUI，干完即退）
+  │                          probe（Net）  （AUR / 新闻：常驻 HTTP 连接）
   └──► app ─► registry ─► providers ─► model
         │                    │
         ├─► ui（只读 App）    └─► metadata（依赖探测 / 路径解析）
-        ├─► packages ───────► probe        （软件包中心：搜索 / 已安装 / 新闻）
+        ├─► packages::worker               （两个常驻线程：数据库 + 网络）
         └─► runtime ────────► model        （执行：只传 argv，永不经 shell）
             media                          （工作目录里的媒体文件）
             history / state                （历史与配置，纯文本落盘）
@@ -182,7 +194,11 @@ main ─► cli ──► packages ──► probe        （命令行模式：�
 | `registry` | Provider 聚合、发现、重载、跨域搜索、收藏与最近 |
 | `app` | 界面状态与按键（列表 / 表单 / 选择器 / 文件 / 历史 / 输出 / 帮助） |
 | `ui` | 纯渲染 |
-| `packages` | 软件包中心的数据层：解析、队列、已读新闻、命令翻译（`argv` 而不是 shell 串） |
+| `packages::libalpm` | 包数据的权威来源：搜索 / 信息 / 已安装 / 孤儿 / 可更新数 / 依赖索引（纯逻辑都有单测） |
+| `packages::probe` | 网络那半边：AUR RPC 与 Arch 新闻，持有一个常驻 `ureq` agent（连接复用） |
+| `packages::worker` | 两个常驻线程（数据库 + 网络），界面只跟 channel 打交道 |
+| `packages` | 与取数方式无关的东西：筛选、队列、已读新闻、命令翻译（`argv` 而不是 shell 串） |
+| `app::text_input` | 带光标的单行输入（字符下标，中文/emoji 不会切半） |
 | `cli` | 命令行模式：`-s/-i/-r/-u/-n/-l/--clear-cache`，与 TUI 共用同一份命令翻译 |
 | `runtime` | 交互式接管终端；捕获式后台任务（实时输出 / 进度 / 取消） |
 | `media` | 工作目录里的媒体文件扫描 |
@@ -194,17 +210,35 @@ main ─► cli ──► packages ──► probe        （命令行模式：�
 - **不是**原生调用 libav：执行层始终是 CLI，好处是稳定、可组合、可预览，代价是没有帧级精度；
 - 交互式脚本（fzf 菜单那类）会接管终端、无法后台化 —— 它们本身就是 UI；
 - 危险度只有 `safe` / `caution` 两级；
-- 取消先 SIGTERM：ffmpeg 会把已写部分收尾成一个可播的文件，但**不是完整结果**。
+- 取消先 SIGTERM（发给**整个进程组**）：ffmpeg 会把已写部分收尾成一个可播的文件，
+  但**不是完整结果**；
+- 官方源搜索是**子串匹配**，不是正则。`pacman -Ss` 那种 `^fzf$` 写进来会被当成
+  「去掉锚点的词」（排序本来就把完全同名的排最前）；要正则就用「包管理」域里那条
+  `pacman -Ss` 动作；
+- 二进制**动态链接 libalpm**：只支持 Arch（这个工具箱本来就一半是 pacman / paru）；
+- 「可更新数」按本地同步库算，库旧了会偏小（状态行会说出来）。
 
 ## 开发
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test                       # 快，全 hermetic
+cargo test                       # 快，基本 hermetic
 cargo test -- --ignored          # 冒烟：真跑 ffmpeg / 7z / jq / pandoc / exiftool / magick
+cargo test smoke -- --ignored    # 冒烟：真读 pacman 数据库、真联网（AUR / 新闻）
 cargo build
 ```
+
+这三条已经进了 CI（`.github/workflows/ci.yml`，跑在 Arch 容器里 —— 链接 libalpm）。
+
+fish 补全在 `completions/toolbox-hub.fish`：
+
+```bash
+ln -s ~/code/toolbox-hub/completions/toolbox-hub.fish \
+      ~/.config/fish/completions/toolbox-hub.fish
+```
+
+`-i` 补仓库里的包名，`-r` 补本地已装的 —— 都是现查 `pacman`，不联网。
 
 改 `manifests/*.toml` 也要重新编译（它们是 `include_str!` 编进去的）。
 
