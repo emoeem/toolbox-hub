@@ -9,6 +9,7 @@
 //! 那个面板上显示的命令和真正跑的命令是同一个函数算出来的
 //! （[`crate::packages::command_preview`]），不存在「看到的和跑的不一样」。
 
+use super::TextInput;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -126,7 +127,7 @@ pub struct PackageView {
     pub message: String,
 
     // ── 搜索 ──
-    pub query: String,
+    pub query: TextInput,
     /// 搜索框是不是在输入状态（字母会进 query）。
     pub editing: bool,
     pub hits: Vec<PackageHit>,
@@ -200,7 +201,7 @@ impl PackageView {
             dry_run: false,
             operation: PackageOperation::Install,
             message: String::new(),
-            query: String::new(),
+            query: TextInput::new(),
             editing: true,
             hits: Vec::new(),
             visible: Vec::new(),
@@ -288,7 +289,7 @@ impl PackageView {
     /// 之前是「两路都回来才算数」，于是官方源 0.45 秒就有结果，你却要盯着
     /// 「搜索中…」等 AUR 那十几秒。现在官方源一到就显示，AUR 到了再补进来。
     pub fn start_search(&mut self) {
-        let term = self.query.trim().to_string();
+        let term = self.query.text().trim().to_string();
         if term.is_empty() {
             self.message = String::from("先填个搜索词");
             return;
@@ -641,7 +642,7 @@ impl PackageView {
     /// 搜索词同时干两件事：`Enter` 拿去问官方源与 AUR（远端），打字则**本地**
     /// 模糊过滤已有结果 —— 这就是 pac（fzf 那一层）的手感：键入即筛、回车才上网找。
     pub fn apply_filter(&mut self) {
-        let needle = self.query.trim().to_string();
+        let needle = self.query.text().trim().to_string();
         let mut rows: Vec<(usize, i32)> = Vec::new();
 
         for (index, hit) in self.hits.iter().enumerate() {
@@ -718,7 +719,7 @@ impl PackageView {
     /// 搜索框里的词在这里也生效：三种模式共用同一个输入框，
     /// 「输入即筛」在哪个模式下都得成立，不然切过去就得先把词删掉。
     pub fn apply_installed_filter(&mut self) {
-        let needle = self.query.trim().to_string();
+        let needle = self.query.text().trim().to_string();
         let mut rows: Vec<usize> = self
             .installed
             .iter()
@@ -758,7 +759,7 @@ impl PackageView {
     ///
     /// 和已安装列表一样，搜索框里的词在这里也是**本地过滤**（标题命中即可）。
     pub fn rebuild_news(&mut self) {
-        let needle = self.query.trim().to_string();
+        let needle = self.query.text().trim().to_string();
         let mut rows: Vec<usize> = (0..self.news.len())
             .filter(|&index| self.news_filter.matches(&self.news[index], &self.read_news))
             .filter(|&index| {
@@ -979,7 +980,7 @@ impl PackageView {
             }
         };
         self.history_index = Some(next);
-        self.query = self.history[next].clone();
+        self.query.set(&self.history[next]);
     }
 
     /// 结果区上下移动（跟着模式走）。
@@ -1466,7 +1467,7 @@ mod tests {
         ]);
         assert_eq!(view.rows_len(), 3, "一开始全都在");
 
-        view.query = String::from("fzf");
+        view.query.set("fzf");
         view.apply_filter();
         assert_eq!(view.rows_len(), 1);
         assert_eq!(
@@ -1474,7 +1475,7 @@ mod tests {
             Some("fzf")
         );
 
-        view.query = String::from("sz");
+        view.query.set("sz");
         view.apply_filter();
         assert!(
             view.visible
@@ -1482,11 +1483,11 @@ mod tests {
                 .any(|&index| view.hits[index].name == "sysz")
         );
 
-        view.query = String::from("dotbare 的说明");
+        view.query.set("dotbare 的说明");
         view.apply_filter();
         assert_eq!(view.rows_len(), 1);
 
-        view.query = String::from("zzzz");
+        view.query.set("zzzz");
         view.apply_filter();
         assert_eq!(view.rows_len(), 0);
     }
@@ -1755,7 +1756,7 @@ mod tests {
 
         // 已安装：按名字模糊筛
         view.mode = PackageMode::Installed;
-        view.query = String::from("bash");
+        view.query.set("bash");
         view.refilter();
         assert_eq!(view.rows_len(), 1);
         assert_eq!(
@@ -1765,7 +1766,7 @@ mod tests {
 
         // 新闻：按标题筛
         view.mode = PackageMode::News;
-        view.query = String::from("内核");
+        view.query.set("内核");
         view.refilter();
         assert_eq!(view.rows_len(), 1);
         assert_eq!(

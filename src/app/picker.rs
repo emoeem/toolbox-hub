@@ -7,6 +7,7 @@
 //! 体积在显示时才按需读。实测 `/usr/lib`（7543 项）：带 stat 90ms、不带 4ms ——
 //! 而打字是每敲一个字重建一次列表的。
 
+use super::TextInput;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -46,7 +47,7 @@ pub struct Picker {
     visible: Vec<usize>,
     pub selected: usize,
     /// 输入即过滤（空 = 全显示）。
-    pub filter: String,
+    pub filter: TextInput,
     /// 要填的表单字段下标。
     pub field: usize,
     /// 目标字段是多值吗 —— 决定选中后「追加」还是「替换」。
@@ -65,7 +66,7 @@ impl Picker {
             all: Vec::new(),
             visible: Vec::new(),
             selected: 0,
-            filter: String::new(),
+            filter: TextInput::new(),
             field,
             repeatable,
             dir_only,
@@ -148,12 +149,17 @@ impl Picker {
     }
 
     /// 应用过滤词（**纯内存**，打字走这条路）。
+    /// 过滤条件变了就重算一遍（粘贴、打字都走它）。
+    pub fn refilter(&mut self) {
+        self.apply_filter();
+    }
+
     pub fn apply_filter(&mut self) {
         self.visible = self
             .all
             .iter()
             .enumerate()
-            .filter(|(_, entry)| matches(&entry.name, &self.filter))
+            .filter(|(_, entry)| matches(&entry.name, self.filter.text()))
             .map(|(index, _)| index)
             .collect();
 
@@ -218,14 +224,16 @@ impl Picker {
 
     /// 打字：只重算过滤，**不碰磁盘**。
     pub fn push_char(&mut self, ch: char) {
-        self.filter.push(ch);
+        self.filter.insert(ch);
         self.selected = 0;
         self.apply_filter();
     }
 
     /// 退格：过滤词非空就删一个字，否则上翻一层目录。
     pub fn backspace(&mut self) {
-        if self.filter.pop().is_some() {
+        let had = !self.filter.is_empty();
+        self.filter.backspace();
+        if had {
             self.selected = 0;
             self.apply_filter();
         } else {
@@ -306,7 +314,7 @@ mod tests {
         for _ in 0.."MP4z".len() {
             picker.backspace();
         }
-        assert_eq!(picker.filter, "");
+        assert_eq!(picker.filter.text(), "");
         assert_eq!(picker.len(), 4);
         assert_eq!(picker.dir(), dir.as_path(), "删过滤词不该换目录");
 
@@ -354,13 +362,13 @@ mod tests {
         // 过滤词为空：退格 = 上翻一层
         picker.backspace();
         assert_eq!(picker.dir(), dir.as_path());
-        assert_eq!(picker.filter, "", "上翻不等于往过滤词里写字");
+        assert_eq!(picker.filter.text(), "", "上翻不等于往过滤词里写字");
 
         // 有过滤词：退格 = 删一个字，**不换目录**
         let here = picker.dir().to_path_buf();
         picker.push_char('m');
         picker.backspace();
-        assert_eq!(picker.filter, "");
+        assert_eq!(picker.filter.text(), "");
         assert_eq!(picker.dir(), here.as_path(), "删过滤词时不该动目录");
 
         fs::remove_dir_all(&dir).expect("cleanup");

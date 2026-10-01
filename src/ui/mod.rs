@@ -337,7 +337,7 @@ mod tests {
         let mut app = app();
         let mut view = PackageView::new(Vec::new(), None);
         view.mode = PackageMode::Search;
-        view.query = String::from("fzf");
+        view.query.set("fzf");
         view.hits = vec![
             crate::packages::PackageHit {
                 repo: String::from("extra"),
@@ -390,6 +390,22 @@ mod tests {
         view.message = String::from("2 个结果");
         app.packages = Some(view);
 
+        // 光标画在它真正在的位置上（以前永远贴在末尾，因为压根没有光标）
+        if let Some(view) = app.packages.as_mut() {
+            view.editing = true;
+            view.query.set("fzf");
+            view.query.left();
+        }
+        let screen = render_compact(&mut app, 160, 40);
+        assert!(
+            screen.contains("fz▏f"),
+            "光标该夹在 z 和 f 之间：\n{screen}"
+        );
+        if let Some(view) = app.packages.as_mut() {
+            view.query.end();
+            view.editing = false;
+        }
+
         let screen = render_compact(&mut app, 160, 40);
         for wanted in [
             "软件包中心",
@@ -434,12 +450,42 @@ mod tests {
 
         // 输入框的词在已安装模式里也是本地过滤（三种模式共用一个输入框）
         if let Some(view) = app.packages.as_mut() {
-            view.query = String::from("zzz");
+            view.query.set("zzz");
             view.refilter();
         }
         let screen = render_compact(&mut app, 160, 40);
         assert!(!screen.contains("bash"), "过滤后不该还看得见 bash");
         assert!(screen.contains("这个分类里没有包"), "该提示被筛空了");
+    }
+
+    /// 粘贴：终端开了 bracketed paste 之后，多行文本是**一个事件**。
+    ///
+    /// 关键断言是「没有回车」——以前粘一条带换行的命令，那串换行会被当成
+    /// 一串 Enter，命令就顺手跑出去了。
+    #[test]
+    fn paste_lands_in_the_search_box_without_pressing_enter() {
+        use crate::app::{handle_paste, package_view::PackageView};
+
+        let mut app = app();
+        let mut view = PackageView::new(Vec::new(), None);
+        view.editing = true;
+        app.packages = Some(view);
+
+        handle_paste(&mut app, "fzf\n--height 40%\t-x");
+
+        let view = app.packages.as_ref().expect("包中心还开着");
+        assert_eq!(view.query.text(), "fzf --height 40% -x", "多行折成单行");
+        assert!(!view.query.text().contains('\n'));
+        assert!(!view.searching, "粘贴不该触发搜索");
+
+        // 光标停在末尾，接着打字接在后面
+        if let Some(view) = app.packages.as_mut() {
+            view.query.insert('!');
+        }
+        assert_eq!(
+            app.packages.as_ref().map(|view| view.query.text()),
+            Some("fzf --height 40% -x!")
+        );
     }
 
     /// 回归测试：这正是「跑完一个交互式脚本回来，界面只剩一行字」的真凶。
@@ -550,7 +596,7 @@ mod tests {
     fn search_mode_swaps_the_header_row_and_the_footer_hint() {
         let mut app = app();
         app.searching = true;
-        app.query = "trim".to_string();
+        app.query.set("trim");
         app.apply_filter();
 
         let text = render_compact(&mut app, 100, 30);
@@ -618,7 +664,7 @@ mod tests {
         let mut app = app();
         app.searching = true;
         // sysinfo 属于系统域，而当前停在媒体域：跨域搜索要能找到并说明。
-        app.query = "sysinfo".to_string();
+        app.query.set("sysinfo");
         app.apply_filter();
 
         let text = render_compact(&mut app, 100, 30);
@@ -1023,7 +1069,7 @@ mod tests {
 
         // 再渲染一帧跨域搜索：故意用一个宽泛的查询，展示「命中落在哪些域」那一行。
         app.searching = true;
-        app.query = "i".to_string();
+        app.query.set("i");
         app.apply_filter();
         println!("{}", pretty(&render(&mut app, 108, 34)));
         println!("（查询「i」的跨域结果，第二行是命中分布）");

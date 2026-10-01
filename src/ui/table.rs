@@ -89,7 +89,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 /// 空视图不是错误：可能是域没接 Provider、分类下没工具，或者搜索没命中。
 fn draw_empty(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let domain = app.current_domain();
-    let query = app.query.trim().to_string();
+    let query = app.query.text().trim().to_string();
 
     let message = if app.scope == Scope::Favorites && app.favorite_count() == 0 {
         String::from("还没有收藏任何工具。\n在列表里选中一件，按 f 收藏；再按 v 可以切回全部工具。")

@@ -29,7 +29,10 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor,
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+        event::{
+            self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+            EnableMouseCapture, Event,
+        },
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
@@ -98,6 +101,7 @@ fn install_panic_hook() {
             io::stdout(),
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableBracketedPaste,
             cursor::Show
         );
         original(info);
@@ -107,7 +111,15 @@ fn install_panic_hook() {
 fn setup_terminal() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // 打开括号粘贴：终端会把「粘贴」当成**一个事件**送过来，而不是几十次按键。
+    // 好处有二：快；而且粘进来的多行文本不会被当成一串回车（以前粘一条带换行的
+    // 命令，就会顺手把命令发出去）。
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
@@ -116,7 +128,8 @@ fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()
 }
@@ -151,6 +164,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
             match event::read()? {
                 Event::Key(key) if app::handle_key(app, key, &cwd)? => break,
                 Event::Mouse(mouse) => app::handle_mouse(app, mouse, &cwd)?,
+                Event::Paste(text) => app::handle_paste(app, &text),
                 _ => {}
             }
         }

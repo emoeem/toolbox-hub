@@ -6,9 +6,11 @@
 mod input;
 pub mod package_view;
 mod picker;
+mod text_input;
 
-pub use input::{handle_key, handle_mouse};
+pub use input::{handle_key, handle_mouse, handle_paste};
 pub use picker::Picker;
+pub use text_input::TextInput;
 
 use std::{
     collections::VecDeque,
@@ -378,7 +380,7 @@ pub struct App {
     pub filtered: Vec<usize>,
     pub selected: usize,
     pub table: TableState,
-    pub query: String,
+    pub query: TextInput,
     pub searching: bool,
     /// 与 `registry.tools()` 等长；标记跨筛选、跨域保留。
     pub marked: Vec<bool>,
@@ -439,7 +441,7 @@ impl App {
             filtered: Vec::new(),
             selected: 0,
             table: TableState::default(),
-            query: String::new(),
+            query: TextInput::new(),
             searching: false,
             marked,
             message: String::new(),
@@ -501,15 +503,17 @@ impl App {
         // 收藏 / 最近是跨域视图：不受当前域与分类限制，但关键词照样能筛。
         let tag = self.sub_filter().map(str::to_string);
         self.filtered = match self.scope {
-            Scope::All => self
-                .registry
-                .view(self.current_domain(), tag.as_deref(), &self.query),
+            Scope::All => {
+                self.registry
+                    .view(self.current_domain(), tag.as_deref(), self.query.text())
+            }
             Scope::Favorites | Scope::Recent => {
-                if self.query.trim().is_empty() {
+                if self.query.text().trim().is_empty() {
                     self.registry.all_indices()
                 } else {
                     // 关键词非空时 view 本来就是跨域的。
-                    self.registry.view(self.current_domain(), None, &self.query)
+                    self.registry
+                        .view(self.current_domain(), None, self.query.text())
                 }
             }
         };
@@ -573,7 +577,7 @@ impl App {
     ///
     /// UI 靠它决定：显示域内分类条，还是显示「命中落在哪些域」的说明。
     pub fn is_global_search(&self) -> bool {
-        !self.query.trim().is_empty()
+        !self.query.text().trim().is_empty()
     }
 
     /// 当前搜索结果按域统计，只列出有命中的域，顺序按 [`Domain::ALL`]。
@@ -3841,17 +3845,17 @@ mod tests {
     fn search_reaches_across_domains_while_browsing_stays_in_domain() {
         let mut app = app();
         // 当前停在媒体域，但搜到的是工具域的 shorin —— 这正是跨域搜索要解决的。
-        app.query = "shorin".to_string();
+        app.query.set("shorin");
         app.apply_filter();
         assert_eq!(app.filtered.len(), 1);
         assert_eq!(app.current().map(|tool| tool.name.as_str()), Some("shorin"));
         assert!(app.is_global_search());
 
-        app.query = "trim".to_string();
+        app.query.set("trim");
         app.apply_filter();
         assert_eq!(app.filtered.len(), 1);
 
-        app.query = String::new();
+        app.query.clear();
         app.apply_filter();
         assert_eq!(app.filtered.len(), 3, "清空搜索后回到域内浏览");
         assert!(!app.is_global_search());
@@ -3860,7 +3864,7 @@ mod tests {
     #[test]
     fn global_search_reports_hits_per_domain() {
         let mut app = app();
-        app.query = "o".to_string();
+        app.query.set("o");
         app.apply_filter();
 
         assert_eq!(app.filtered.len(), 3);

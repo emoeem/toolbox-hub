@@ -99,8 +99,8 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 /// 没有可展示的工具时，说明「为什么空」而不是留一片空白。
 fn draw_placeholder(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let domain = app.current_domain();
-    let text = if !app.query.trim().is_empty() {
-        format!("搜索「{}」没有命中。", app.query.trim())
+    let text = if !app.query.text().trim().is_empty() {
+        format!("搜索「{}」没有命中。", app.query.text().trim())
     } else if app.registry.tool_count_in(domain) == 0 {
         format!(
             "{} · {}\n该域的 Provider 尚未接入。",

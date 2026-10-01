@@ -103,7 +103,10 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     } else if app.searching {
         Line::from(vec![
             Span::styled("  / ", theme::title_style()),
-            Span::styled(app.query.clone(), Style::default().fg(theme::CYAN)),
+            Span::styled(
+                app.query.text().to_string(),
+                Style::default().fg(theme::CYAN),
+            ),
             Span::styled("▌", Style::default().fg(theme::CYAN)),
         ])
     } else {

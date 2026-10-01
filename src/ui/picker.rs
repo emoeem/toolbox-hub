@@ -29,7 +29,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Span::styled("（直接打字就能过滤）", Style::default().fg(theme::FAINT))
     } else {
         Span::styled(
-            format!("{}▌", picker.filter),
+            format!("{}▌", picker.filter.text()),
             Style::default().fg(theme::TEXT),
         )
     };

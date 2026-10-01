@@ -507,8 +507,17 @@ fn draw_search(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     )];
 
     if view.editing {
+        // 光标画在**它真正在的位置**（以前永远贴在末尾，因为压根没有光标）
+        let (before, after) = view.query.split_at_cursor();
         spans.push(Span::styled(
-            format!("{}▏", view.query),
+            before.to_string(),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("▏", Style::default().fg(theme::PURPLE)));
+        spans.push(Span::styled(
+            after.to_string(),
             Style::default()
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
@@ -519,7 +528,7 @@ fn draw_search(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         ));
     } else {
         spans.push(Span::styled(
-            view.query.clone(),
+            view.query.text().to_string(),
             Style::default().fg(theme::TEXT),
         ));
         spans.push(Span::styled(

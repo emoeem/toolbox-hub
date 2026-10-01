@@ -803,12 +803,22 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Backspace => {
-            app.query.pop();
+            app.query.backspace();
             app.selected = 0;
             app.apply_filter();
         }
+        KeyCode::Delete => {
+            app.query.delete();
+            app.selected = 0;
+            app.apply_filter();
+        }
+        // 光标移动：以前只有 push/pop，打错开头只能全删重打
+        KeyCode::Left => app.query.left(),
+        KeyCode::Right => app.query.right(),
+        KeyCode::Home => app.query.home(),
+        KeyCode::End => app.query.end(),
         KeyCode::Char(c) => {
-            app.query.push(c);
+            app.query.insert(c);
             app.selected = 0;
             app.apply_filter();
         }
@@ -918,14 +928,41 @@ fn handle_packages_key(
         }
         KeyCode::Char(ch) if editing && !ctrl => {
             if let Some(view) = app.packages.as_mut() {
-                view.query.push(ch);
+                view.query.insert(ch);
                 view.refilter(); // 本地模糊过滤：键入即筛
             }
         }
         KeyCode::Backspace if editing => {
             if let Some(view) = app.packages.as_mut() {
-                view.query.pop();
+                view.query.backspace();
                 view.refilter();
+            }
+        }
+        KeyCode::Delete if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.delete();
+                view.refilter();
+            }
+        }
+        // 输入态下 ←→ 是移动光标（非输入态才是切模式）
+        KeyCode::Left if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.left();
+            }
+        }
+        KeyCode::Right if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.right();
+            }
+        }
+        KeyCode::Home if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.home();
+            }
+        }
+        KeyCode::End if editing => {
+            if let Some(view) = app.packages.as_mut() {
+                view.query.end();
             }
         }
         KeyCode::Char('u') if editing && ctrl => {
@@ -1131,6 +1168,31 @@ fn handle_packages_key(
         _ => {}
     }
     Ok(false)
+}
+
+/// 处理一次粘贴（终端开了 bracketed paste 才会有这个事件）。
+///
+/// 交给当前**正在输入**的那个框：软件包中心 > 全局搜索 > 文件选择器。
+/// 用事件而不是一串按键，一来快（一次事件 vs 几十次按键），二来终端不会再往里
+/// 塞回车 —— 粘一段多行文本不会顺手把命令发出去。
+pub fn handle_paste(app: &mut App, text: &str) {
+    if let Some(view) = app.packages.as_mut()
+        && view.editing
+    {
+        view.query.insert_str(text);
+        view.refilter();
+        return;
+    }
+    if app.searching {
+        app.query.insert_str(text);
+        app.selected = 0;
+        app.apply_filter();
+        return;
+    }
+    if let Some(picker) = app.picker.as_mut() {
+        picker.filter.insert_str(text);
+        picker.refilter();
+    }
 }
 
 /// 执行选中的工具：挂起 TUI、交给 runtime、回来后清标记。
