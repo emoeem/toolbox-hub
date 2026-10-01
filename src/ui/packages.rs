@@ -268,6 +268,25 @@ fn row_style(view: &PackageView) -> Style {
     }
 }
 
+/// 只画看得见的那几十行，返回窗口边界。
+///
+/// `Table::new` 会把传进去的行**全部** collect 成 Vec（ratatui 内部就是这么做的），
+/// 所以每次重画都得把所有行构造一遍。已安装列表在这台机器上是 2271 行 ——
+/// 按一次 ↓ 就重新分配上万次对象，滚动会发涩（空闲时更明显，实测空转 3~4% CPU，
+/// 脏标记已经把那部分解决了，剩下这个是给滚动提速的）。
+///
+/// 窗口跟着选区走：选区永远落在窗口里，所以 `TableState` 的 `offset` 保持 0，
+/// 高亮行就是窗口内的相对下标。
+fn window(total: usize, selected: usize, height: u16) -> (usize, usize) {
+    let room = height.saturating_sub(1).max(1) as usize; // 表头占一行
+    if total <= room {
+        return (0, total);
+    }
+    let half = room / 2;
+    let start = selected.saturating_sub(half).min(total - room);
+    (start, start + room)
+}
+
 fn empty_hint(frame: &mut ratatui::Frame, text: &str, area: Rect) {
     frame.render_widget(
         Paragraph::new(text)
@@ -290,7 +309,8 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
         return;
     }
 
-    let rows = (0..view.rows_len())
+    let (start, end) = window(view.rows_len(), view.rows_selected(), area.height);
+    let rows = (start..end)
         .filter_map(|row| view.visible_hit(row))
         .map(|hit| {
             let repo_color = if hit.is_aur() {
@@ -339,7 +359,9 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
     .row_highlight_style(row_style(view))
     .highlight_symbol("➤ ");
 
-    let mut state = TableState::default().with_selected(Some(view.rows_selected()));
+    // 预窗口化之后，高亮行是窗口内的相对下标
+    let mut state =
+        TableState::default().with_selected(Some(view.rows_selected().saturating_sub(start)));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -361,7 +383,8 @@ fn draw_installed_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rec
         return;
     }
 
-    let rows = (0..view.rows_len())
+    let (start, end) = window(view.rows_len(), view.rows_selected(), area.height);
+    let rows = (start..end)
         .filter_map(|row| view.installed_hit(row))
         .map(|package| {
             let tag_color = if package.orphan {
@@ -402,7 +425,9 @@ fn draw_installed_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rec
     .row_highlight_style(row_style(view))
     .highlight_symbol("➤ ");
 
-    let mut state = TableState::default().with_selected(Some(view.rows_selected()));
+    // 预窗口化之后，高亮行是窗口内的相对下标
+    let mut state =
+        TableState::default().with_selected(Some(view.rows_selected().saturating_sub(start)));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -420,7 +445,8 @@ fn draw_news_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         return;
     }
 
-    let rows = (0..view.rows_len())
+    let (start, end) = window(view.rows_len(), view.rows_selected(), area.height);
+    let rows = (start..end)
         .filter_map(|row| view.news_hit(row))
         .map(|item| {
             let key = crate::packages::news_key(item);
@@ -462,7 +488,9 @@ fn draw_news_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     .row_highlight_style(row_style(view))
     .highlight_symbol("➤ ");
 
-    let mut state = TableState::default().with_selected(Some(view.rows_selected()));
+    // 预窗口化之后，高亮行是窗口内的相对下标
+    let mut state =
+        TableState::default().with_selected(Some(view.rows_selected().saturating_sub(start)));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -707,4 +735,29 @@ fn draw_confirm(frame: &mut ratatui::Frame, confirm: &Confirm, area: Rect) {
             .block(theme::panel(&format!(" {} · 确认 ", confirm.title))),
         popup,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window;
+
+    /// 窗口跟着选区走，且永远落在合法范围内 —— 越界会直接 panic 在切片上。
+    #[test]
+    fn the_window_follows_the_selection() {
+        // 行数比视口还少：全都画
+        assert_eq!(window(5, 0, 10), (0, 5));
+        assert_eq!(window(0, 0, 10), (0, 0));
+
+        // 2271 行、视口 20 行：窗口始终 20 行，选区在里面
+        let (start, end) = window(2271, 0, 20);
+        assert_eq!((start, end), (0, 19), "开头贴着顶");
+        let (start, end) = window(2271, 1000, 20);
+        assert_eq!(end - start, 19);
+        assert!(start <= 1000 && 1000 < end, "选区必须在窗口里");
+
+        // 末尾不能越界（这是最容易写出 bug 的地方）
+        let (start, end) = window(2271, 2270, 20);
+        assert_eq!(end, 2271, "末尾窗口要贴底");
+        assert!(start < 2271);
+    }
 }

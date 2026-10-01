@@ -1692,6 +1692,7 @@ version = "0.1.0"
 dependencies = [
  "alpm",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

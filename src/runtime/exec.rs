@@ -376,18 +376,18 @@ impl RunningJob {
     /// 取消：**先请它自己退**（SIGTERM），给 ffmpeg 一个把输出文件收尾的机会。
     /// 之后还会收到一个 `Done`（`cancelled = true`）。
     ///
-    /// 没有 libc 依赖，所以用 `kill` 命令发信号；`kill` 不在就直接 SIGKILL。
+    /// 以前这里是 spawn 一个 `kill -TERM <pid>`：为了不引依赖绕的路，代价是
+    /// 多起一个进程、还依赖那个程序存在。现在直接 `libc::kill` —— 一次系统调用。
+    ///
+    /// 发**整个进程组**（`-pid`）而不是单个进程：工具自己拉起来的子进程
+    /// （ffmpeg 的管道、shell 脚本里的后台任务）也该一起收到，不然它们会变成孤儿
+    /// 继续闷头写文件。任务是以自己的进程组启动的（见 `spawn`）。
     pub fn terminate(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         let Some(pid) = self.pid() else {
             return;
         };
-        let polite = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !polite {
+        if !signal_group(pid, libc::SIGTERM) {
             self.cancel();
         }
     }
@@ -395,11 +395,23 @@ impl RunningJob {
     /// 直接杀掉（SIGKILL）。
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        // 先整组 SIGKILL（子进程也别漏），再退回 Child::kill 兜底。
+        if let Some(pid) = self.pid() {
+            let _ = signal_group(pid, libc::SIGKILL);
+        }
         // 注意：收尾线程只在两条流 EOF 之后才会持有这把锁去 wait，所以这里不会卡住。
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
     }
+}
+
+/// 给「进程组」发信号（`kill(-pgid)`）。失败返回 false，调用方自己兜底。
+///
+/// 用组而不是单个 pid：`program` 底下可能还有孙子进程，只杀父进程会把它们留下。
+fn signal_group(pid: u32, signal: libc::c_int) -> bool {
+    // SAFETY: `kill` 是纯系统调用，参数就是 pid 与信号号；负号表示「进程组」。
+    unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
 }
 
 /// 这一行是不是 ffmpeg `-progress` 吐的进度键。
@@ -434,14 +446,22 @@ pub fn spawn_captured(
     cwd: &Path,
     label: &str,
 ) -> io::Result<RunningJob> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(argv)
         .current_dir(cwd)
         // 不给它 stdin：后台任务不该等着人喂输入。
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // 让它自成进程组（pgid = 自己的 pid）：取消时才能一次把整组带走，
+    // 不然工具拉起来的孙子进程会变成孤儿接着跑、接着写文件。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -760,6 +780,73 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!marker.exists(), "drop 之后子进程必须已经死了（pid {pid}）");
+    }
+
+    /// `terminate()` 走的是**整个进程组**：工具自己拉起来的孙子进程也要一起走。
+    ///
+    /// 造一个真的孙子进程（非交互 shell 里的 `&` 子进程与 shell 同组）：
+    /// 只杀父进程的话它会变成孤儿接着跑 —— 那正是「取消之后还有东西在写文件」
+    /// 的来源。这条测试就是钉住「整组带走」。
+    #[test]
+    fn terminate_takes_the_whole_process_group() {
+        use std::{path::PathBuf, sync::mpsc::RecvTimeoutError};
+
+        let pidfile = std::env::temp_dir().join(format!("toolbox-hub-pgid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let job = spawn_captured(
+            &PathBuf::from("/bin/sh"),
+            &[String::from("-c"), script],
+            &PathBuf::from("/tmp"),
+            "sh",
+        )
+        .expect("spawn");
+
+        // 等孙子进程的 pid 落盘
+        let mut grandchild = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let grandchild = grandchild.expect("孙子进程的 pid 应该写进文件了");
+        assert!(alive(grandchild), "还没取消，它当然活着");
+
+        job.terminate();
+
+        let captured = loop {
+            match job.events.recv_timeout(Duration::from_secs(10)) {
+                Ok(JobEvent::Done(captured)) => break captured,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => panic!("SIGTERM 之后还是没结束"),
+                Err(RecvTimeoutError::Disconnected) => panic!("事件通道断了"),
+            }
+        };
+        assert!(captured.cancelled, "要标成被取消");
+
+        // 孙子进程要跟着走（SIGTERM 之后可能先变僵尸，所以给它一点时间）
+        let mut gone = false;
+        for _ in 0..100 {
+            if !alive(grandchild) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "孙子进程 {grandchild} 还活着 —— 进程组没带走");
+
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    /// 这个 pid 还活着吗（`kill(pid, 0)` 不发信号，只做存在性检查）。
+    fn alive(pid: i32) -> bool {
+        // SAFETY: 信号 0 不发送任何东西，只检查进程是否存在。
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 
     #[test]

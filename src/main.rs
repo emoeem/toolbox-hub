@@ -122,20 +122,32 @@ fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
 }
 
 fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    // 只在「有事发生」的那一帧才画。
+    //
+    // 以前是每轮无条件 `terminal.draw`，而主循环 100ms 一轮 —— 没人操作也每秒画
+    // 十帧，每帧还要把所有行重新构造一遍（已安装列表 2271 行就是上万次分配）。
+    // 实测空转 3~4% CPU，纯属白烧。现在只有按键/鼠标/后台有变动/需要整屏重画
+    // 这几种情况才画。
+    let mut dirty = true;
     loop {
         // 接管过终端（跑了交互式工具）以后，必须先丢掉 ratatui 的旧帧：
         // 它记着接管前那一帧，而离开备用屏幕时物理屏已经空了，直接 draw 会因为
         // 「没变化」而一个格子都不写 —— 界面看起来就只剩一行状态文字。
         if app.take_full_redraw() {
             terminal.clear()?;
+            dirty = true;
         }
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        if dirty {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            dirty = false;
+        }
         // 每轮都重新取一次：用户可能刚按 `d` 改过工作目录。
         let cwd = app.work_dir.clone();
 
         // 尺寸变化不做特殊处理：下一帧 draw 会按新的 area 重新布局。
         // 有按键就处理；没有按键也**不能** continue（后台事件还得取）。
         if event::poll(Duration::from_millis(100))? {
+            dirty = true; // 有输入（含窗口尺寸变化）就重画
             match event::read()? {
                 Event::Key(key) if app::handle_key(app, key, &cwd)? => break,
                 Event::Mouse(mouse) => app::handle_mouse(app, mouse, &cwd)?,
@@ -147,8 +159,12 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
         // * 只放在「有按键」的分支后面是不行的 —— 没人敲键盘时进度就不动了
         //   （实测：面板上耗时在走、进度和输出一直空着，按一下键才刷出来）；
         // * 放在按键**之后**是为了让「按 q 取消」不会顺手把刚打开的输出视图关掉。
-        app.poll_job(&cwd);
-        app.poll_packages();
+        if app.poll_job(&cwd) {
+            dirty = true;
+        }
+        if app.poll_packages() {
+            dirty = true;
+        }
     }
     Ok(())
 }

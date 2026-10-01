@@ -358,7 +358,9 @@ impl PackageView {
     ///
     /// 以前这里有六个接收器、六段几乎一样的 `try_recv` 样板；现在只有一个
     /// [`Response`]，分发集中在一处 —— 加一种取数只需动 `worker` 和这里各一行。
-    pub fn poll(&mut self) {
+    ///
+    /// 返回值是「这一帧有东西变了」：主循环据此决定要不要重画（见 `main::run`）。
+    pub fn poll(&mut self) -> bool {
         // 先把回答收干净再处理：`try_recv` 借着 worker（也就是 self），
         // 而 `handle` 要改 self —— 不先收完就是借用冲突。
         let mut responses = Vec::new();
@@ -367,10 +369,12 @@ impl PackageView {
                 responses.push(response);
             }
         }
+        let handled = !responses.is_empty();
         for response in responses {
             self.handle(response);
         }
-        self.follow_selection();
+        let asked = self.follow_selection();
+        handled || asked
     }
 
     fn handle(&mut self, response: Response) {
@@ -480,9 +484,9 @@ impl PackageView {
     ///
     /// 两个数据源分工明确：搜索模式查**仓库里**的包（官方源走 libalpm、AUR 走
     /// RPC），已安装模式查**本地**的那份 —— 外来包在同步库里根本不存在。
-    fn follow_selection(&mut self) {
+    fn follow_selection(&mut self) -> bool {
         if self.info_pending.is_some() {
-            return;
+            return false;
         }
         // 先把「要查谁」定下来（这一段只借 self 的不可变引用），再去发请求，
         // 免得「借 worker」和「改 info_pending」同时要 self。
@@ -493,22 +497,22 @@ impl PackageView {
         let (name, target) = match self.mode {
             PackageMode::Search => match self.selected_hit() {
                 Some(hit) => (hit.name.clone(), Target::Repo(hit.clone())),
-                None => return,
+                None => return false,
             },
             PackageMode::Installed => match self.selected_installed() {
                 Some(package) => (package.name.clone(), Target::Local(package.name.clone())),
-                None => return,
+                None => return false,
             },
-            PackageMode::News => return,
+            PackageMode::News => return false,
         };
 
         if self.info.as_ref().map(|(shown, _)| shown.as_str()) == Some(name.as_str()) {
-            return;
+            return false;
         }
         self.info_pending = Some(name.clone());
 
         let Some(worker) = self.worker.as_ref() else {
-            return;
+            return false;
         };
         let hit = match target {
             Target::Repo(hit) => hit,
@@ -527,6 +531,7 @@ impl PackageView {
             },
         };
         worker.info(&hit);
+        true
     }
 
     /// 两路结果合流：排序 + 去重 + 重建筛选，尽量保住当前选中的那个包。

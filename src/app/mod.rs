@@ -1015,10 +1015,12 @@ impl App {
     }
 
     /// 每帧收一次包管理的后台结果（搜索、包信息、新闻）。
-    pub fn poll_packages(&mut self) {
-        if let Some(view) = self.packages.as_mut() {
-            view.poll();
-        }
+    /// 收包管理的后台结果。返回 `true` 表示收到了东西（该重画了）。
+    pub fn poll_packages(&mut self) -> bool {
+        let Some(view) = self.packages.as_mut() else {
+            return false;
+        };
+        view.poll()
     }
 
     /// 关闭包管理视图（历史与队列都落盘）。
@@ -1598,12 +1600,19 @@ impl App {
     /// 主循环每帧调一次：把后台任务的事件取干净。
     ///
     /// 取到 `Done` 就收尾：写历史、起队列里的下一件、都跑完了开输出视图。
-    pub fn poll_job(&mut self, cwd: &Path) {
+    /// 收后台任务的进度与输出。返回 `true` 表示「这一帧有别的东西要画」。
+    ///
+    /// 主循环拿它决定要不要 `terminal.draw`：后台在跑的时候就一直画（进度条与
+    /// 耗时要动），没人干活、也没人按键的时候就**一帧都不画** —— 空闲时每秒十次
+    /// 全量重建界面的钱省下来了。
+    pub fn poll_job(&mut self, cwd: &Path) -> bool {
         let Some(running) = self.running.as_mut() else {
-            return;
+            return false;
         };
 
         let mut done: Option<Captured> = None;
+        // 任务在跑：耗时/进度每帧都在变，所以这一帧总是要画
+        let mut changed = true;
         while let Ok(event) = running.job.events.try_recv() {
             match event {
                 runtime::JobEvent::Line { stderr, text } => {
@@ -1627,13 +1636,13 @@ impl App {
         }
 
         if done.is_none() {
-            return;
+            return changed;
         }
         let captured = done.expect("刚判过不是 None");
 
         // 收尾前先把 running 的借用放掉。
         let Some(running) = self.running.take() else {
-            return;
+            return changed;
         };
         let (tool_id, tool_name, record_argv, values, ok_exit_codes) = (
             running.tool_id,
@@ -1674,6 +1683,8 @@ impl App {
         } else {
             self.start_next_job(cwd);
         }
+        changed = true;
+        changed
     }
 
     /// 算这次执行的「总时长」（进度条用）。
