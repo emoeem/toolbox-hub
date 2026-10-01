@@ -276,16 +276,8 @@ fn handle_packages_mouse(
         return Ok(());
     }
 
-    if areas.search.contains(point) {
-        if let Some(view) = app.packages.as_mut() {
-            view.editing = true;
-            view.pane = Pane::Rows;
-            view.message = String::from("输入关键词，Enter 搜索");
-        }
-        return Ok(());
-    }
-
-    // 排序标签（顶栏里那个 `排序 相关度▾`）也点得动：直接开菜单，键盘来选。
+    // 状态行：点左半边是「开始打字过滤」，点右半边是排序菜单。
+    // （旧版式里这儿是单独一行搜索框，现在照 paru 把它并进状态行了。）
     if areas.status.contains(point) {
         let sorts_open = app
             .packages
@@ -294,10 +286,22 @@ fn handle_packages_mouse(
         if sorts_open {
             return Ok(());
         }
+        let wide_enough = point.x < areas.status.x + areas.status.width.saturating_sub(40);
         if let Some(view) = app.packages.as_mut() {
-            view.editing = false;
-            view.open_sort_menu();
+            if wide_enough {
+                view.editing = true;
+                view.pane = Pane::Rows;
+                view.message = String::from("打字即时过滤，Enter 上网搜");
+            } else {
+                view.editing = false;
+                view.open_sort_menu();
+            }
         }
+        return Ok(());
+    }
+
+    if areas.tabs.contains(point) {
+        // 上面已经处理过（标签命中区），这里只是兜底：点在标签行的空白处
         return Ok(());
     }
 
@@ -311,12 +315,15 @@ fn handle_packages_mouse(
 
     let double = is_double_click(mouse);
 
-    if areas.queue.contains(point) {
+    // 队列在 `Tab` 切过去时整块占着结果表那块地方
+    if app
+        .packages
+        .as_ref()
+        .is_some_and(|view| view.pane == Pane::Queue)
+    {
         if let Some(view) = app.packages.as_mut() {
             view.editing = false;
-            view.pane = Pane::Queue;
-            // 面板有一圈边框，行号要减掉它
-            let row = point.y.saturating_sub(areas.queue.y).saturating_sub(1) as usize;
+            let row = point.y.saturating_sub(areas.results.y).saturating_sub(1) as usize;
             if row < view.queue.len() {
                 view.queue_selected = row;
             } else {
@@ -723,6 +730,17 @@ fn execute_form(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Err
     let started = Instant::now();
 
     match tool.mode {
+        // 内置界面：不起进程、也不要参数，直接开对应视图
+        RunMode::Native => {
+            let view = tool
+                .action
+                .as_ref()
+                .map(|action| action.program.clone())
+                .unwrap_or_default();
+            open_native_view(app, &view);
+            app.form = None;
+            return Ok(());
+        }
         RunMode::Capture => {
             // 展开成一次或多次执行（`foreach` 声明了就是「每个输入各跑一次」）。
             // 注意：这一步必须在**关表单之前**做 —— 关了就取不到表单里的值了。
@@ -1232,6 +1250,18 @@ pub fn handle_paste(app: &mut App, text: &str) {
 ///
 /// 需要填参数的工具（`Curated` 那类）**不在这里执行** —— 它们得先打开表单，
 /// 否则就是在替用户瞎猜参数。批量执行时把它们跳过并说明。
+/// 打开一个内置界面（`program` 就是界面名）。
+fn open_native_view(app: &mut App, view: &str) {
+    match view {
+        "package-center" => {
+            app.close_help();
+            app.open_packages();
+            app.message = String::from("软件包中心：打字过滤 · Space 排队 · Enter 摆出要跑的命令");
+        }
+        other => app.message = format!("不认识的界面「{other}」"),
+    }
+}
+
 fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let targets = app.execution_targets();
     if targets.is_empty() {
@@ -1254,6 +1284,7 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
         match tool.mode {
             RunMode::Capture => capture.push(tool.clone()),
             RunMode::Interactive => interactive.push(tool.clone()),
+            RunMode::Native => {} // 上面已经单独处理过了
         }
     }
 

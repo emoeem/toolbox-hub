@@ -119,11 +119,14 @@ impl Registry {
             }
         }
 
-        // 按域顺序 + 工具名排序，让表格顺序稳定，不受目录遍历顺序影响。
+        // 按域顺序 + 置顶 + 工具名排序：顺序稳定（不受目录遍历影响），
+        // 而 `pin` 让某个域里最该先看到的项排在前面。
         tools.sort_by(|a, b| {
             a.domain
                 .index()
                 .cmp(&b.domain.index())
+                .then_with(|| a.pin.is_none().cmp(&b.pin.is_none()))
+                .then_with(|| a.pin.unwrap_or(0).cmp(&b.pin.unwrap_or(0)))
                 .then_with(|| a.name.cmp(&b.name))
         });
         self.tools = tools;
@@ -251,6 +254,7 @@ mod tests {
             requires: Vec::new(),
             missing_deps: Vec::new(),
             install_hint: None,
+            pin: None,
             action: None,
             mode: RunMode::Interactive,
             danger: Danger::Safe,

@@ -171,6 +171,8 @@ pub fn has_paccache() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     /// 真跑：AUR 搜索 + 用搜索结果回答包信息（第二次不发请求）。
@@ -201,6 +203,117 @@ mod tests {
         assert!(fields.iter().any(|(key, _)| key == "Votes"));
         assert!(fields.iter().any(|(key, _)| key == "AUR URL"));
         assert!(net.aur.contains_key(&name), "信息请求不该把它从缓存里踢掉");
+    }
+
+    /// 真跑：libalpm 算出来的两个数字，必须与真 pacman 一致。
+    ///
+    /// 对账用 `pacman -Qu` 而**不是** `checkupdates`：后者每次都重新下载数据库
+    /// （就是那 18 秒），于是能看到「本地库还不知道的更新」。实测差距就是这么来的：
+    /// checkupdates 30 / `pacman -Qu` 27 / libalpm 27。
+    #[test]
+    #[ignore = "真的跑 pacman -Qu 与 pacman -Qtdq（只读），默认跳过"]
+    fn smoke_libalpm_agrees_with_pacman() {
+        use crate::packages::libalpm::Db;
+
+        let db = Db::open().expect("打开数据库");
+
+        let expected = count_lines("pacman", &["-Qu"]);
+        let ours = db.pending_updates().expect("应该算得出来");
+        assert_eq!(
+            ours,
+            expected,
+            "可更新数与 pacman -Qu 对不上（差 {}）",
+            ours as i64 - expected as i64
+        );
+
+        let expected = count_lines("pacman", &["-Qtdq"]);
+        let ours = db.orphan_names().len();
+        assert_eq!(ours, expected, "孤儿判定与 pacman -Qtd 对不上");
+    }
+
+    /// 跑一条命令数它输出了几行（空行不算）。
+    fn count_lines(program: &str, args: &[&str]) -> usize {
+        let output = Command::new(program).args(args).output().expect("跑得起来");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    }
+
+    /// 真跑：两路搜索都能出结果，同一个包不会因为出现在多个仓库里而重复。
+    #[test]
+    #[ignore = "真的读数据库并联网（只读），默认跳过"]
+    fn smoke_search_both_sources() {
+        use crate::packages::libalpm::Db;
+
+        let db = Db::open().expect("打开数据库");
+        let official = db.search("fzf").expect("官方源搜索");
+        assert!(
+            official.iter().any(|hit| hit.name == "fzf"),
+            "官方源该有 fzf：{:?}",
+            official.iter().map(|hit| &hit.name).collect::<Vec<_>>()
+        );
+        assert!(
+            official
+                .iter()
+                .any(|hit| hit.name == "fzf" && hit.is_installed()),
+            "fzf 装了，应该标上已安装"
+        );
+
+        // 仓库优先级去重：同名包只留优先级最高的那个仓库
+        let mut names: Vec<&str> = official.iter().map(|hit| hit.name.as_str()).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "同一个包不该出现两次（cachyos 与 extra）"
+        );
+
+        // AUR 那一路可能因为网络失败，但失败要说明白是哪一路
+        match Net::new().search_aur("fzf", db.local_versions()) {
+            Ok(hits) => assert!(!hits.is_empty(), "AUR 里应该有名字带 fzf 的包"),
+            Err(error) => println!("AUR 那一路失败（网络问题可接受）：{error}"),
+        }
+    }
+
+    /// 真跑：官方源与 AUR 的信息面板（字段名是中文，照 `paru -Si` 排）。
+    #[test]
+    #[ignore = "真的读数据库并联网（只读），默认跳过"]
+    fn smoke_info_both_sources() {
+        use crate::packages::libalpm::Db;
+
+        let db = Db::open().expect("打开数据库");
+        let official = db.info("bash").expect("bash 的信息");
+        for wanted in [
+            "软件库",
+            "名字",
+            "版本",
+            "描述",
+            "依赖于",
+            "下载大小",
+            "安装后大小",
+            "验证者",
+        ] {
+            assert!(
+                official.iter().any(|(key, _)| key == wanted),
+                "信息面板少了「{wanted}」：{official:?}"
+            );
+        }
+
+        // 外来包（AUR 装的）也要能查：同步库里没有，只能落到本地库
+        if let Some(foreign) = db
+            .installed()
+            .ok()
+            .and_then(|packages| packages.into_iter().find(|package| package.foreign))
+        {
+            let fields = db.info(&foreign.name).expect("外来包也该有信息");
+            assert!(
+                fields.iter().any(|(key, _)| key == "名字"),
+                "外来包的信息面板：{fields:?}"
+            );
+        }
     }
 
     /// 真跑：Arch 新闻。

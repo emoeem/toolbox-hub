@@ -24,45 +24,34 @@ use crate::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct PackageLayout {
-    /// 顶栏状态（结果数 / 排序 / 队列 / 待更新 / 新闻）。
+    /// 顶栏状态（结果 N/M · 已选 · 队列）+ 右端键提示。
     pub status: Rect,
     /// 模式标签 + 仓库/分类标签。
     pub tabs: Rect,
+    /// 结果表（整行宽）—— 或者队列（`Tab` 切过去时占这块）。
     pub results: Rect,
-    /// 搜索框（结果表下面那一行）。
-    pub search: Rect,
-    /// 安装清单。
-    pub queue: Rect,
-    /// 右侧包信息。
+    /// 包信息面板（整行宽，在下面）。
+    ///
+    /// 这是照着 `paru` 的版式来的：**列表在上整行、信息在下整行**。
+    /// 之前是左右分栏（pacseek 那种），信息面板太窄，长依赖列表要折行。
     pub info: Rect,
 }
 
 /// 软件包中心唯一的布局来源。
 pub fn layout(area: Rect) -> PackageLayout {
     let rows = Layout::vertical([
-        Constraint::Length(1), // 状态
-        Constraint::Length(1), // 标签
-        Constraint::Min(8),    // 主体
+        Constraint::Length(1),  // 状态 + 键提示
+        Constraint::Length(1),  // 标签
+        Constraint::Min(6),     // 结果表（paru：整行）
+        Constraint::Length(11), // 包信息（paru：整行，在下面）
     ])
     .split(area);
-
-    // 左边一列从上到下：结果表 → 搜索框 → 安装清单；右边整列是包信息。
-    let columns =
-        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(rows[2]);
-    let left = Layout::vertical([
-        Constraint::Min(4),
-        Constraint::Length(1),
-        Constraint::Length(6),
-    ])
-    .split(columns[0]);
 
     PackageLayout {
         status: rows[0],
         tabs: rows[1],
-        results: left[0],
-        search: left[1],
-        queue: left[2],
-        info: columns[1],
+        results: rows[2],
+        info: rows[3],
     }
 }
 
@@ -113,9 +102,13 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let areas = layout(inner);
     draw_status(frame, view, areas.status);
     draw_tabs(frame, view, areas.tabs);
-    draw_rows(frame, view, areas.results);
-    draw_search(frame, view, areas.search);
-    draw_queue(frame, view, areas.queue);
+    // 焦点在队列时，队列**整块**顶掉结果表（paru 的 Tab:多选 那种感觉：
+    // 屏幕上始终是「一个列表 + 一块信息」，不挤成三块）
+    if view.pane == Pane::Queue {
+        draw_queue(frame, view, areas.results);
+    } else {
+        draw_rows(frame, view, areas.results);
+    }
     draw_info(frame, view, areas.info);
 
     // 浮层最后画，保证盖在上面
@@ -129,39 +122,21 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 // ── 顶栏 ────────────────────────────────────────────────────────────────────
 
 fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
+    let total = view.hits.len();
+    let shown = view.rows_len();
     let mut spans = vec![
         Span::styled(" 结果 ", Style::default().fg(theme::DIM)),
         Span::styled(
-            format!("{}", view.rows_len()),
+            format!("{shown}/{total}"),
             Style::default()
                 .fg(theme::CYAN)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
 
-    if view.dry_run {
-        spans.push(Span::styled(
-            "  演练 ",
-            Style::default()
-                .fg(theme::BG)
-                .bg(theme::YELLOW)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    if view.mode != PackageMode::News {
-        spans.push(Span::styled(
-            format!("  排序 {}▾", view.sort.label()),
-            Style::default().fg(theme::PURPLE),
-        ));
-    }
-
+    // 已选（队列里有几个）—— 对应 paru 那个 `(0)`
     spans.push(Span::styled(
-        format!("  操作 {}  ", view.operation.label()),
-        Style::default().fg(theme::YELLOW),
-    ));
-    spans.push(Span::styled(
-        format!("队列 {}", view.queue.len()),
+        format!("  ({} 已选)", view.queue.len()),
         Style::default().fg(if view.queue.is_empty() {
             theme::DIM
         } else {
@@ -169,18 +144,45 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         }),
     ));
 
-    if let Some(count) = view.pending_updates {
+    // 输入态：把过滤词就写在这儿（paru 也没有单独的搜索框）
+    if view.editing {
+        let (before, after) = view.query.split_at_cursor();
+        spans.push(Span::styled("   筛选 ", Style::default().fg(theme::GREEN)));
         spans.push(Span::styled(
-            format!("  待更新 {count}"),
-            Style::default().fg(if count > 0 {
-                theme::YELLOW
-            } else {
-                theme::GREEN
-            }),
+            before.to_string(),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
         ));
-        // 「待更新」是按本地同步库算的（和 `pacman -Qu` 同一口径），库旧了这个数就
-        // 偏小 —— `checkupdates` 之所以更准，是因为它每次都重新下载数据库（18 秒），
-        // 那个代价不值得付。库旧了就说出来，别给一个看着很确定的数字。
+        spans.push(Span::styled("▏", Style::default().fg(theme::PURPLE)));
+        spans.push(Span::styled(
+            after.to_string(),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if !view.query.is_empty() {
+        spans.push(Span::styled(
+            format!("   筛选 {}", view.query.text()),
+            Style::default().fg(theme::DIM),
+        ));
+    }
+
+    if view.dry_run {
+        spans.push(Span::styled(
+            "   演练 ",
+            Style::default()
+                .fg(theme::BG)
+                .bg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if let Some(count) = view.pending_updates.filter(|count| *count > 0) {
+        spans.push(Span::styled(
+            format!("   待更新 {count}"),
+            Style::default().fg(theme::YELLOW),
+        ));
         if let Some(note) = view.sync_age_note() {
             spans.push(Span::styled(
                 format!("（{note}）"),
@@ -190,21 +192,23 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     }
     if let Some(unread) = view.news_unread().filter(|count| *count > 0) {
         spans.push(Span::styled(
-            format!("  新闻 {unread} 未读"),
+            format!("   新闻 {unread} 未读"),
             Style::default().fg(theme::YELLOW),
         ));
     }
 
+    // paru 那一行末尾的 `:` 后面也是一句状态短语；照抄这个位置
     spans.push(Span::styled(
         format!("   {}", view.status_line()),
         Style::default().fg(theme::FAINT),
     ));
-    if let Some(error) = view.errors.first() {
-        spans.push(Span::styled(
-            format!("  ! {error}"),
-            Style::default().fg(theme::RED),
-        ));
-    }
+
+    // 右端：键提示（paru 那行 `Tab:多选 | Enter:安装 | …`）
+    let hint = "Tab:队列 · Enter:执行 · Space:多选 · s:排序 · Esc:退出";
+    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let room = (area.width as usize).saturating_sub(used + hint.chars().count() + 2);
+    spans.push(Span::raw(" ".repeat(room)));
+    spans.push(Span::styled(hint, Style::default().fg(theme::FAINT)));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -352,12 +356,16 @@ fn empty_hint(frame: &mut ratatui::Frame, text: &str, area: Rect) {
 
 fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     if view.rows_len() == 0 {
-        let text = if view.searching {
-            "搜索中…（官方源 + AUR 两路并行）"
+        let text = if view.loading_all {
+            "正在读全部包…（三万多个，要一下下）"
+        } else if view.searching {
+            "搜索中…（官方源 + AUR 两路并行，先到的先显示）"
+        } else if view.searched.is_none() && view.hits.is_empty() {
+            "取数线程没起来：直接打字 + Enter 也能搜官方源与 AUR"
         } else if view.hits.is_empty() {
-            "还没有结果：在下面输入关键词回车（例如 fzf、ripgrep）"
+            "没有匹配的包。Enter 上网搜一次，或者改改关键词"
         } else {
-            "都被仓库标签筛掉了：点标签或按 0 全开"
+            "都被仓库标签筛掉了：按 0 全开，或者点标签"
         };
         empty_hint(frame, text, area);
         return;
@@ -402,12 +410,14 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
     let table = Table::new(
         rows,
         [
+            // 仓库列要放得下 `cachyos-extra-v3`（16 字符），不然会被截成
+            // `cachyos-extra-`，看着像另一个仓库
+            Constraint::Length(16),
+            Constraint::Length(22),
             Constraint::Length(14),
-            Constraint::Length(20),
-            Constraint::Length(13),
             Constraint::Min(16),
-            Constraint::Length(13),
-            Constraint::Length(13),
+            Constraint::Length(12),
+            Constraint::Length(18),
         ],
     )
     .row_highlight_style(row_style(view))
@@ -549,50 +559,6 @@ fn draw_news_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
 }
 
 // ── 搜索框 / 安装清单 / 包信息 ──────────────────────────────────────────────
-
-fn draw_search(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
-    let mut spans = vec![Span::styled(
-        " 搜索 ",
-        Style::default().fg(if view.editing {
-            theme::GREEN
-        } else {
-            theme::DIM
-        }),
-    )];
-
-    if view.editing {
-        // 光标画在**它真正在的位置**（以前永远贴在末尾，因为压根没有光标）
-        let (before, after) = view.query.split_at_cursor();
-        spans.push(Span::styled(
-            before.to_string(),
-            Style::default()
-                .fg(theme::TEXT)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled("▏", Style::default().fg(theme::PURPLE)));
-        spans.push(Span::styled(
-            after.to_string(),
-            Style::default()
-                .fg(theme::TEXT)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            "   Enter 上网搜 · ↑↓ 翻历史 · Esc 退出输入",
-            Style::default().fg(theme::FAINT),
-        ));
-    } else {
-        spans.push(Span::styled(
-            view.query.text().to_string(),
-            Style::default().fg(theme::TEXT),
-        ));
-        spans.push(Span::styled(
-            "   i 或 / 改词 · Ctrl+R 重搜 · Enter 搜/读",
-            Style::default().fg(theme::FAINT),
-        ));
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
 
 fn draw_queue(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     let focused = view.pane == Pane::Queue;

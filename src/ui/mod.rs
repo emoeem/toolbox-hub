@@ -232,6 +232,7 @@ mod tests {
             requires: Vec::new(),
             missing_deps: Vec::new(),
             install_hint: None,
+            pin: None,
             action: None,
             mode: RunMode::Interactive,
             danger: Danger::Safe,
@@ -383,8 +384,8 @@ mod tests {
         view.info = Some((
             String::from("fzf"),
             vec![
-                (String::from("Depends On"), String::from("glibc")),
-                (String::from("Download Size"), String::from("0.5 MiB")),
+                (String::from("依赖于"), String::from("glibc")),
+                (String::from("下载大小"), String::from("0.5 MiB")),
             ],
         ));
         view.message = String::from("2 个结果");
@@ -407,6 +408,7 @@ mod tests {
         }
 
         let screen = render_compact(&mut app, 160, 40);
+        // 版式照 paru：整行列表在上、整行包信息在下，键提示在状态行右端
         for wanted in [
             "软件包中心",
             "搜索",
@@ -414,15 +416,27 @@ mod tests {
             "新闻",
             "extra",
             "fzf",
-            "排序",
-            "安装清单",
             "sysz",
             "包信息",
-            "DependsOn",
-            "DownloadSize",
-            "2个结果",
+            "依赖于",
+            "下载大小",
+            "已选",
+            "Tab:队列",
         ] {
             assert!(screen.contains(wanted), "屏幕上少了 {wanted}：\n{screen}");
+        }
+
+        // 队列（Tab 切过去）整块顶掉结果表
+        if let Some(view) = app.packages.as_mut() {
+            view.pane = crate::app::package_view::Pane::Queue;
+        }
+        let screen = render_compact(&mut app, 160, 40);
+        assert!(
+            screen.contains("安装清单"),
+            "队列面板该顶掉结果表：\n{screen}"
+        );
+        if let Some(view) = app.packages.as_mut() {
+            view.pane = crate::app::package_view::Pane::Rows;
         }
 
         // 模式标签也跟着走：切到已安装就不再画仓库标签，

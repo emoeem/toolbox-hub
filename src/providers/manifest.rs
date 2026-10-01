@@ -63,7 +63,11 @@ const BUNDLED: &[(&str, &str)] = &[
 /// **加/删 `manifests/*.toml` 里的动作后要更新这里**：测试拿它对账，
 /// 某个 manifest 悄悄解析失败时（例如拼错一个键），工具数会立刻对不上。
 #[cfg(test)]
-const BUNDLED_ACTION_COUNT: usize = 32;
+const BUNDLED_ACTION_COUNT: usize = 33;
+
+/// 内置动作里 `mode = "native"` 的那些：`program` 写的是**界面名**（不是命令）。
+#[cfg(test)]
+const NATIVE_ACTIONS: &[&str] = &["manifest:pkg-center"];
 
 pub struct ManifestProvider {
     /// 用户 manifest 目录，按顺序读；先读到的占住 id。
@@ -210,6 +214,8 @@ struct ManifestAction {
     program: String,
     #[serde(default)]
     base_argv: Vec<String>,
+    /// 在域里置顶（0 最靠前）。见 [`crate::model::ToolDefinition::pin`]。
+    pin: Option<i32>,
     #[serde(default)]
     install: Option<String>,
     #[serde(default)]
@@ -329,8 +335,24 @@ impl ManifestAction {
             }
         }
 
+        let mode = match self.mode.as_deref().map(str::trim) {
+            // 默认捕获输出：manifest 包的是普通 CLI，不是 fzf 那种 TUI。
+            None | Some("") => RunMode::Capture,
+            Some(raw) => RunMode::parse(raw).ok_or_else(|| {
+                complain(&format!(
+                    "不认识的 mode「{raw}」，可用 interactive / capture / native"
+                ))
+            })?,
+        };
         let program = self.program.trim().to_string();
-        let deps = metadata::dependencies_of(std::slice::from_ref(&program));
+        // native 动作的 `program` 是**界面名**（`package-center`），不是命令：
+        // 拿它去探依赖只会得到「依赖缺失」—— 实拍踩到过，那一项因此沉到列表底部。
+        let is_native = matches!(mode, RunMode::Native);
+        let deps = if is_native {
+            Default::default()
+        } else {
+            metadata::dependencies_of(std::slice::from_ref(&program))
+        };
         let ready = deps.is_ready();
 
         Ok(ToolDefinition {
@@ -348,18 +370,11 @@ impl ManifestAction {
             input: self.input.clone(),
             output: self.output.clone(),
             features: self.features.clone(),
+            pin: self.pin,
             requires: deps.required,
             missing_deps: deps.missing,
             install_hint: self.install.clone(),
-            mode: match self.mode.as_deref().map(str::trim) {
-                // 默认捕获输出：manifest 包的是普通 CLI，不是 fzf 那种 TUI。
-                None | Some("") => RunMode::Capture,
-                Some(raw) => RunMode::parse(raw).ok_or_else(|| {
-                    complain(&format!(
-                        "不认识的 mode「{raw}」，可用 interactive / capture"
-                    ))
-                })?,
-            },
+            mode,
             danger: match self.danger.as_deref().map(str::trim) {
                 None | Some("") => Danger::Safe,
                 Some(raw) => Danger::parse(raw).ok_or_else(|| {
@@ -493,7 +508,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{BUNDLED_ACTION_COUNT, ManifestProvider};
+    use super::{BUNDLED_ACTION_COUNT, ManifestProvider, NATIVE_ACTIONS};
     use crate::{
         model::Domain,
         providers::{Discovery, Provider},
@@ -534,6 +549,24 @@ mod tests {
             }
         }
         action.build_argv(&values).expect("填好必填项就该能构建")
+    }
+
+    /// native 动作的 `program` 是界面名，不该出现在「命令」的检查里。
+    #[test]
+    fn native_actions_are_not_commands() {
+        let discovery = bundled_discovery();
+        for id in NATIVE_ACTIONS {
+            let tool = by_id(&discovery, id);
+            let action = tool.action.as_ref().expect("带动作");
+            assert_eq!(
+                action.program, "package-center",
+                "{id} 的 program 应该是界面名"
+            );
+            assert!(
+                matches!(tool.mode, crate::model::RunMode::Native),
+                "{id} 该是 native 模式"
+            );
+        }
     }
 
     #[test]

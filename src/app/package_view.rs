@@ -210,6 +210,10 @@ pub struct PackageView {
     // ── 在飞的请求 ──
     /// 常驻取数线程（libalpm 句柄 + HTTP 连接都活在里面，见 `packages::worker`）。
     worker: Option<Worker>,
+    /// 整个同步库（浏览模式的基础：一进来就有东西看，像 paru 那样）。
+    pub all_hits: Vec<PackageHit>,
+    /// 全部包还在读。
+    pub loading_all: bool,
     /// 官方源的命中（与 AUR 分开存：两路各回各的，谁先到谁先上屏）。
     official_hits: Vec<PackageHit>,
     aur_hits: Vec<PackageHit>,
@@ -270,6 +274,8 @@ impl PackageView {
             history,
             history_index: None,
             worker,
+            all_hits: Vec::new(),
+            loading_all: false,
             official_hits: Vec::new(),
             aur_hits: Vec::new(),
             awaiting_official: false,
@@ -295,7 +301,7 @@ impl PackageView {
             self.message = format!("{} 模式", mode.label());
         }
         match mode {
-            PackageMode::Search => {}
+            PackageMode::Search => self.ensure_all_packages(),
             PackageMode::Installed => self.ensure_installed(),
             PackageMode::News => self.ensure_news(),
             PackageMode::Health => self.ensure_health(),
@@ -306,6 +312,25 @@ impl PackageView {
 
     pub fn cycle_mode(&mut self) {
         self.set_mode(self.mode.next());
+    }
+
+    /// 浏览模式：把整个同步库铺上（这是 paru 的第一屏：`< 38869/38869`）。
+    ///
+    /// 只拉一次：之后打字是**本地**过滤，Enter 才上网搜。
+    pub fn ensure_all_packages(&mut self) {
+        if self.loading_all || !self.all_hits.is_empty() {
+            return;
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            // 没有取数线程时也要能说明白，而不是留一块空屏
+            if self.message.is_empty() {
+                self.message = String::from("取数线程没起来：只能按 Enter 上网搜，列不出全部包");
+            }
+            return;
+        };
+        self.loading_all = true;
+        self.message = String::from("正在读全部包…");
+        worker.all_packages();
     }
 
     fn ensure_installed(&mut self) {
@@ -445,6 +470,14 @@ impl PackageView {
 
     fn handle(&mut self, response: Response) {
         match response {
+            Response::AllPackages(hits) => {
+                self.loading_all = false;
+                self.all_hits = hits;
+                // 用户已经开始搜了就别拿全库覆盖搜索结果
+                if self.searched.is_none() {
+                    self.rebuild_hits();
+                }
+            }
             Response::Official(hits) => {
                 self.awaiting_official = false;
                 self.official_hits = hits;
@@ -626,12 +659,17 @@ impl PackageView {
     fn rebuild_hits(&mut self) {
         let keep = self.selected_hit().map(|hit| hit.name.clone());
 
-        let mut hits: Vec<PackageHit> = self
-            .official_hits
-            .iter()
-            .chain(self.aur_hits.iter())
-            .cloned()
-            .collect();
+        // 浏览模式（还没按过 Enter）：铺全库；搜过之后：铺搜索结果
+        let browsing = self.searched.is_none();
+        let mut hits: Vec<PackageHit> = if browsing {
+            self.all_hits.clone()
+        } else {
+            self.official_hits
+                .iter()
+                .chain(self.aur_hits.iter())
+                .cloned()
+                .collect()
+        };
 
         let needle = self
             .searched
@@ -641,15 +679,20 @@ impl PackageView {
             .trim_start_matches('^')
             .trim_end_matches('$')
             .to_string();
-        hits.sort_by(|a, b| {
-            let exact = |hit: &PackageHit| hit.name.eq_ignore_ascii_case(&needle) as u8;
-            b.is_installed()
-                .cmp(&a.is_installed())
-                .then(exact(b).cmp(&exact(a)))
-                .then(b.votes.unwrap_or(0).cmp(&a.votes.unwrap_or(0)))
-                .then(a.repo.cmp(&b.repo))
-                .then(a.name.cmp(&b.name))
-        });
+        if browsing {
+            // 浏览全库时按名字排（搜索那种「相关的排前」在全库上没有意义）
+            hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.repo.cmp(&b.repo)));
+        } else {
+            hits.sort_by(|a, b| {
+                let exact = |hit: &PackageHit| hit.name.eq_ignore_ascii_case(&needle) as u8;
+                b.is_installed()
+                    .cmp(&a.is_installed())
+                    .then(exact(b).cmp(&exact(a)))
+                    .then(b.votes.unwrap_or(0).cmp(&a.votes.unwrap_or(0)))
+                    .then(a.repo.cmp(&b.repo))
+                    .then(a.name.cmp(&b.name))
+            });
+        }
         hits.dedup_by(|a, b| a.name == b.name && a.version == b.version);
         self.hits = hits;
 
@@ -666,8 +709,14 @@ impl PackageView {
         }
 
         // 两路都回来了才算搜完
-        self.searching = self.awaiting_official || self.awaiting_aur;
-        self.message = if self.searching {
+        self.searching = !browsing && (self.awaiting_official || self.awaiting_aur);
+        self.message = if browsing {
+            if self.loading_all {
+                String::from("正在读全部包…")
+            } else {
+                format!("全部 {} 个包", self.all_hits.len())
+            }
+        } else if self.searching {
             let waiting = match (self.awaiting_official, self.awaiting_aur) {
                 (true, true) => "官方源 + AUR",
                 (true, false) => "官方源",
@@ -1421,8 +1470,12 @@ impl PackageView {
                     String::from("搜索中…")
                 } else if let Some(term) = &self.searched {
                     format!("「{term}」{} 个结果", self.visible.len())
-                } else {
+                } else if self.loading_all {
+                    String::from("正在读全部包…")
+                } else if self.all_hits.is_empty() {
                     String::from("输入关键词回车搜索（官方源 + AUR）")
+                } else {
+                    format!("全部 {} 个包 · 打字即时过滤", self.all_hits.len())
                 }
             }
             PackageMode::Installed => {

@@ -283,6 +283,8 @@ pub struct Facts {
     pub state: InstalledState,
     /// 装的时候是「自己点名」还是「被依赖拖进来」（没装就是 `None`）。
     pub explicit: Option<bool>,
+    /// 包的校验方式（`pacman -Qi` 里的「验证者」：SHA-256 校验值 / 数字签名）。
+    pub validation: Option<String>,
 }
 
 /// `2030.16 KiB` 这种给人看的体积（pacman 也是这么写的）。
@@ -301,76 +303,84 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
-fn list_text(items: &[String]) -> Option<String> {
-    (!items.is_empty()).then(|| items.join("  "))
-}
-
-/// 把事实拼成信息面板的 `Key : Value` 列表（顺序照着 paru / pacman -Sii 的习惯）。
+/// 把事实拼成信息面板的字段列表。
 ///
-/// 空字段直接不出现 —— 面板上不该有一堆 `None`。
+/// **字段名用中文**，顺序照着 `paru -Si` 的中文输出排 —— 这是用户看着顺眼的
+/// 那一套（截图里就是「软件库 / 名字 / 版本 / 描述 / 架构 …」）。
+///
+/// 几个列表型字段（组 / 提供 / 与它冲突 / 取代）**空着也照写，值写「无」**：
+/// 面板上少一行会让人以为是没查到，写「无」才是「查到了，就是没有」。
 pub fn info_fields(facts: &Facts) -> Vec<(String, String)> {
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            String::from("无")
+        } else {
+            items.join("  ")
+        }
+    };
     let mut fields: Vec<(String, String)> = vec![
-        ("Repository".into(), facts.repo.clone()),
-        ("Name".into(), facts.name.clone()),
-        ("Version".into(), facts.version.clone()),
-        ("Description".into(), facts.description.clone()),
-        ("Architecture".into(), facts.arch.clone()),
+        ("软件库".into(), facts.repo.clone()),
+        ("名字".into(), facts.name.clone()),
+        ("版本".into(), facts.version.clone()),
+        ("描述".into(), facts.description.clone()),
+        ("架构".into(), facts.arch.clone()),
         ("URL".into(), facts.url.clone()),
+        ("软件许可".into(), list(&facts.licenses)),
+        ("组".into(), list(&facts.groups)),
+        ("提供".into(), list(&facts.provides)),
+        ("依赖于".into(), list(&facts.depends)),
+        ("可选依赖".into(), list(&facts.optional_deps)),
     ];
 
-    let optional = |key: &str, value: Option<String>| value.map(|value| (key.to_string(), value));
+    // 这几项有内容才写：空着写「无」会淹掉真正重要的那一行
+    if !facts.required_by.is_empty() {
+        fields.push(("被依赖".into(), facts.required_by.join("  ")));
+    }
+    if !facts.optional_for.is_empty() {
+        fields.push(("可选者".into(), facts.optional_for.join("  ")));
+    }
+    fields.push(("与它冲突".into(), list(&facts.conflicts)));
+    fields.push(("取代".into(), list(&facts.replaces)));
 
-    fields.extend(optional("Licenses", list_text(&facts.licenses)));
-    fields.extend(optional("Groups", list_text(&facts.groups)));
-    fields.extend(optional("Provides", list_text(&facts.provides)));
-    fields.extend(optional("Depends On", list_text(&facts.depends)));
-    fields.extend(optional("Optional Deps", list_text(&facts.optional_deps)));
-    // 卸载安全就靠这两行：谁需要它
-    fields.extend(optional("Required By", list_text(&facts.required_by)));
-    fields.extend(optional("Optional For", list_text(&facts.optional_for)));
-    fields.extend(optional("Conflicts With", list_text(&facts.conflicts)));
-    fields.extend(optional("Replaces", list_text(&facts.replaces)));
     fields.extend(
         facts
             .download_size
-            .map(|size| ("Download Size".into(), size_text(size))),
+            .map(|size| ("下载大小".into(), size_text(size))),
     );
     fields.extend(
         facts
             .installed_size
-            .map(|size| ("Installed Size".into(), size_text(size))),
+            .map(|size| ("安装后大小".into(), size_text(size))),
     );
-    fields.extend(optional(
-        "Packager",
-        (!facts.packager.is_empty()).then(|| facts.packager.clone()),
-    ));
+    fields.extend((!facts.packager.is_empty()).then(|| ("打包者".into(), facts.packager.clone())));
     fields.extend(
         facts
             .build_date
-            .map(|stamp| ("Build Date".into(), super::format_epoch(stamp))),
+            .map(|stamp| ("编译日期".into(), super::format_epoch(stamp))),
     );
     fields.extend(
         facts
             .install_date
-            .map(|stamp| ("Install Date".into(), super::format_epoch(stamp))),
+            .map(|stamp| ("安装日期".into(), super::format_epoch(stamp))),
     );
+    fields.extend(facts.validation.clone().map(|text| ("验证者".into(), text)));
     fields.extend(
         facts
             .installed_version
             .clone()
-            .map(|version| ("Installed".into(), version)),
+            .map(|version| ("已装版本".into(), version)),
     );
     fields.extend(facts.explicit.map(|explicit| {
         (
-            "Install Reason".into(),
+            "安装原因".into(),
             String::from(if explicit {
-                "Explicitly installed"
+                "自己点名装的"
             } else {
-                "Installed as a dependency"
+                "被依赖拖进来的"
             }),
         )
     }));
-    fields.extend(facts.state.label().map(|label| ("Status".into(), label)));
+    fields.extend(facts.state.label().map(|label| ("状态".into(), label)));
 
     fields.retain(|(_, value)| !value.trim().is_empty());
     fields
@@ -591,6 +601,39 @@ impl Db {
         Ok(rows)
     }
 
+    /// 整个同步库里的包（按仓库优先级去重），给「一进来就有东西看」用。
+    ///
+    /// 这就是 `paru` 那个 `< 38869/38869` 的列表。代价是一次全库扫描：首次
+    /// 解析同步库 ~365ms，之后 ~30ms —— 都在常驻线程里，界面先显示「正在读…」。
+    pub fn all_packages(&self) -> Vec<PackageHit> {
+        let local = self.local_versions();
+        let mut claimed: HashSet<&str> = HashSet::new();
+        let mut hits = Vec::new();
+        for db in self.handle.syncdbs() {
+            for package in db.pkgs() {
+                if !claimed.insert(package.name()) {
+                    continue;
+                }
+                hits.push(PackageHit {
+                    repo: db.name().to_string(),
+                    name: package.name().to_string(),
+                    version: package.version().to_string(),
+                    description: package.desc().unwrap_or_default().to_string(),
+                    installed_state: state_for_versions(
+                        self.handle.localdb().pkg(package.name()).ok(),
+                        package.version(),
+                    ),
+                    votes: None,
+                    popularity: None,
+                    maintainer: None,
+                    out_of_date: false,
+                });
+                let _ = local;
+            }
+        }
+        hits
+    }
+
     /// 有多少个包可以更新 —— `checkupdates` 的替代品。
     ///
     /// `None` 表示**不知道**（数据库打不开），不是「0 个」。
@@ -690,6 +733,20 @@ fn sample(items: &BTreeSet<String>) -> String {
     )
 }
 
+/// 「验证者」那一行：pacman 自己也是这么写的（SHA-256 校验值 / 数字签名）。
+fn validation_text(package: &Package) -> Option<String> {
+    use ::alpm::PackageValidation;
+    let validation = package.validation();
+    let mut parts = Vec::new();
+    if validation.contains(PackageValidation::SHA256SUM) {
+        parts.push("SHA-256 校验值");
+    }
+    if validation.contains(PackageValidation::SIGNATURE) {
+        parts.push("数字签名");
+    }
+    (!parts.is_empty()).then(|| parts.join("  "))
+}
+
 /// 「仓库里这个版本」与「本地那个版本」的关系（没装就是 `NotInstalled`）。
 fn state_of(repo: &::alpm::Ver, installed: Option<&::alpm::Ver>) -> InstalledState {
     match installed {
@@ -771,6 +828,7 @@ fn facts_from(package: &Package, repo: &str, local: Option<&Package>, demand: &D
         installed_version,
         state,
         explicit: local.map(|package| package.reason() == PackageReason::Explicit),
+        validation: validation_text(package),
     }
 }
 
@@ -858,9 +916,10 @@ Include = /etc/pacman.d/mirrorlist
         }
     }
 
-    /// 空字段不该出现在面板上（否则满屏 `None`）。
+    /// 字段名照着 `paru -Si` 的中文输出排；该写「无」的写「无」，
+    /// 该省略的省略。
     #[test]
-    fn info_fields_skip_empty_values() {
+    fn info_fields_read_like_paru_si() {
         let fields = info_fields(&facts());
         let get = |key: &str| {
             fields
@@ -869,19 +928,22 @@ Include = /etc/pacman.d/mirrorlist
                 .map(|(_, value)| value.clone())
         };
 
-        assert_eq!(get("Repository").as_deref(), Some("extra"));
-        assert_eq!(get("Depends On").as_deref(), Some("glibc  bash"));
-        assert_eq!(get("Required By").as_deref(), Some("toolbox-hub"));
-        assert_eq!(get("Download Size").as_deref(), Some("1.98 MiB"));
-        assert_eq!(get("Installed Size").as_deref(), Some("5.48 MiB"));
-        assert_eq!(
-            get("Install Reason").as_deref(),
-            Some("Explicitly installed")
-        );
-        assert_eq!(get("Groups"), None, "没有的字段不该出现");
-        assert_eq!(get("Conflicts With"), None);
+        assert_eq!(get("软件库").as_deref(), Some("extra"));
+        assert_eq!(get("名字").as_deref(), Some("fzf"));
+        assert_eq!(get("依赖于").as_deref(), Some("glibc  bash"));
+        assert_eq!(get("被依赖").as_deref(), Some("toolbox-hub"));
+        assert_eq!(get("下载大小").as_deref(), Some("1.98 MiB"));
+        assert_eq!(get("安装后大小").as_deref(), Some("5.48 MiB"));
+        assert_eq!(get("安装原因").as_deref(), Some("自己点名装的"));
 
-        // 面板顺序：体积和「谁需要它」都要在，且不能出现空值
+        // 列表型字段空着也要写「无」：少一行会让人以为没查到
+        assert_eq!(get("组").as_deref(), Some("无"));
+        assert_eq!(get("与它冲突").as_deref(), Some("无"));
+        assert_eq!(get("取代").as_deref(), Some("无"));
+
+        // 可选依赖也照写「无」；「可选者」只在真有的时候才写
+        assert_eq!(get("可选依赖").as_deref(), Some("无"));
+        assert_eq!(get("可选者"), None);
         assert!(fields.iter().all(|(_, value)| !value.trim().is_empty()));
     }
 

@@ -636,6 +636,16 @@ impl App {
         } else {
             format!("{} · {} 个工具", current.label(), count)
         };
+
+        // 包管理域的「主界面」就是软件包中心：切进去直接打开它，
+        // 而不是先给一张 14 个 CLI 动作的列表（那正是「按 Enter 得到表单」的来源）。
+        // 想看动作列表就按 Esc —— 它就在中心底下。
+        if current == Domain::Packages && self.packages.is_none() {
+            self.open_packages();
+            self.message = String::from(
+                "软件包中心：打字过滤（全库）· Enter 上网搜 · Space 排队 · Esc 回动作列表",
+            );
+        }
     }
 
     /// 切换二级筛选。
@@ -1025,6 +1035,8 @@ impl App {
             view.message = format!("上次的队列还在：{} 个（Ctrl+I 也可导入）", queue.len());
             view.queue = queue;
         }
+        // 一进来就把全库铺上（paru 那种「一进就有 38869 个包」），别让人对着空屏发呆
+        view.ensure_all_packages();
         self.packages = Some(view);
     }
 
@@ -2563,6 +2575,7 @@ mod tests {
             requires: Vec::new(),
             missing_deps: Vec::new(),
             install_hint: None,
+            pin: None,
             action: None,
             mode: RunMode::Interactive,
             danger: Danger::Safe,

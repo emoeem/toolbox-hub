@@ -49,6 +49,7 @@ impl FftoolsProvider {
             missing_deps: deps.missing,
             install_hint: metadata::meta(head, name, "install"),
             // FFTools 的脚本自己会问参数，不需要工具箱代填。
+            pin: None,
             action: None,
             mode: mode_of(head, name),
             danger: danger_of(head, name),

@@ -12,6 +12,13 @@ pub enum RunMode {
     /// **捕获输出**：留在 TUI 里把 stdout/stderr 收下来，跑完进内置输出视图。
     /// 给「跑完吐一段文字」的工具用：jq、pandoc、ImageMagick、mediainfo…
     Capture,
+    /// **内置界面**：这一项不是一个命令，而是工具箱自己的界面。
+    /// `program` 里写界面名（现在只有 `package-center`）。
+    ///
+    /// 为什么要有它：包管理那些动作以前是「13 个 CLI 动作 + 一个藏在 p 键后面的
+    /// 界面」，于是在「包管理」域里按 Enter 得到的是**填参数表单**，而不是包管理
+    /// 界面。现在软件包中心本身就是这个域的第一项，按 Enter 直接进去。
+    Native,
 }
 
 impl RunMode {
@@ -20,6 +27,7 @@ impl RunMode {
         match raw.trim().to_lowercase().as_str() {
             "interactive" | "接管" => Some(RunMode::Interactive),
             "capture" | "捕获" => Some(RunMode::Capture),
+            "native" | "内置" | "界面" => Some(RunMode::Native),
             _ => None,
         }
     }
@@ -96,6 +104,11 @@ pub struct ToolDefinition {
     /// `None` 表示这件工具本身就是个可执行文件、直接跑就行；`Some` 表示要先进表单，
     /// 由 [`Action::build_argv`] 生成 argv。
     pub action: Option<Action>,
+    /// 在所属域里置顶（数字越小越靠前）。
+    ///
+    /// 为什么需要它：域内是按**名字**排的，稳定但不管语义 —— 一个域里最该先看到的
+    /// 那一项，不该因为名字的 Unicode 码位靠后就沉到底部。
+    pub pin: Option<i32>,
     /// 跑它的时候 TUI 怎么办（见 [`RunMode`]）。
     pub mode: RunMode,
     /// 危险程度（见 [`Danger`]）。
@@ -229,6 +242,7 @@ mod tests {
             requires: Vec::new(),
             missing_deps: Vec::new(),
             install_hint: None,
+            pin: None,
             action: None,
             mode: RunMode::Interactive,
             danger: Danger::Safe,

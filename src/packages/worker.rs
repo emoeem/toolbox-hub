@@ -40,6 +40,8 @@ use super::{
 /// 发给数据库线程的请求。
 pub enum DbRequest {
     Search(String),
+    /// 整个同步库（paru 那个「一进来就有 38869 个包」的列表）。
+    AllPackages,
     Info(String),
     Installed,
     /// 可更新数 + 同步库有多旧（一起问，省一次往返）。
@@ -65,6 +67,8 @@ pub enum NetRequest {
 pub enum Response {
     /// 官方源搜索结果。
     Official(Vec<PackageHit>),
+    /// 全部包（浏览模式）。
+    AllPackages(Vec<PackageHit>),
     /// AUR 搜索结果。
     Aur(Vec<PackageHit>),
     /// 某一路失败了（`source` 是「官方源」或「AUR」）。
@@ -133,6 +137,11 @@ impl Worker {
 
     fn net(&self, request: NetRequest) {
         let _ = self.net_tx.send(request);
+    }
+
+    /// 拉全部包（进界面时先把这个铺上，别让用户对着空屏发呆）。
+    pub fn all_packages(&self) {
+        self.db(DbRequest::AllPackages);
     }
 
     /// 搜两路：官方源走数据库线程，AUR 走网络线程，谁先回来谁先上屏。
@@ -236,6 +245,7 @@ fn spawn_db(
                             error: Some(error),
                         },
                     }),
+                    DbRequest::AllPackages => Response::AllPackages(db.all_packages()),
                     DbRequest::Installed => {
                         if let Ok(mut shared) = local.write() {
                             *shared = db.local_versions().clone();
@@ -333,7 +343,7 @@ fn file_integrity_output() -> Vec<String> {
 /// 数据库打不开时，把错误翻译成「这次请求该回什么」。
 fn failed_for(request: &DbRequest, error: &str) -> Response {
     match request {
-        DbRequest::Search(_) => Response::Failed {
+        DbRequest::AllPackages | DbRequest::Search(_) => Response::Failed {
             source: "官方源",
             error: error.to_string(),
         },
@@ -389,6 +399,7 @@ mod tests {
     fn describe(response: &Response) -> &'static str {
         match response {
             Response::Official(_) => "官方源结果",
+            Response::AllPackages(_) => "全部包",
             Response::Aur(_) => "AUR 结果",
             Response::Failed { .. } => "失败",
             Response::Info(_) => "包信息",

@@ -92,6 +92,7 @@ impl ScriptedProvider {
             missing_deps: deps.missing,
             install_hint: metadata::meta(head, name, "install"),
             // 注解脚本自己负责交互，不经过参数表单。
+            pin: None,
             action: None,
             mode: mode_of(head, name),
             danger: danger_of(head, name),
