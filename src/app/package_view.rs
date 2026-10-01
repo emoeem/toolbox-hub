@@ -32,6 +32,8 @@ struct NewsOutcome {
     /// 最后一次全系统升级的时间点（给列表打「★ 升级后发布」用的）。
     mark: Option<u64>,
     pending_updates: Option<usize>,
+    /// 本地同步库多久没同步了（秒）——「待更新」是按它算的，旧了要说明。
+    sync_age: Option<u64>,
     error: Option<String>,
 }
 
@@ -169,8 +171,10 @@ pub struct PackageView {
     pub news_after_upgrade: Option<usize>,
     /// 那次升级的时间点；列表拿它给单条打 `★`。
     pub news_mark: Option<u64>,
-    /// 有多少个包可以更新（`checkupdates`）。
+    /// 有多少个包可以更新（libalpm 按本地同步库算）。
     pub pending_updates: Option<usize>,
+    /// 同步库有多旧（秒）；超过一天就会在「待更新」旁边标出来。
+    pub sync_age: Option<u64>,
 
     // ── 包信息 ──
     pub info: Option<(String, Vec<(String, String)>)>,
@@ -196,7 +200,7 @@ pub struct PackageView {
     news_rx: Option<Receiver<NewsOutcome>>,
     installed_rx: Option<Receiver<Result<Vec<InstalledPackage>, String>>>,
     orphans_rx: Option<Receiver<Vec<String>>>,
-    removal_rx: Option<Receiver<Vec<String>>>,
+    confirm_rx: Option<Receiver<Vec<String>>>,
 }
 
 impl PackageView {
@@ -232,6 +236,7 @@ impl PackageView {
             news_after_upgrade: None,
             news_mark: None,
             pending_updates: None,
+            sync_age: None,
             info: None,
             info_error: None,
             info_pending: None,
@@ -246,7 +251,7 @@ impl PackageView {
             news_rx: None,
             installed_rx: None,
             orphans_rx: None,
-            removal_rx: None,
+            confirm_rx: None,
         };
         view.read_news = packages::load_read_news(&packages::read_news_path());
         view
@@ -363,6 +368,7 @@ impl PackageView {
             .name(String::from("pkg-news"))
             .spawn(move || {
                 let pending_updates = probe::pending_updates();
+                let sync_age = probe::sync_db_age().map(|age| age.as_secs());
                 let mark = probe::last_upgrade();
                 let outcome = match probe::news() {
                     Ok(items) => NewsOutcome {
@@ -370,6 +376,7 @@ impl PackageView {
                         items,
                         mark,
                         pending_updates,
+                        sync_age,
                         error: None,
                     },
                     Err(error) => NewsOutcome {
@@ -377,6 +384,7 @@ impl PackageView {
                         after_upgrade: 0,
                         mark,
                         pending_updates,
+                        sync_age,
                         error: Some(error),
                     },
                 };
@@ -395,7 +403,7 @@ impl PackageView {
         self.poll_news();
         self.poll_installed();
         self.poll_orphans();
-        self.poll_removal();
+        self.poll_confirm_notes();
         self.follow_selection();
     }
 
@@ -460,6 +468,7 @@ impl PackageView {
             Ok(outcome) => {
                 self.news_rx = None;
                 self.pending_updates = outcome.pending_updates;
+                self.sync_age = outcome.sync_age;
                 if let Some(error) = outcome.error {
                     self.message = format!("抓新闻失败：{error}");
                     return;
@@ -548,18 +557,20 @@ impl PackageView {
         }
     }
 
-    fn poll_removal(&mut self) {
-        let Some(rx) = &self.removal_rx else {
+    /// 收确认面板的补充信息（谁依赖它们 / 要下载多少 / 有几个能更新）。
+    ///
+    /// 这些都要读 pacman 数据库：libalpm 只要几十毫秒，但界面一帧都不该等 ——
+    /// 面板先弹出来，分析结果到了再补一行。
+    fn poll_confirm_notes(&mut self) {
+        let Some(rx) = &self.confirm_rx else {
             return;
         };
         match rx.try_recv() {
             Ok(notes) => {
-                self.removal_rx = None;
+                self.confirm_rx = None;
                 if let Some(confirm) = self.confirm.as_mut() {
                     confirm.pending = false;
-                    for note in notes {
-                        confirm.notes.push(note);
-                    }
+                    confirm.notes.extend(notes);
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -567,8 +578,26 @@ impl PackageView {
                 if let Some(confirm) = self.confirm.as_mut() {
                     confirm.pending = false;
                 }
-                self.removal_rx = None;
+                self.confirm_rx = None;
             }
+        }
+    }
+
+    /// 起一个后台线程算确认面板的补充信息。
+    fn spawn_confirm_notes<F>(&mut self, job: F)
+    where
+        F: FnOnce() -> Vec<String> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name(String::from("pkg-preflight"))
+            .spawn(move || {
+                let _ = tx.send(job());
+            });
+        if spawned.is_ok() {
+            self.confirm_rx = Some(rx);
+        } else if let Some(confirm) = self.confirm.as_mut() {
+            confirm.pending = false;
         }
     }
 
@@ -615,7 +644,19 @@ impl PackageView {
             .spawn(move || {
                 let outcome = match target {
                     Target::Repo(hit) => probe::info(&hit),
-                    Target::Local(name) => probe::local_info(&name),
+                    // 本地包的「仓库」是 local：probe::info 对非 AUR 一律走 libalpm，
+                    // 同步库里没有就自动落到本地库（外来包也能看信息）。
+                    Target::Local(name) => probe::info(&super::packages::PackageHit {
+                        repo: String::from("local"),
+                        name,
+                        version: String::new(),
+                        description: String::new(),
+                        installed_state: super::packages::InstalledState::NotInstalled,
+                        votes: None,
+                        popularity: None,
+                        maintainer: None,
+                        out_of_date: false,
+                    }),
                 };
                 let _ = tx.send(outcome);
             });
@@ -1177,30 +1218,26 @@ impl PackageView {
                 "{aur} 个 AUR 包会现场编译（要等一会儿；编译完的包留在 pacman 缓存里）"
             ));
         }
-        if self.operation == PackageOperation::Remove {
-            notes.push(String::from("正在查谁依赖它们…"));
-        }
-
+        let operation = self.operation;
         self.confirm = Some(Confirm {
             title: format!("{} {} 个包", self.operation.label(), names.len()),
             command: packages::command_preview(&program, &argv),
             notes,
-            action: ConfirmAction::Queue(self.operation),
-            pending: self.operation == PackageOperation::Remove,
+            action: ConfirmAction::Queue(operation),
+            // 补充信息（体积 / 谁依赖它们）马上在后台算，面板先出来
+            pending: true,
         });
 
-        // 卸载的影响分析放后台：`pacman -Qi` 一个包一次进程，队列长了会卡帧。
-        if self.operation == PackageOperation::Remove {
-            let (tx, rx) = mpsc::channel();
-            let spawned = thread::Builder::new()
-                .name(String::from("pkg-removal"))
-                .spawn(move || {
-                    let _ = tx.send(probe::removal_report(&names));
-                });
-            if spawned.is_ok() {
-                self.removal_rx = Some(rx);
-            }
-        }
+        self.spawn_confirm_notes(move || match operation {
+            PackageOperation::Remove => probe::removal_report(&names),
+            _ => match probe::download_total(&names) {
+                Some(bytes) => vec![format!(
+                    "要下载 {}（AUR 包的体积要等编译时才知道）",
+                    packages::libalpm::size_text(bytes)
+                )],
+                None => Vec::new(),
+            },
+        });
     }
 
     /// 系统更新的确认面板。
@@ -1215,7 +1252,13 @@ impl PackageView {
                 String::from("改的是整个系统，升完最好看一眼 Arch 新闻"),
             ],
             action: ConfirmAction::Upgrade,
-            pending: false,
+            pending: true,
+        });
+
+        // 实时数一遍（libalpm 约 20ms，放后台只是不想让面板晚一帧出现）
+        self.spawn_confirm_notes(|| match probe::pending_updates() {
+            Some(count) => vec![format!("现在有 {count} 个包可以更新")],
+            None => vec![String::from("查不出可更新数（数据库读不到）")],
         });
     }
 
@@ -1321,6 +1364,15 @@ impl PackageView {
         let _ = packages::save_read_news(&packages::read_news_path(), &self.read_news);
         self.message = format!("{count} 条标记为已读");
         self.rebuild_news();
+    }
+
+    /// 同步库的一句话（超过一天才值得说）。
+    pub fn sync_age_note(&self) -> Option<String> {
+        let seconds = self.sync_age?;
+        (seconds > 24 * 3600).then(|| {
+            let days = seconds / 86_400;
+            format!("库 {days} 天没同步")
+        })
     }
 
     /// 未读条数（状态行用）。
@@ -1449,8 +1501,7 @@ mod tests {
             name: name.to_string(),
             version: String::from("1.0-1"),
             description: format!("{name} 的说明"),
-            installed: false,
-            installed_version: None,
+            installed_state: crate::packages::InstalledState::NotInstalled,
             votes,
             popularity: None,
             maintainer: None,
@@ -1653,7 +1704,7 @@ mod tests {
             "{}",
             confirm.command
         );
-        assert!(!confirm.pending, "安装不需要查被依赖");
+        assert!(confirm.pending, "体积要现算，面板先出来（后台线程补一行）");
         assert_eq!(
             confirm.action,
             ConfirmAction::Queue(PackageOperation::Install)

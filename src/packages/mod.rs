@@ -7,12 +7,13 @@
 //!
 //! | 数据 | 来源 | 为什么 |
 //! | --- | --- | --- |
-//! | 官方源搜索 / 信息 | `pacman -Ss` / `pacman -Sii` | 没人会重写 libalpm；一律用 `LC_ALL=C` 跑，免得被本地化标记（`[已安装]`）影响解析 |
+//! | 官方源搜索 / 信息 / 已安装 / 可更新 | **libalpm 直连**（[`libalpm`]） | 结构化数据、pacman 自己的 vercmp、比起进程快 1~3 个数量级（实测表见 [`libalpm`] 开头） |
 //! | AUR 搜索 / 信息 | AUR 官方 RPC（`curl` + JSON） | 比解析 `paru -Ss` 的文本强得多：得票、热度、维护者、是否过期、依赖都有 |
 //! | 已安装集合 | `pacman -Qq` 一次拿全 | 搜索结果里标 `[已安装]`，AUR 的命中也要能标，逐个查太慢 |
 //! | PKGBUILD | `paru -Gp` | 官方没有第二条路 |
 //! | Arch 新闻 | `archlinux.org/feeds/news/` | 用来提醒「有没读过的新闻」，pacsea 的 Arch Status 就是这个意思 |
 
+pub mod libalpm;
 pub mod probe;
 
 use std::{
@@ -20,6 +21,49 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+
+/// 本地已装版本与「正在看的这个版本」的关系。
+///
+/// 为什么不只是一个 `installed: bool` 加字符串比较：pacman 的版本序有 epoch、
+/// pkgrel、字母数字段一堆特例，字符串比会把**方向**搞反 —— 实拍过：
+/// `cachyos-extra-v3/fzf 0.74.4-1.1` 已装时，`extra/fzf 0.74.4-1` 被标成
+/// 「↑ 已装 0.74.4-1.1」，看着像有更新，其实本地那个更新。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum InstalledState {
+    #[default]
+    NotInstalled,
+    /// 装的就是这个版本。
+    Same,
+    /// 本地是旧版本，仓库里有新的 → 可以升级。
+    Older(String),
+    /// 本地版本更新（第三方仓库常常比官方源新）→ 别乱降级。
+    Newer(String),
+}
+
+impl InstalledState {
+    /// 由 pacman 的 vercmp 结果得出（比较交给 libalpm，别自己写）。
+    pub fn from_ordering(ordering: std::cmp::Ordering, installed: String) -> Self {
+        match ordering {
+            std::cmp::Ordering::Equal => Self::Same,
+            std::cmp::Ordering::Greater => Self::Older(installed),
+            std::cmp::Ordering::Less => Self::Newer(installed),
+        }
+    }
+
+    pub fn is_installed(&self) -> bool {
+        !matches!(self, Self::NotInstalled)
+    }
+
+    /// 结果表里那一列标记（`None` = 没什么好说的）。
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::NotInstalled => None,
+            Self::Same => Some(String::from("✓ 已安装")),
+            Self::Older(version) => Some(format!("↑ 可升级（已装 {version}）")),
+            Self::Newer(version) => Some(format!("✓ 已装更新版 {version}")),
+        }
+    }
+}
 
 /// 一条搜索结果（官方源与 AUR 合并成同一种结构）。
 #[derive(Clone, Debug, PartialEq)]
@@ -29,10 +73,8 @@ pub struct PackageHit {
     pub name: String,
     pub version: String,
     pub description: String,
-    /// 本地已安装（或已安装但版本不同）。
-    pub installed: bool,
-    /// 已安装的版本（来自 `pacman -Ss` 的标记；AUR 只知道自己装没装）。
-    pub installed_version: Option<String>,
+    /// 本地装的那个与这个的关系（含「没装」）。
+    pub installed_state: InstalledState,
     /// AUR 得票（官方源没有）。
     pub votes: Option<u64>,
     /// AUR 热度（官方源没有）。
@@ -47,18 +89,16 @@ impl PackageHit {
         self.repo == "aur"
     }
 
+    pub fn is_installed(&self) -> bool {
+        self.installed_state.is_installed()
+    }
+
     /// 结果表里那一列标记。
     pub fn status_label(&self) -> String {
         if self.out_of_date {
             return String::from("! 已过期");
         }
-        if !self.installed {
-            return String::new();
-        }
-        match &self.installed_version {
-            Some(version) if version != &self.version => format!("↑ 已装 {version}"),
-            _ => String::from("✓ 已安装"),
-        }
+        self.installed_state.label().unwrap_or_default()
     }
 }
 
@@ -126,124 +166,6 @@ impl SortMode {
             SortMode::Version => "版本",
         }
     }
-}
-
-/// 解析 `LC_ALL=C pacman -Ss <词>` 的输出。
-///
-/// 格式（两行一组）：
-///
-/// ```text
-/// extra/fzf 0.74.4-1 [installed]
-///     Command-line fuzzy finder
-/// ```
-///
-/// 方括号里可能是 `installed` 或 `installed: 1.2.3-1`（版本不同）。
-pub fn parse_official_search(text: &str) -> Vec<PackageHit> {
-    let mut hits = Vec::new();
-    let mut lines = text.lines().peekable();
-
-    while let Some(line) = lines.next() {
-        if line.starts_with(' ') || line.trim().is_empty() {
-            continue;
-        }
-        let Some((repo_name, rest)) = line.split_once(' ') else {
-            continue;
-        };
-        let Some((repo, name)) = repo_name.split_once('/') else {
-            continue;
-        };
-
-        // 版本之后如果还有内容，就是「已安装」的标记。
-        let mut parts = rest.splitn(2, ' ');
-        let version = parts.next().unwrap_or_default().to_string();
-        let marker = parts.next().unwrap_or_default().trim();
-        let installed = marker.starts_with('[');
-        let installed_version = (installed && marker.contains(':'))
-            .then(|| {
-                marker
-                    .trim_start_matches('[')
-                    .split_once(':')
-                    .map(|(_, version)| version.trim().trim_end_matches(']').to_string())
-            })
-            .flatten();
-
-        // 描述是紧随其后的缩进行（可能有多行，接起来）。
-        let mut description = String::new();
-        while let Some(next) = lines.peek() {
-            if !next.starts_with(' ') {
-                break;
-            }
-            let next = lines.next().unwrap_or_default().trim();
-            if !description.is_empty() {
-                description.push(' ');
-            }
-            description.push_str(next);
-        }
-
-        hits.push(PackageHit {
-            repo: repo.to_string(),
-            name: name.to_string(),
-            version,
-            description,
-            installed,
-            installed_version,
-            votes: None,
-            popularity: None,
-            maintainer: None,
-            out_of_date: false,
-        });
-    }
-
-    hits
-}
-
-/// 解析 `pacman -Qq`（一行一个已安装包名）。
-pub fn parse_installed(text: &str) -> BTreeSet<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// 解析 `pacman -Sii` / `paru -Sii` 那种 `Key : Value` 输出。
-///
-/// 关键细节：**长值会折行**，续行以空格开头 —— 要并回上一个字段，
-/// 否则「Required By」这种长列表会被截断（实拍确认过）。
-pub fn parse_info(text: &str) -> Vec<(String, String)> {
-    let mut fields: Vec<(String, String)> = Vec::new();
-
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        // pacman 的对齐会产生多个空格（`Repository      : x`），所以**不能**拿
-        // 空格数判断是不是续行；真信号是：续行以空白开头（贴在上一行下面）。
-        let is_continuation = line.starts_with(' ') || line.starts_with('\t');
-        let split = line.split_once(" : ").or_else(|| line.split_once(':'));
-        let (key, value) = match split {
-            Some((key, value)) if !is_continuation && !key.trim().is_empty() => {
-                (key.trim().to_string(), value.trim().to_string())
-            }
-            _ => {
-                // 续行：接到上一个字段后面
-                if let Some(last) = fields.last_mut() {
-                    if !last.1.is_empty() {
-                        last.1.push(' ');
-                    }
-                    last.1.push_str(line.trim());
-                }
-                continue;
-            }
-        };
-
-        let value = value.trim().to_string();
-        // 工具箱关心的字段排前面，其余按原顺序跟着（pacsea 的信息面板也是这个思路）。
-        fields.push((key, value));
-    }
-
-    fields
 }
 
 // ── AUR ─────────────────────────────────────────────────────────────────────
@@ -336,8 +258,8 @@ fn aur_hit(package: AurPackage) -> PackageHit {
         name: package.name,
         version: package.version,
         description: package.description.unwrap_or_default(),
-        installed: false, // 由调用方拿 `pacman -Qq` 标上
-        installed_version: None,
+        // AUR 的回答里没有「本地装没装」，由调用方查本地库补上
+        installed_state: InstalledState::NotInstalled,
         votes: Some(package.num_votes),
         popularity: Some(package.popularity),
         maintainer: package.maintainer,
@@ -772,59 +694,6 @@ impl InstalledFilter {
     }
 }
 
-/// `pacman -Q` 那种 `名字 版本`（一行一条）。
-pub fn parse_installed_versions(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            match line.rsplit_once(' ') {
-                Some((name, version)) => Some((name.to_string(), version.to_string())),
-                // 只有名字（理论上不会有，但别把整行吃掉）
-                None => Some((line.to_string(), String::new())),
-            }
-        })
-        .collect()
-}
-
-/// 把 `pacman -Q` / `-Qe` / `-Qm` / `-Qtd` 四次查询拼成浏览器要的数据。
-///
-/// 纯函数：查是 [`probe`] 的事，这里只做集合运算，好在测试里钉住。
-pub fn parse_installed_packages(
-    versions: &str,
-    explicit: &str,
-    foreign: &str,
-    orphans: &str,
-) -> Vec<InstalledPackage> {
-    // `-Qe` / `-Qm` / `-Qtd` 的输出是 `名字 版本`，不是纯名字（`-Qeq` 才是纯名字，
-    // 但那样要多跑一次进程）。统一取每行第一个字段 —— 实拍踩过：拿整行去和 `-Q`
-    // 的名字比对，结果是「显式 0 个、外来 0 个」，整张表全被标成「依赖」。
-    let names = |text: &str| -> BTreeSet<String> {
-        parse_installed_versions(text)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect()
-    };
-    let explicit_set = names(explicit);
-    let foreign_set = names(foreign);
-    let orphan_set = names(orphans);
-
-    let mut packages: Vec<InstalledPackage> = parse_installed_versions(versions)
-        .into_iter()
-        .map(|(name, version)| InstalledPackage {
-            explicit: explicit_set.contains(&name),
-            foreign: foreign_set.contains(&name),
-            orphan: orphan_set.contains(&name),
-            name,
-            version,
-        })
-        .collect();
-    packages.sort_by(|a, b| a.name.cmp(&b.name));
-    packages
-}
-
 // ── 搜索历史 ─────────────────────────────────────────────────────────────────
 
 /// 搜索历史最多记多少条。
@@ -1138,29 +1007,6 @@ pub fn searches_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// 真实 `LC_ALL=C pacman -Ss ^fzf$` 的输出（含「已装但版本不同」那种标记）。
-    const OFFICIAL_SEARCH: &str = "\
-cachyos-extra-v3/fzf 0.74.4-1.1 [installed]
-    Command-line fuzzy finder
-extra/fzf 0.74.4-1 [installed: 0.74.4-1.1]
-    Command-line fuzzy finder
-community/fzf-tmux 0.74.4-1
-    A tmux wrapper for fzf
-";
-
-    /// 真实 `pacman -Sii bash | head -22` 的形状（含折行的长值）。
-    const INFO: &str = "\
-Repository      : cachyos-v3
-Name            : bash
-Version         : 5.3.20-2
-Description     : The GNU Bourne Again shell
-Depends On      : readline  libreadline.so=8-64  glibc  ncurses
-Required By     : 4ti2  7zip  7zip-zstd  9base  abcde
-                  aconfmgr-git  acpid  adljack
-Optional For    : a2jmidid  alsa-oss
-Download Size   : 2030.16 KiB
-";
-
     /// 真实 AUR RPC 回复（裁到两个结果，字段一个不少）。
     const AUR_SEARCH: &str = r#"{"resultcount":1,"results":[{"Description":"Fast TUI for searching","FirstSubmitted":1759428378,"ID":2171380,"LastModified":1784573962,"Maintainer":"Firstpick","Name":"pacsea-bin","NumVotes":5,"OutOfDate":null,"PackageBase":"pacsea-bin","PackageBaseID":223019,"Popularity":0.093482,"URL":"https://github.com/Firstp1ck/Pacsea","URLPath":"/cgit/aur.git/snapshot/pacsea-bin.tar.gz","Version":"0.8.2-2"}]}"#;
 
@@ -1190,68 +1036,6 @@ Download Size   : 2030.16 KiB
         assert_eq!(PackageOperation::Remove.label(), "卸载");
         assert_eq!(PackageOperation::Install.next(), PackageOperation::Remove);
         assert_eq!(PackageOperation::Download.next(), PackageOperation::Install);
-    }
-
-    #[test]
-    fn official_search_parses_repo_name_version_and_installed_marker() {
-        let hits = parse_official_search(OFFICIAL_SEARCH);
-        assert_eq!(hits.len(), 3);
-
-        assert_eq!(hits[0].repo, "cachyos-extra-v3");
-        assert_eq!(hits[0].name, "fzf");
-        assert_eq!(hits[0].version, "0.74.4-1.1");
-        assert!(hits[0].installed);
-        assert_eq!(hits[0].installed_version, None, "单纯 installed 没有版本");
-        assert_eq!(hits[0].description, "Command-line fuzzy finder");
-
-        assert_eq!(
-            hits[1].installed_version.as_deref(),
-            Some("0.74.4-1.1"),
-            "已装但版本不同要能读出来"
-        );
-        assert_eq!(hits[1].status_label(), "↑ 已装 0.74.4-1.1");
-
-        assert!(!hits[2].installed, "没有标记就是没装");
-        assert_eq!(hits[2].status_label(), "");
-    }
-
-    #[test]
-    fn official_search_ignores_blank_and_continuation_lines_at_the_top() {
-        let hits =
-            parse_official_search("\n   stray continuation\n\ncore/zsh 5.9-1\n    The Z shell\n");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].name, "zsh");
-    }
-
-    #[test]
-    fn info_fields_join_wrapped_lines() {
-        let fields = parse_info(INFO);
-        let get = |key: &str| {
-            fields
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value.clone())
-                .unwrap_or_default()
-        };
-
-        assert_eq!(get("Repository"), "cachyos-v3");
-        assert_eq!(get("Name"), "bash");
-        assert_eq!(
-            get("Required By"),
-            "4ti2  7zip  7zip-zstd  9base  abcde aconfmgr-git  acpid  adljack",
-            "折行的值必须接起来，否则长列表会被截断"
-        );
-        assert_eq!(
-            get("Depends On"),
-            "readline  libreadline.so=8-64  glibc  ncurses"
-        );
-    }
-
-    #[test]
-    fn installed_set_is_one_name_per_line() {
-        let set = parse_installed("7zip\na52dec\n\n  aalib  \n");
-        assert_eq!(set.len(), 3);
-        assert!(set.contains("aalib"));
     }
 
     #[test]
@@ -1480,51 +1264,6 @@ Download Size   : 2030.16 KiB
         let (program, argv) = orphan_remove_command(&[String::from("a"), String::from("b")]);
         assert_eq!(program, "pacman");
         assert_eq!(argv, vec!["-Rns", "a", "b"]);
-    }
-
-    /// 已安装包浏览器：四张名单拼成 显式/依赖/外来/孤儿。
-    #[test]
-    fn installed_browser_joins_the_four_lists() {
-        let packages = parse_installed_packages(
-            "bash 5.3-1\nreadline 8.2-1\naur-thing 1.0-1\nstale-lib 0.1-1\n",
-            // 四个输入都按 pacman 真实输出的形状写：`-Qe/-Qm/-Qtd` 也是 `名字 版本`
-            "bash 5.3-1\naur-thing 1.0-1\nstale-lib 0.1-1\n",
-            "aur-thing 1.0-1\n",
-            "stale-lib 0.1-1\n",
-        );
-
-        assert_eq!(packages.len(), 4);
-        let get = |name: &str| {
-            packages
-                .iter()
-                .find(|package| package.name == name)
-                .expect("有这个包")
-        };
-        assert_eq!(get("bash").tag(), "显式");
-        assert_eq!(get("readline").tag(), "依赖");
-        assert_eq!(get("aur-thing").tag(), "外来");
-        assert_eq!(get("stale-lib").tag(), "孤儿");
-        assert_eq!(get("readline").version, "8.2-1");
-
-        // 筛选：孤儿不算进「显式」—— 那正是你想清掉的那堆
-        assert_eq!(
-            packages
-                .iter()
-                .filter(|package| InstalledFilter::Explicit.matches(package))
-                .count(),
-            2
-        );
-        assert_eq!(
-            packages
-                .iter()
-                .filter(|package| InstalledFilter::Dependency.matches(package))
-                .count(),
-            1
-        );
-        assert!(
-            InstalledFilter::Orphan.matches(get("stale-lib")),
-            "孤儿筛选要认得出来"
-        );
     }
 
     /// 已读新闻：落盘再读回来要一模一样。

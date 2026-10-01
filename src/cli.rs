@@ -310,8 +310,11 @@ fn package_op(operation: PackageOperation, names: &[String], dry_run: bool) -> R
 }
 
 /// 这个名字是不是只有 AUR 有（不在官方源里）。
+///
+/// 查的是 libalpm（本地数据库），不起 `pacman -Ss` 进程 —— 这也是「装的时候用
+/// pacman 还是 paru」的判断依据。
 fn is_aur_only(name: &str) -> bool {
-    probe::official_search(name)
+    packages::libalpm::search(name)
         .map(|hits| !hits.iter().any(|hit| hit.name == name))
         .unwrap_or(false)
 }

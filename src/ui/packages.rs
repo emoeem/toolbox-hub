@@ -178,6 +178,15 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
                 theme::GREEN
             }),
         ));
+        // 「待更新」是按本地同步库算的（和 `pacman -Qu` 同一口径），库旧了这个数就
+        // 偏小 —— `checkupdates` 之所以更准，是因为它每次都重新下载数据库（18 秒），
+        // 那个代价不值得付。库旧了就说出来，别给一个看着很确定的数字。
+        if let Some(note) = view.sync_age_note() {
+            spans.push(Span::styled(
+                format!("（{note}）"),
+                Style::default().fg(theme::FAINT),
+            ));
+        }
     }
     if let Some(unread) = view.news_unread().filter(|count| *count > 0) {
         spans.push(Span::styled(
