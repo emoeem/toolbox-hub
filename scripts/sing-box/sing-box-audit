@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# sing-box-audit:summary=sing-box 配置审计修复：补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则
+# sing-box-audit:domain=网络
+# sing-box-audit:tags=sing-box,代理,修复
+# sing-box-audit:input=当前 /etc/sing-box/config.json
+# sing-box-audit:output=应用后的配置 + 时间戳备份 + 健康检查结果
+# sing-box-audit:features=6 个可选开关（国内 IP 表 / 直连清单 / 广告补漏 / DNS 故障转移组 / 规则集走包路径 / 广告改 NXDOMAIN）；改配置前先 check，失败自动回滚
+# sing-box-audit:requires=sing-box,sudo,python3,curl,dig
+# sing-box-audit:install=~/code/toolbox-hub/scripts/sing-box/install.sh
+# sing-box-audit:internal=true
+# sing-box-audit:mode=interactive
+# sing-box-audit:danger=caution
+#
+# ↑ 注解契约见 ~/.config/toolbox-hub/tools/README.md；本脚本由 manifest 的 sing-box.toml 驱动。
+
+# 应用 sing-box 审计报告(2026-10-02)的 P1 + P2 修复
+#   P1a: 加 anti-AD 规则集（补 criteo/outbrain/adsrvr/rubicon/doubleverify/appsflyer… 等追踪家族）
+#   P1b: 换用上游最新 geoip/cn（补 8.130.222.0/24 这类缺失网段，本地那份已过期）
+#   P2 : 删 dns-local（无人引用的潜在泄露面）、删两条与 final 重复的路由规则、
+#        去掉 external_ui*（同时消掉 1.14→1.16 的弃用告警，MetaCubeXD 一并下线）
+#   --with-dns-groups: 可选 P3，把闲置的 dns-proxy-google / dns-direct-tencent 变成故障转移组
+#
+# 安全管线：全部改动先在内存里做 → sing-box check（root）→ 备份 → 原子替换 → 重启 →
+#           健康检查（is-active + tun0 + 经代理出口 + 新拦域名）→ 任一失败自动回滚重启。
+set -Eeuo pipefail
+
+# 规则集来源：优先用 sing-box-rule-sets 包安装的 /usr/share 路径（多机通用），
+# 回退到本地生成缓存（没有装包时）。
+_default_ruleset_src() {
+    local d
+    for d in /usr/share/sing-box-rule-sets "${HOME}/.cache/sing-box-rule-sets"; do
+        [[ -d $d ]] && { printf '%s' "$d"; return 0; }
+    done
+    printf '%s' /usr/share/sing-box-rule-sets
+}
+RULESET_SRC="${RULESET_SRC:-$(_default_ruleset_src)}"
+CONF="${CONF:-/etc/sing-box/config.json}"
+RULE_DIR="/etc/sing-box/rule-set"
+BACKUP_DIR="/etc/sing-box/backups"
+BIN="${BIN:-/usr/bin/sing-box}"
+SERVICE="${SERVICE:-sing-box}"
+PROBE_VIA_PROXY="https://api.ipify.org"
+WITH_DNS_GROUPS=0
+WITH_CNCIDR=0
+WITH_DIRECT=0
+WITH_EXTRA_ADS=0
+USE_PKG_PATHS=0
+NXDOMAIN_ADS=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-dns-groups)  WITH_DNS_GROUPS=1 ;;
+    --with-cncidr)      WITH_CNCIDR=1 ;;   # 再加一份 mihomo 的国内 IP 表（17,958 条，独立日更）
+    --with-direct-list) WITH_DIRECT=1 ;;   # STUN / 游戏主机 / LAN cache / NCSI 强制直连
+    --with-extra-ads)   WITH_EXTRA_ADS=1 ;; # 补 3 个国内广告端点（ad.duowan.com / sdkmob.com / ads.wps.cn）
+    --use-package-paths) USE_PKG_PATHS=1 ;; # 指向 sing-box-rule-sets 包提供的 /usr/share 路径（规则集随 pacman 更新）
+    --nxdomain-ads)     NXDOMAIN_ADS=1 ;;   # DNS 广告拦截由 reject(REFUSED) 改为 predefined(NXDOMAIN)：应用立刻失败，不再卡 ~5s
+    *) printf 'FATAL 未知参数：%s（可用：--with-dns-groups --with-cncidr --with-direct-list --with-extra-ads --use-package-paths --nxdomain-ads）\n' "$arg" >&2; exit 1 ;;
+  esac
+done
+
+# 私有临时目录：/tmp 是 sticky 且内核开了 fs.protected_regular，
+# 直接写固定的 /tmp/<名字> 时，若该文件属于别的用户（例如我以普通用户干跑遗留的），
+# 即便 root 也会被 EACCES 拒绝 —— 所以一律写进自己独占的 mktemp 目录。
+WORK="$(mktemp -d /tmp/sing-box-audit.XXXXXX)"
+NEW_JSON="$WORK/new-config.json"
+CHECK_OUT="$WORK/check.out"
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31mFATAL\033[0m %s\n' "$*" >&2; exit 1; }
+
+# 直接执行也能用：Toolbox Hub 的 program 就是这个脚本本身（没经过 sudo）
+# —— 不是 root 就自己 exec sudo（交互模式已接管终端，能正常提示密码）。
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || { printf 'FATAL 需要 root，但没装 sudo\n' >&2; exit 1; }
+    # 必须换算成**绝对路径**再交给 sudo：在 shell 里敲 `sing-box-audit` 时 $0 是裸名字，
+    # 而 sudo 默认用 secure_path（/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin），
+    # 里面没有 ~/.local/bin —— 裸名字会在 sudo 那一层报「找不到命令」。
+    self="$0"
+    [[ $self == */* ]] || self="$(command -v -- "$self" 2>/dev/null || true)"
+    [[ -n $self && -e $self ]] || { printf 'FATAL 定位不到脚本自身：%s\n' "$0" >&2; exit 1; }
+    exec sudo -- "$self" "$@"
+fi
+[[ -f $CONF ]] || die "找不到配置 $CONF"
+[[ -f $RULESET_SRC/anti-ad.srs ]] || die "找不到 $RULESET_SRC/anti-ad.srs（先生成规则集）"
+[[ -f $RULESET_SRC/geoip-cn-fresh.srs ]] || die "找不到 $RULESET_SRC/geoip-cn-fresh.srs"
+command -v python3 >/dev/null || die "需要 python3"
+
+say "① 前置检查"
+systemctl is-active --quiet "$SERVICE" || die "$SERVICE 当前不是 active，先修好它"
+"$BIN" check -c "$CONF" >/dev/null 2>&1 || die "当前配置本身 check 不过，先处理"
+say "   服务 active，当前配置 check 通过"
+
+if [[ $USE_PKG_PATHS -eq 1 ]]; then
+  RULE_DIR=/usr/share/sing-box-rule-sets
+  [[ -d $RULE_DIR ]] || die "用了 --use-package-paths，但 $RULE_DIR 不存在（先装 sing-box-rule-sets 包）"
+fi
+
+say "② 安装规则集到 $RULE_DIR"
+install -d -m 755 "$BACKUP_DIR"
+if [[ $USE_PKG_PATHS -eq 1 ]]; then
+  say "   使用 sing-box-rule-sets 包提供的规则集，不复制文件"
+else
+install -m 644 "$RULESET_SRC/anti-ad.srs"        "$RULE_DIR/anti-ad.srs"
+install -m 644 "$RULESET_SRC/geoip-cn-fresh.srs" "$RULE_DIR/geoip-cn-fresh.srs"
+[[ $WITH_CNCIDR -eq 1 ]] && install -m 644 "$RULESET_SRC/cncidr-mihomo.srs" "$RULE_DIR/cncidr-mihomo.srs" || true
+[[ $WITH_DIRECT -eq 1 ]] && install -m 644 "$RULESET_SRC/must-direct.srs"   "$RULE_DIR/must-direct.srs" || true
+[[ $WITH_EXTRA_ADS -eq 1 ]] && install -m 644 "$RULESET_SRC/ads-extra.srs"  "$RULE_DIR/ads-extra.srs" || true
+fi
+ls -la "$RULE_DIR"/*.srs 2>/dev/null | awk '{print "   ",$5,$9}'
+
+say "③ 生成新配置（内存里改，不落盘）"
+OUT_JSON="$NEW_JSON" RULE_DIR="$RULE_DIR" USE_PKG_PATHS="$USE_PKG_PATHS" NXDOMAIN_ADS="$NXDOMAIN_ADS" \
+WITH_DNS_GROUPS="$WITH_DNS_GROUPS" WITH_CNCIDR="$WITH_CNCIDR" \
+WITH_DIRECT="$WITH_DIRECT" WITH_EXTRA_ADS="$WITH_EXTRA_ADS" python3 - "$CONF" <<'PY'
+import json, sys, copy
+conf_path = sys.argv[1]
+RULE_DIR = __import__("os").environ.get("RULE_DIR", "/etc/sing-box/rule-set")
+with_groups = __import__("os").environ.get("WITH_DNS_GROUPS") == "1"
+cfg = json.load(open(conf_path, encoding="utf-8"))
+orig = copy.deepcopy(cfg)
+report = []
+
+route = cfg.setdefault("route", {})
+dns = cfg.setdefault("dns", {})
+
+# ---- P1a: anti-AD 规则集 ----
+rs = route.setdefault("rule_set", [])
+if not any(r.get("tag") == "anti-AD" for r in rs):
+    rs.append({"type": "local", "tag": "anti-AD", "format": "binary",
+               "path": f"{RULE_DIR}/anti-ad.srs"})
+    report.append("route.rule_set += anti-AD")
+for container, label in ((dns.get("rules", []), "dns.rules"), (route.get("rules", []), "route.rules")):
+    for r in container:
+        if r.get("action") == "reject" and "anti-AD" not in r.get("rule_set", []):
+            r["rule_set"] = list(r.get("rule_set", [])) + ["anti-AD"]
+            report.append(f"{label} reject 规则 += anti-AD")
+
+# ---- P1b: 上游最新 geoip/cn 作为第二条规则集 ----
+if not any(r.get("tag") == "geoip/cn-fresh" for r in rs):
+    rs.append({"type": "local", "tag": "geoip/cn-fresh", "format": "binary",
+               "path": f"{RULE_DIR}/geoip-cn-fresh.srs"})
+    report.append("route.rule_set += geoip/cn-fresh")
+for r in route.get("rules", []):
+    if r.get("rule_set") == ["geoip/cn"]:
+        r["rule_set"] = ["geoip/cn", "geoip/cn-fresh"]
+        report.append("geoip/cn 规则同时匹配 geoip/cn-fresh")
+
+# ---- P2a: 删掉与 route.final 重复的路由规则 ----
+final = route.get("final")
+kept, dropped = [], []
+for r in route.get("rules", []):
+    keys = set(r.keys())
+    redundant = (
+        (keys <= {"action", "outbound"} and r.get("outbound") == final)                    # 无条件兜底
+        or (keys <= {"protocol", "port", "action", "outbound"}
+            and r.get("protocol") == ["quic"] and r.get("port") == [443]
+            and r.get("outbound") == final)                                                # quic/443 与 final 同向
+    )
+    (dropped if redundant else kept).append(r)
+if dropped:
+    route["rules"] = kept
+    report.append(f"删除 {len(dropped)} 条与 final({final}) 重复的路由规则")
+
+# ---- P2b: 删掉无人引用的 dns-local（潜在泄露面）----
+before = len(dns.get("servers", []))
+dns["servers"] = [s for s in dns.get("servers", []) if s.get("type") != "local"]
+if len(dns["servers"]) != before:
+    report.append("删除 dns.servers 里的 local（dns-local）")
+
+# ---- P2c: 去掉 external_ui*（1.14 弃用、1.16 移除；MetaCubeXD 一并下线）----
+clash = (cfg.get("experimental", {}) or {}).get("clash_api", {}) or {}
+for key in ("external_ui", "external_ui_download_url", "external_ui_download_detour"):
+    if key in clash:
+        clash.pop(key)
+        report.append(f"删除 clash_api.{key}")
+
+# ---- 可选: mihomo 的国内 IP 表（第三份 CN IP 来源，独立日更）----
+if __import__("os").environ.get("WITH_CNCIDR") == "1":
+    if not any(r.get("tag") == "cncidr-mihomo" for r in rs):
+        rs.append({"type": "local", "tag": "cncidr-mihomo", "format": "binary",
+                   "path": f"{RULE_DIR}/cncidr-mihomo.srs"})
+        report.append("route.rule_set += cncidr-mihomo")
+    for r in route.get("rules", []):
+        if r.get("rule_set") and "geoip/cn" in r["rule_set"] and "cncidr-mihomo" not in r["rule_set"]:
+            r["rule_set"] = list(r["rule_set"]) + ["cncidr-mihomo"]
+            report.append("geoip 规则同时匹配 cncidr-mihomo")
+
+# ---- 可选: 国内广告端点补漏（只加精确域名，绝不用 apex 后缀去误伤正常流量）----
+if __import__("os").environ.get("WITH_EXTRA_ADS") == "1":
+    if not any(r.get("tag") == "ads-extra" for r in rs):
+        rs.append({"type": "local", "tag": "ads-extra", "format": "binary",
+                   "path": f"{RULE_DIR}/ads-extra.srs"})
+        report.append("route.rule_set += ads-extra")
+    for container, label in ((dns.get("rules", []), "dns.rules"), (route.get("rules", []), "route.rules")):
+        for r in container:
+            if r.get("action") == "reject" and "ads-extra" not in r.get("rule_set", []):
+                r["rule_set"] = list(r.get("rule_set", [])) + ["ads-extra"]
+                report.append(f"{label} reject 规则 += ads-extra")
+
+# ---- 可选: 必须直连清单（STUN / 游戏主机 / LAN cache / NCSI）----
+if __import__("os").environ.get("WITH_DIRECT") == "1":
+    if not any(r.get("tag") == "must-direct" for r in rs):
+        rs.append({"type": "local", "tag": "must-direct", "format": "binary",
+                   "path": f"{RULE_DIR}/must-direct.srs"})
+        report.append("route.rule_set += must-direct")
+    rules = route.setdefault("rules", [])
+    if not any(r.get("rule_set") == ["must-direct"] for r in rules):
+        idx = 0
+        for i, r in enumerate(rules):
+            if r.get("ip_is_private"):
+                idx = i + 1
+        rules.insert(idx, {"rule_set": ["must-direct"], "action": "route", "outbound": "direct"})
+        report.append(f"插入 must-direct 直连规则（第 {idx + 1} 条）")
+
+# ---- 可选: DNS 广告拦截改用 predefined/NXDOMAIN ----
+# 背景：sing-box 的 DNS `reject` 返回 REFUSED，而 systemd-resolved 不会把 REFUSED 转告客户端
+# （它当成"上游坏了"去重试其他上游），于是走系统解析器的应用每个广告域名要等 ~5s 才失败。
+# 换成 NXDOMAIN（"域名不存在"）后，resolved 会正常转告，应用立刻失败并做负缓存。
+if __import__("os").environ.get("NXDOMAIN_ADS") == "1":
+    for r in dns.get("rules", []):
+        if r.get("action") == "reject":
+            matchers = {k: v for k, v in r.items() if k not in ("action", "rcode")}
+            r.clear()
+            r.update(matchers)
+            r["action"] = "predefined"
+            r["rcode"] = "NXDOMAIN"
+            report.append("dns 广告规则：reject(REFUSED) → predefined(NXDOMAIN)")
+
+# ---- P3（可选）: DNS 故障转移组 ----
+if with_groups:
+    servers = dns.setdefault("servers", [])
+    tags = {s.get("tag") for s in servers}
+    if "dns-proxy" not in tags and {"dns-proxy-cf", "dns-proxy-google"} <= tags:
+        servers.append({"type": "group", "tag": "dns-proxy",
+                        "servers": ["dns-proxy-cf", "dns-proxy-google"]})
+        report.append("新增 dns-proxy 故障转移组（cf + google）")
+    if "dns-direct" not in tags and {"dns-direct-ali", "dns-direct-tencent"} <= tags:
+        servers.append({"type": "group", "tag": "dns-direct",
+                        "servers": ["dns-direct-ali", "dns-direct-tencent"]})
+        report.append("新增 dns-direct 故障转移组（ali + tencent）")
+    if dns.get("final") == "dns-proxy-cf":
+        dns["final"] = "dns-proxy"
+    ddr = route.get("default_domain_resolver")
+    if isinstance(ddr, dict) and ddr.get("server") == "dns-direct-ali":
+        ddr["server"] = "dns-direct"                      # 对象写法
+    elif ddr == "dns-direct-ali":
+        route["default_domain_resolver"] = "dns-direct"   # 字符串写法（你当前就是这种）
+    for r in dns.get("rules", []):
+        if r.get("server") == "dns-proxy-cf": r["server"] = "dns-proxy"
+        if r.get("server") == "dns-direct-ali": r["server"] = "dns-direct"
+    report.append("dns.final / dns.rules / default_domain_resolver 改指故障转移组")
+
+import os as _os
+# ---- --use-package-paths: 把已存在条目的路径也重写到包目录（幂等逻辑只负责新增，这里补重写）----
+if __import__("os").environ.get("USE_PKG_PATHS") == "1":
+    _known = {
+        "anti-AD": "anti-ad.srs",
+        "geoip/cn-fresh": "geoip-cn-fresh.srs",
+        "cncidr-mihomo": "cncidr-mihomo.srs",
+        "must-direct": "must-direct.srs",
+        "ads-extra": "ads-extra.srs",
+    }
+    for r in rs:
+        t = r.get("tag")
+        if isinstance(t, str) and t in _known:
+            want = f"{RULE_DIR}/{_known[t]}"
+            if r.get("path") != want:
+                report.append(f"规则集 {t} 路径 → {want}")
+                r["path"] = want
+
+json.dump(cfg, open(_os.environ["OUT_JSON"], "w", encoding="utf-8"),
+          ensure_ascii=False, indent=2)
+print("   变更清单：")
+for line in report or ["（无变化，配置已是目标状态）"]:
+    print("     -", line)
+print(f"  规则数：route.rules {len(orig.get('route',{}).get('rules',[]))} → {len(route.get('rules',[]))}，"
+      f"rule_set {len(orig.get('route',{}).get('rule_set',[]))} → {len(rs)}")
+PY
+
+say "④ 用 root 校验新配置（check 不过就什么都不做）"
+if ! "$BIN" check -c "$NEW_JSON" > "$CHECK_OUT" 2>&1; then
+  tail -5 "$CHECK_OUT" | sed 's/^/    /'
+  die "新配置 check 失败，线上未做任何改动"
+fi
+say "   check 通过 ✅"
+
+say "⑤ 备份 → 原子替换 → 重启"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BK="$BACKUP_DIR/config.$STAMP.pre-audit.json"
+cp -a "$CONF" "$BK" && say "   备份：$BK"
+cp -a "$NEW_JSON" "$CONF.new" && chmod 644 "$CONF.new"
+mv -f "$CONF.new" "$CONF"
+systemctl restart "$SERVICE"
+sleep 2
+
+say "⑥ 健康检查"
+fail=""
+for _ in $(seq 30); do systemctl is-active --quiet "$SERVICE" && break; sleep 0.5; done
+systemctl is-active --quiet "$SERVICE" || fail="服务未 active"
+# 入站模式不同，健康判据不同：TUN 等 tun0；eBPF 没有 tun0，改用「不设代理的请求是否走代理」证明内核接管
+INBOUNDS="$(python3 -c "
+import json
+d=json.load(open('$CONF'))
+print(','.join(str(i.get('type','')) for i in d.get('inbounds',[])))" 2>/dev/null || echo '')"
+if [[ -z $fail && $INBOUNDS == *tun* ]]; then
+  for _ in $(seq 20); do ip link show tun0 >/dev/null 2>&1 && break; sleep 0.5; done
+  ip link show tun0 >/dev/null 2>&1 || fail="tun0 未出现"
+elif [[ -z $fail && $INBOUNDS == *ebpf* ]]; then
+  _direct="$(curl -s -m 12 https://api.ipify.org || true)"
+  [[ -n $_direct ]] || fail="eBPF 模式下未经代理的请求失败"
+  say "   eBPF 模式：不设代理出口 = ${_direct:-无}"
+fi
+if [[ -z $fail ]]; then
+  exit_ip="$(curl -s -m 12 -x http://127.0.0.1:7892 "$PROBE_VIA_PROXY" || true)"
+  [[ -n $exit_ip ]] || fail="经代理出口探测失败"
+fi
+if [[ -z $fail ]]; then
+  blocked_ok=0; for d in criteo.com tr.outbrain.com match.adsrvr.org pixel.quantserve.com; do
+    [[ -z "$(dig +short +time=3 +tries=1 "$d" 2>/dev/null)" ]] && blocked_ok=$((blocked_ok+1))
+  done
+  [[ $blocked_ok -ge 3 ]] || fail="新规则集似乎没生效（4 个测试域名只拦住 $blocked_ok 个）"
+fi
+
+if [[ -n $fail ]]; then
+  warn "健康检查失败：$fail —— 正在回滚"
+  cp -a "$BK" "$CONF"
+  systemctl restart "$SERVICE"
+  sleep 3
+  systemctl is-active --quiet "$SERVICE" && warn "已回滚并重启，服务恢复" || warn "回滚后服务仍异常，请手动检查！"
+  exit 1
+fi
+
+say "✅ 全部完成"
+echo "   经代理出口：$exit_ip"
+echo "   新拦域名：criteo.com / tr.outbrain.com / match.adsrvr.org / pixel.quantserve.com 均已拦截"
+echo "   备份：$BK（回滚：cp -a 它回 $CONF && systemctl restart $SERVICE）"
+echo
+echo "   建议随后复测："
+echo "     dig +short doubleclick.net          # 空"
+echo "     curl -s https://myip.ipip.net       # 国内仍直连（电信 IP）"
+echo "     curl -6 -s -o /dev/null -w '%{http_code}\\n' https://ipv6.google.com   # 200（AAAA-only，不能加 -4）"

@@ -56,6 +56,12 @@ const BUNDLED: &[(&str, &str)] = &[
         "packages.toml",
         include_str!("../../manifests/packages.toml"),
     ),
+    // sing-box 的运维动作：真正干活的是 scripts/sing-box/ 下的脚本（PKGBUILD 装到
+    // /usr/bin；源码用户跑那个目录里的 install.sh）。动作这边只管把开关填成表单。
+    (
+        "sing-box.toml",
+        include_str!("../../manifests/sing-box.toml"),
+    ),
 ];
 
 /// 内置动作总数。
@@ -63,7 +69,7 @@ const BUNDLED: &[(&str, &str)] = &[
 /// **加/删 `manifests/*.toml` 里的动作后要更新这里**：测试拿它对账，
 /// 某个 manifest 悄悄解析失败时（例如拼错一个键），工具数会立刻对不上。
 #[cfg(test)]
-const BUNDLED_ACTION_COUNT: usize = 33;
+const BUNDLED_ACTION_COUNT: usize = 38;
 
 /// 内置动作里 `mode = "native"` 的那些：`program` 写的是**界面名**（不是命令）。
 #[cfg(test)]
@@ -893,6 +899,82 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// sing-box 的运维动作：危险度、运行模式、以及「开关 → argv」的映射都要对得上
+    /// `scripts/sing-box/` 里脚本真正认的参数。
+    ///
+    /// 这些动作不直接跑 sing-box，而是驱动那些脚本。脚本认的开关写错了不会编译失败，
+    /// 只会**静默地少传一个参数**（比如 `--nxdomain-ads` 拼成 `--nxdomain`），所以这里
+    /// 把默认值和开关构造成 argv 逐个对账。
+    #[test]
+    fn sing_box_actions_drive_the_ops_scripts() {
+        use crate::model::{Danger, RunMode};
+
+        let discovery = bundled_discovery();
+
+        // 只读的体检：留在界面里、不打扰用户
+        let status = by_id(&discovery, "manifest:sing-box-status");
+        assert_eq!(status.danger, Danger::Safe, "体检是只读的");
+        assert_eq!(status.mode, RunMode::Capture, "体检该留在界面里看输出");
+
+        // 会改配置 / 重启服务的四个：要 sudo、要能看见回滚日志 → interactive + caution
+        for id in [
+            "manifest:sing-box-audit",
+            "manifest:sing-box-to-ebpf",
+            "manifest:sing-box-to-tun",
+            "manifest:sing-box-container-proxy",
+        ] {
+            let tool = by_id(&discovery, id);
+            assert_eq!(tool.danger, Danger::Caution, "{id} 会改配置并重启服务");
+            assert_eq!(tool.mode, RunMode::Interactive, "{id} 要 sudo 密码");
+        }
+
+        // 审计的 6 个开关 → 6 个 argv 元素，一个都不能少
+        let audit = by_id(&discovery, "manifest:sing-box-audit");
+        let action = audit.action.as_ref().expect("审计动作带参数表单");
+        let mut values = action.default_values();
+        for key in [
+            "cncidr",
+            "direct_list",
+            "extra_ads",
+            "dns_groups",
+            "pkg_paths",
+            "nxdomain",
+        ] {
+            values.set(key, "true");
+        }
+        let argv = action
+            .build_argv(&values)
+            .expect("六个开关都填了，应能构建");
+        for flag in [
+            "--with-cncidr",
+            "--with-direct-list",
+            "--with-extra-ads",
+            "--with-dns-groups",
+            "--use-package-paths",
+            "--nxdomain-ads",
+        ] {
+            assert!(
+                argv.iter().any(|arg| arg == flag),
+                "审计动作少了 {flag}：{argv:?}"
+            );
+        }
+
+        // 切 eBPF 的数据面是 choice：不选也必须是默认的 cgroup，不能构建出空 argv
+        let to_ebpf = by_id(&discovery, "manifest:sing-box-to-ebpf");
+        let action = to_ebpf.action.as_ref().expect("切 eBPF 动作带参数表单");
+        let argv = action
+            .build_argv(&action.default_values())
+            .expect("默认值应能构建");
+        assert!(
+            argv.iter().any(|arg| arg == "--data-plane"),
+            "切 eBPF 必须带 --data-plane：{argv:?}"
+        );
+        assert!(
+            argv.iter().any(|arg| arg == "cgroup"),
+            "默认数据面应是 cgroup：{argv:?}"
+        );
     }
 
     /// 会改系统的包管理动作必须标 `danger = "caution"`。

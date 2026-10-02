@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# sing-box-status:summary=sing-box 体检：模式/入站/出口/分流/DNS/规则集/eBPF 附件/备份，一屏看清
+# sing-box-status:domain=网络
+# sing-box-status:tags=sing-box,代理,诊断
+# sing-box-status:input=当前 /etc/sing-box/config.json
+# sing-box-status:output=一屏体检报告（只读，不改任何东西）
+# sing-box-status:features=自动识别 TUN / eBPF 模式并选对应的检查项；用随机子域验证 DNS 广告拦截（缓存无法伪造）；出口与直连并排对比；--fast 跳过联网检查；--strict 有问题时以非 0 退出
+# sing-box-status:requires=sing-box,jq,curl,dig
+# sing-box-status:install=~/code/toolbox-hub/scripts/sing-box/install.sh
+# sing-box-status:internal=true
+# sing-box-status:mode=capture
+#
+# ↑ 注解契约见 ~/.config/toolbox-hub/tools/README.md；本脚本由 manifest 的 sing-box.toml 驱动。
+
+set -Eeuo pipefail
+
+CONF="${CONF:-/etc/sing-box/config.json}"
+BIN="${BIN:-sing-box}"
+API_URL="${API_URL:-http://127.0.0.1:9091}"
+PROXY_PORT="${PROXY_PORT:-7892}"
+FAST=0
+STRICT=0
+for arg in "$@"; do
+    case "$arg" in
+        --fast) FAST=1 ;;
+        --strict) STRICT=1 ;;
+        -h|--help)
+            printf '用法：sing-box-status [--fast] [--strict]\n  --fast    跳过联网检查（出口 / DNS）\n  --strict  有硬性问题时以非 0 退出\n'
+            exit 0 ;;
+        *) printf '不认识的参数：%s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+# 捕获模式（Toolbox Hub 的输出视图）里不该出现转义序列
+if [[ -t 1 ]]; then
+    C_DIM=$'\033[2m'; C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'; C_OFF=$'\033[0m'
+else
+    C_DIM=""; C_OK=""; C_BAD=""; C_WARN=""; C_OFF=""
+fi
+
+[[ -r $CONF ]] || { printf '读不到 %s（需要能看到该文件；它通常是 644）\n' "$CONF"; exit 2; }
+command -v jq >/dev/null || { printf '缺少 jq：sudo pacman -S jq\n'; exit 2; }
+
+problems=0
+# 输出helper统一吞掉 EPIPE：`sing-box-status | head` 这种用法不该让体检报错中止
+row() { printf '  %-10s %s\n' "$1" "$2" 2>/dev/null || true; }
+ok()   { printf '%s✓%s' "$C_OK" "$C_OFF" 2>/dev/null || true; }
+bad()  { printf '%s✗%s' "$C_BAD" "$C_OFF" 2>/dev/null || true; problems=$((problems + 1)); }
+warn() { printf '%s!%s' "$C_WARN" "$C_OFF" 2>/dev/null || true; }
+
+printf '\n%s sing-box 体检%s  %s\n' "$C_DIM" "$C_OFF" "$(date '+%F %T')" 2>/dev/null || true
+printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF" 2>/dev/null || true
+
+# ── 服务 ───────────────────────────────────────────────────────────────────
+svc="$(systemctl is-active sing-box 2>/dev/null || true)"
+if [[ $svc == active ]]; then
+    since="$(systemctl show sing-box -p ActiveEnterTimestamp --value 2>/dev/null | cut -d' ' -f2-3)"
+    mem="$(systemctl show sing-box -p MemoryCurrent --value 2>/dev/null)"
+    mib=""
+    [[ $mem =~ ^[0-9]+$ ]] && mib="$(awk -v b="$mem" 'BEGIN{printf "%.1f MB", b/1048576}')"
+    row 服务 "$(ok) active${since:+（自 $since）}${mib:+  内存 $mib}"
+else
+    row 服务 "$(bad) $svc"
+fi
+
+# ── 模式与入站 ─────────────────────────────────────────────────────────────
+inbounds="$(jq -r '[.inbounds[].type] | join(", ")' "$CONF" 2>/dev/null || echo '?')"
+mode_line="$inbounds"
+if jq -e '.inbounds[] | select(.type=="ebpf")' "$CONF" >/dev/null 2>&1; then
+    dp="$(jq -r '.inbounds[] | select(.type=="ebpf") | .local.data_plane // "cgroup"' "$CONF")"
+    sh="$(jq -r '.inbounds[] | select(.type=="ebpf") | (.shared.enabled // false)' "$CONF")"
+    mode_line="eBPF（local $dp，shared $sh）"
+elif jq -e '.inbounds[] | select(.type=="tun")' "$CONF" >/dev/null 2>&1; then
+    if ip link show tun0 >/dev/null 2>&1; then
+        mode_line="TUN（tun0 mtu $(cat /sys/class/net/tun0/mtu 2>/dev/null || echo '?')）"
+    else
+        mode_line="TUN（$(bad) 但 tun0 不存在）"
+    fi
+fi
+row 模式 "$mode_line"
+row 入站 "$(jq -r '[.inbounds[] | select(.type=="mixed") | "mixed :\(.listen_port // "-")"] | join(" + ")' "$CONF")$(jq -r '[.inbounds[] | select(.type!="mixed") | .tag] | if length>0 then " + " + join(" + ") else "" end' "$CONF")"
+
+# ── eBPF 附件（仅 eBPF 模式）────────────────────────────────────────────────
+if jq -e '.inbounds[] | select(.type=="ebpf")' "$CONF" >/dev/null 2>&1; then
+    secret="$(jq -r '.experimental.clash_api.secret // ""' "$CONF")"
+    if ebpf="$("$BIN" api ebpf --url "$API_URL" --secret "$secret" 2>/dev/null)"; then
+        n="$(printf '%s' "$ebpf" | jq -r '.inbounds | length' 2>/dev/null || echo '?')"
+        mech="$(printf '%s' "$ebpf" | jq -r '[.inbounds[].attachments[]?.mechanism] | unique | join(",")' 2>/dev/null)"
+        nz="$(printf '%s' "$ebpf" | jq -r '[.inbounds[].counters // {} | to_entries[] | select(.value != "0" and .value != 0) | .key] | length' 2>/dev/null || echo 0)"
+        if [[ $n =~ ^[0-9]+$ ]] && (( n > 0 )); then
+            row eBPF "$(ok) $n 个活动入站（$mech）  非零计数器 $nz"
+        else
+            row eBPF "$(bad) 没有活动入站"
+        fi
+    else
+        row eBPF "$(warn) 查询不到 API 服务（$API_URL）"
+    fi
+fi
+
+# ── 规则集构成 ─────────────────────────────────────────────────────────────
+row 规则 "$(jq -r '"\(.route.rule_set | length) 份规则集 / \(.route.rules | length) 条路由规则 / \(.dns.servers | length) 个 DNS 服务器"' "$CONF")"
+srcs="$(jq -r '
+  ([.route.rule_set[].path // empty | select(startswith("/usr/share/sing-box-rule-sets"))] | length) as $pkg
+  | ([.route.rule_set[].path // empty | select(startswith("/etc"))] | length) as $etc
+  | ([.route.rule_set[].path // empty | select(startswith("/usr/share/sing-box/"))] | length) as $off
+  | "包 \($pkg) 份 · /etc \($etc) 份 · 官方 \($off) 份"' "$CONF" 2>/dev/null || echo '?')"
+row 来源 "$srcs"
+ads_action="$(jq -r '[.dns.rules[] | select(.action=="predefined" or .action=="reject")] | first | if . == null then "-" else (.action + (if .rcode then "/" + .rcode else "" end)) end' "$CONF" 2>/dev/null || echo '?')"
+row 广告 "$ads_action"
+
+# ── 联网检查 ───────────────────────────────────────────────────────────────
+if (( FAST == 0 )); then
+    direct="$(curl -s -m 8 https://api.ipify.org 2>/dev/null || true)"
+    proxy="$(curl -s -m 8 -x "http://127.0.0.1:$PROXY_PORT" https://api.ipify.org 2>/dev/null || true)"
+    if [[ -n $direct && $direct == "$proxy" ]]; then
+        row 接管 "$(ok) 不设代理的出口 = 代理出口（$direct）"
+    elif [[ -z $direct ]]; then
+        row 接管 "$(bad) 不设代理的请求失败（拦截层可能没生效）"
+    else
+        row 接管 "$(bad) 不设代理 $direct ≠ 代理 $proxy"
+    fi
+    # 注意：不要用 head -c 截断 —— 那是按字节切，会把中文切一半，"电信"也就匹配不到了
+    cn="$(curl -s -m 8 https://myip.ipip.net 2>/dev/null | tr -d '\n' || true)"
+    if [[ $cn == *电信* || $cn == *联通* || $cn == *移动* ]]; then
+        row 直连 "$(ok) ${cn:0:80}"
+    elif [[ -z $cn ]]; then
+        row 直连 "$(warn) 查询失败"
+    else
+        row 直连 "$(warn) ${cn:0:80}"
+    fi
+
+    # DNS：随机子域（任何缓存都命不中）+ 对照域名，避免"空"其实是查询失败
+    rand="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    probe="${rand}.doubleclick.net"
+    ctrl="$(dig +short +time=3 +tries=1 @223.5.5.5 www.baidu.com 2>/dev/null | head -1)"
+    leakhit="$(dig +short +time=3 +tries=1 @223.5.5.5 "$probe" 2>/dev/null | head -1)"
+    leak_default="$(dig +short +time=3 +tries=1 "$probe" 2>/dev/null | head -1)"
+    if [[ -z $ctrl ]]; then
+        row DNS "$(warn) 对照域名都解析不了，无法判断"
+    elif [[ -z $leakhit && -z $leak_default ]]; then
+        row DNS "$(ok) 广告域名被拦（$probe）"
+    else
+        row DNS "$(bad) 广告域名仍可解析：${leakhit:-}${leakhit_default:+ / $leakhit_default}"
+    fi
+    echo_val="$(dig +short +time=4 TXT o-o.myaddr.l.google.com 2>/dev/null | tr -d '"' | head -1 || true)"
+    [[ -n $echo_val ]] && row 解析出口 "${echo_val}（应为 Cloudflare / 代理侧）"
+fi
+
+# ── 备份 ───────────────────────────────────────────────────────────────────
+bk_dir="/etc/sing-box/backups"
+if [[ -d $bk_dir ]]; then
+    row 备份 "$(ls -1t "$bk_dir" 2>/dev/null | head -3 | tr '\n' ' ')"
+fi
+printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF" 2>/dev/null || true
+if (( problems == 0 )); then
+    printf ' %s全部正常%s\n\n' "$C_OK" "$C_OFF" 2>/dev/null || true
+else
+    printf ' %s有 %d 项异常%s\n\n' "$C_BAD" "$problems" "$C_OFF" 2>/dev/null || true
+fi
+
+(( STRICT == 0 )) || (( problems == 0 )) || exit 1
+exit 0

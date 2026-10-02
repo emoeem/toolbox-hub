@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# sing-box-switch-tun:summary=把 sing-box 从 eBPF 切回 TUN（TUN 用 auto_route 覆盖转发流量，容器/虚拟机也能被代理）
+# sing-box-switch-tun:domain=网络
+# sing-box-switch-tun:tags=sing-box,代理,模式
+# sing-box-switch-tun:input=当前 eBPF 配置（TUN 定义取自最近一次 pre-ebpf 备份）
+# sing-box-switch-tun:output=切换后的配置 + 备份 + 健康检查（tun0/出口/分流/DNS）
+# sing-box-switch-tun:features=只替换 inbound，DNS 故障转移组与广告规则原样保留；可指定备份来源；失败自动回滚
+# sing-box-switch-tun:requires=sing-box,sudo,python3,curl,dig
+# sing-box-switch-tun:install=~/code/toolbox-hub/scripts/sing-box/install.sh
+# sing-box-switch-tun:internal=true
+# sing-box-switch-tun:mode=interactive
+# sing-box-switch-tun:danger=caution
+#
+# ↑ 注解契约见 ~/.config/toolbox-hub/tools/README.md；本脚本由 manifest 的 sing-box.toml 驱动。
+
+# 把 sing-box 从 eBPF 入站切回 TUN 入站（TUN 靠 auto_route 覆盖转发流量，因此容器/虚拟机也能被代理）
+#
+#   sudo ./switch-to-tun.sh                 # tun 入站取自最近的 config.*.pre-ebpf.json 备份
+#   sudo ./switch-to-tun.sh --from <备份>   # 指定从哪份备份取 tun 入站定义
+#
+# 只替换 inbound：当前配置里的 DNS 故障转移组、广告规则（predefined/NXDOMAIN）、
+# 规则集与路径等全部保留。安全管线与 switch-to-ebpf.sh 相同：
+#   取 TUN 定义 → 改配置 → check → 备份 → 原子替换 → 重启 → 健康检查
+#   （tun0 出现 + 不设代理的请求走代理 + 国内直连 + DNS 广告拦截）→ 失败自动回滚。
+set -Eeuo pipefail
+
+CONF="${CONF:-/etc/sing-box/config.json}"
+BIN="${BIN:-/usr/bin/sing-box}"
+SERVICE="${SERVICE:-sing-box}"
+API_URL="${API_URL:-http://127.0.0.1:9091}"
+BACKUP_DIR="/etc/sing-box/backups"
+FROM=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) FROM="${2:-}"; shift 2 ;;
+    *) printf 'FATAL 未知参数：%s（可用：--from <备份文件>）\n' "$1" >&2; exit 1 ;;
+  esac
+done
+
+WORK="$(mktemp -d /tmp/switch-tun.XXXXXX)"
+NEW_JSON="$WORK/new-config.json"
+CHECK_OUT="$WORK/check.out"
+trap 'rm -rf "$WORK"' EXIT
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31mFATAL\033[0m %s\n' "$*" >&2; exit 1; }
+
+# 直接执行也能用：Toolbox Hub 的 program 就是这个脚本本身（没经过 sudo）
+# —— 不是 root 就自己 exec sudo（交互模式已接管终端，能正常提示密码）。
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || { printf 'FATAL 需要 root，但没装 sudo\n' >&2; exit 1; }
+    # 必须换算成**绝对路径**再交给 sudo：在 shell 里敲 `sing-box-audit` 时 $0 是裸名字，
+    # 而 sudo 默认用 secure_path（/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin），
+    # 里面没有 ~/.local/bin —— 裸名字会在 sudo 那一层报「找不到命令」。
+    self="$0"
+    [[ $self == */* ]] || self="$(command -v -- "$self" 2>/dev/null || true)"
+    [[ -n $self && -e $self ]] || { printf 'FATAL 定位不到脚本自身：%s\n' "$0" >&2; exit 1; }
+    exec sudo -- "$self" "$@"
+fi
+[[ -f $CONF ]] || die "找不到 $CONF"
+command -v python3 >/dev/null || die "需要 python3"
+
+say "① 前置检查"
+systemctl is-active --quiet "$SERVICE" || die "$SERVICE 不是 active，先修好它"
+"$BIN" check -c "$CONF" >/dev/null 2>&1 || die "当前配置 check 不过"
+if ! python3 -c "
+import json,sys
+d=json.load(open('$CONF'))
+sys.exit(0 if any(i.get('type')=='ebpf' for i in d.get('inbounds',[])) else 1)"; then
+  if python3 -c "
+import json,sys
+d=json.load(open('$CONF'))
+sys.exit(0 if any(i.get('type')=='tun' for i in d.get('inbounds',[])) else 1)"; then
+    die "当前已经是 TUN 模式，无需切换"
+  fi
+  die "配置里既没有 ebpf 也没有 tun 入站，本脚本不适用"
+fi
+say "   服务 active、配置合法、当前是 eBPF 模式"
+
+say "② 取 TUN 入站定义"
+if [[ -z $FROM ]]; then
+  FROM="$(ls -1t "$BACKUP_DIR"/config.*.pre-ebpf.json 2>/dev/null | head -1 || true)"
+fi
+TUN_JSON="$WORK/tun-inbound.json"
+if [[ -n $FROM && -f $FROM ]]; then
+  python3 - "$FROM" "$TUN_JSON" <<'PY'
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+d = json.load(open(src, encoding="utf-8"))
+tun = next((i for i in d.get("inbounds", []) if i.get("type") == "tun"), None)
+if tun is None:
+    raise SystemExit(f"备份里没有 tun 入站：{src}")
+json.dump(tun, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print(f"   来源备份：{src}")
+print(f"   定义：{json.dumps(tun, ensure_ascii=False)}")
+PY
+else
+  warn "没找到 pre-ebpf 备份，使用内置默认 TUN 参数"
+  cat > "$TUN_JSON" <<'JSON'
+{"type": "tun", "tag": "tun-in", "interface_name": "tun0",
+ "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"], "mtu": 9000,
+ "auto_route": true, "strict_route": true, "stack": "system"}
+JSON
+fi
+
+say "③ 生成新配置（ebpf → tun，其余保持不动）"
+python3 - "$CONF" "$NEW_JSON" "$TUN_JSON" <<'PY'
+import json, sys
+conf_path, out_path, tun_path = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(open(conf_path, encoding="utf-8"))
+tun = json.load(open(tun_path, encoding="utf-8"))
+tun.setdefault("tag", "tun-in")
+out, dropped = [], []
+for i in cfg.get("inbounds", []):
+    (dropped if i.get("type") == "ebpf" else out).append(i)
+out.append(tun)
+cfg["inbounds"] = out
+json.dump(cfg, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print(f"   移除 ebpf 入站（tag={[d.get('tag') for d in dropped]}），新增 tun（tag={tun['tag']}）")
+print(f"   保留：DNS 服务器 {len(cfg.get('dns', {}).get('servers', []))} 个、"
+      f"规则集 {len(cfg['route']['rule_set'])} 份、路由规则 {len(cfg['route']['rules'])} 条")
+PY
+
+say "④ 校验新配置（check 不过就什么都不做）"
+if ! "$BIN" check -c "$NEW_JSON" > "$CHECK_OUT" 2>&1; then
+  tail -6 "$CHECK_OUT" | sed 's/^/    /'
+  die "新配置 check 失败，线上未做任何改动"
+fi
+say "   check 通过 ✅"
+
+say "⑤ 备份 → 原子替换 → 重启"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BK="$BACKUP_DIR/config.$STAMP.pre-tun.json"
+install -d -m 755 "$BACKUP_DIR"
+cp -a "$CONF" "$BK" && say "   备份（eBPF 配置）：$BK"
+cp -a "$NEW_JSON" "$CONF.new" && chmod 644 "$CONF.new" && mv -f "$CONF.new" "$CONF"
+systemctl restart "$SERVICE"
+sleep 2
+
+say "⑥ 健康检查（TUN 判据）"
+fail=""
+for _ in $(seq 30); do systemctl is-active --quiet "$SERVICE" && break; sleep 0.5; done
+systemctl is-active --quiet "$SERVICE" || {
+  fail="服务未 active"; journalctl -u "$SERVICE" -n 15 --no-pager | sed 's/^/    /'
+}
+# tun0 必须出现
+if [[ -z $fail ]]; then
+  for _ in $(seq 30); do ip link show tun0 >/dev/null 2>&1 && break; sleep 0.5; done
+  if ip link show tun0 >/dev/null 2>&1; then
+    printf '   tun0 已就绪（mtu %s）\n' "$(cat /sys/class/net/tun0/mtu 2>/dev/null || echo '?')"
+  else
+    fail="tun0 未出现"
+  fi
+fi
+# 端到端：不设代理必须走代理
+if [[ -z $fail ]]; then
+  h="$(curl -s -m 12 https://api.ipify.org || true)"
+  p="$(curl -s -m 12 -x http://127.0.0.1:7892 https://api.ipify.org || true)"
+  printf '   不设代理出口=%s / 本地代理口=%s\n' "${h:-无}" "${p:-无}"
+  [[ -n $h && "$h" == "$p" ]] || fail="未经代理的请求没有走代理"
+fi
+# 国内仍直连
+if [[ -z $fail ]]; then
+  cn="$(curl -s -m 12 https://myip.ipip.net || true)"
+  printf '   国内出口：%s\n' "${cn:-无}"
+  [[ $cn == *电信* || $cn == *联通* || $cn == *移动* ]] || fail="国内出口不是直连（分流异常）"
+fi
+# DNS 广告拦截（随机子域 + 直连解析器 + 对照，避开缓存与过渡期抖动）
+if [[ -z $fail ]]; then
+  rand="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  probe="${rand}.doubleclick.net"
+  dns_ok=0
+  for _ in $(seq 20); do
+    resolvectl flush-caches >/dev/null 2>&1 || true
+    ctrl="$(dig +short +time=3 +tries=1 @223.5.5.5 www.baidu.com 2>/dev/null | head -1)"
+    ad="$(dig +short +time=3 +tries=1 @223.5.5.5 "$probe" 2>/dev/null | head -1)"
+    if [[ -n $ctrl && -z $ad ]]; then dns_ok=1; break; fi
+    sleep 1
+  done
+  printf '   DNS 检查（%s）：对照=%s，广告子域=%s\n' "$probe" "${ctrl:-空}" "${ad:+未拦}${ad:-已拦}"
+  [[ $dns_ok -eq 1 ]] || fail="DNS 广告拦截未生效"
+fi
+
+if [[ -n $fail ]]; then
+  warn "健康检查失败：$fail —— 正在回滚到 eBPF 配置"
+  cp -a "$BK" "$CONF"
+  systemctl restart "$SERVICE"
+  sleep 3
+  systemctl is-active --quiet "$SERVICE" && warn "已回滚并重启（仍是 eBPF 模式）" || warn "回滚后仍异常，请手动检查！"
+  exit 1
+fi
+
+resolvectl flush-caches >/dev/null 2>&1 || true
+
+say "⑦ 附带探测：容器是否被接管（TUN 的 auto_route 应该能覆盖）"
+if command -v podman >/dev/null 2>&1; then
+  cip="$(timeout 180 podman run --rm docker.io/library/alpine:latest \
+        sh -c 'apk add --no-cache curl >/dev/null 2>&1; curl -4 -s -m 25 https://api.ipify.org' 2>/dev/null | tail -1 || true)"
+  prox="$(curl -s -m 10 -x http://127.0.0.1:7892 https://api.ipify.org || true)"
+  printf '   容器出口=%s / 代理出口=%s\n' "${cip:-失败}" "${prox:-无}"
+  [[ -n $cip && "$cip" == "$prox" ]] && printf '   ✅ 容器已被代理\n' || printf '   ⚠️ 容器未被接管（检查 podman 网络后端）\n'
+else
+  printf '   未安装 podman，跳过\n'
+fi
+
+say "✅ 已切回 TUN 模式"
+echo "   备份（回滚用）：$BK"
+echo "   回滚：sudo cp -a $BK $CONF && sudo systemctl restart $SERVICE"
+echo
+echo "   注意：面板的「分应用 eBPF 策略」在 TUN 模式下不可用（需要 ebpf 入站），其余功能不受影响。"
+echo "   想再切回 eBPF：sudo ./switch-to-ebpf.sh"

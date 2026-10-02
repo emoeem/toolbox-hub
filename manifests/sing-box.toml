@@ -1,0 +1,180 @@
+# sing-box：本机代理的体检 / 修复 / 模式切换。
+#
+# 这些动作**不直接跑 sing-box**，而是调用 scripts/sing-box/ 下的运维脚本 —— 每个脚本自己
+# 负责「改配置前先 check、失败自动回滚、改完验证」，动作这边只负责把参数填成表单。
+#
+# 脚本从哪来（manifest 的 program 走 PATH 解析，解析不到会显示「依赖缺失」）：
+#   · 源码用户：./scripts/sing-box/install.sh   → 装到 ~/.local/bin
+#   · 装包用户：PKGBUILD 已把它们放进 /usr/bin
+#
+# 为什么都是 mode = "interactive"：这几件事都要 sudo 提示密码、并且要看得见进度输出。
+
+[[action]]
+id = "sing-box-status"
+name = "sing-box 体检"
+summary = "一屏看清：模式 / 入站 / 出口 / 分流 / DNS / 规则集 / 备份（只读）"
+domain = "网络"
+tags = ["sing-box", "诊断"]
+program = "sing-box-status"
+allow_empty = true            # 所有开关都可留空 → 默认就是「不带参数跑脚本」
+mode = "capture"
+install = "./scripts/sing-box/install.sh"
+input = "当前 /etc/sing-box/config.json"
+output = "只读体检报告，不改任何东西"
+features = "自动识别 TUN / eBPF 并选对应检查；用随机子域验证 DNS 广告拦截（缓存伪造不了）；出口与直连并排对比"
+
+[[action.argument]]
+key = "fast"
+label = "跳过联网检查"
+kind = "toggle"
+flag = "--fast"
+default = "false"
+help = "只读配置与内核状态，不测出口 / DNS —— 秒出"
+
+[[action]]
+id = "sing-box-audit"
+name = "sing-box 审计修复"
+summary = "补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则与 dns-local"
+domain = "网络"
+tags = ["sing-box", "修复"]
+program = "sing-box-audit"
+allow_empty = true            # 所有开关都可留空 → 默认就是「不带参数跑脚本」
+mode = "interactive"
+danger = "caution"
+install = "./scripts/sing-box/install.sh"
+input = "当前 /etc/sing-box/config.json"
+output = "应用后的配置 + 时间戳备份 + 健康检查结果"
+features = "改配置前先用 root 跑 check；失败自动回滚；每个开关都是幂等的，可以反复执行"
+
+[[action.argument]]
+key = "cncidr"
+label = "加 mihomo 国内 IP 表"
+kind = "toggle"
+flag = "--with-cncidr"
+default = "false"
+help = "第三份独立来源的 CN CIDR（17958 条）。geoip/cn 偏旧时补漏很有用"
+
+[[action.argument]]
+key = "direct_list"
+label = "加必须直连清单"
+kind = "toggle"
+flag = "--with-direct-list"
+default = "false"
+help = "STUN / 游戏主机 / LAN cache / NCSI —— 这些走代理会坏功能（NAT 类型、Steam 局域网缓存）"
+
+[[action.argument]]
+key = "extra_ads"
+label = "补国内广告端点"
+kind = "toggle"
+flag = "--with-extra-ads"
+default = "false"
+help = "ad.duowan.com / sdkmob.com / ads.wps.cn：anti-AD 漏掉、且只用精确域名不动 apex"
+
+[[action.argument]]
+key = "dns_groups"
+label = "DNS 故障转移组"
+kind = "toggle"
+flag = "--with-dns-groups"
+default = "false"
+help = "把闲置的备用 DNS（Google / 腾讯）编成组：主用挂了自动顶上（这个 fork 支持 type=group，上游 1.14 不支持）"
+
+[[action.argument]]
+key = "pkg_paths"
+label = "规则集走包路径"
+kind = "toggle"
+flag = "--use-package-paths"
+default = "false"
+help = "改指向 /usr/share/sing-box-rule-sets —— 规则集就跟着 pacman 更新，而不是躺在 /etc 的副本里"
+
+[[action.argument]]
+key = "nxdomain"
+label = "广告改 NXDOMAIN"
+kind = "toggle"
+flag = "--nxdomain-ads"
+default = "false"
+help = "DNS 广告拦截从 reject(REFUSED) 改成 predefined(NXDOMAIN)：systemd-resolved 会把 REFUSED 吞掉让应用卡 5 秒，NXDOMAIN 是正常应答，秒失败"
+
+[[action]]
+id = "sing-box-to-ebpf"
+name = "sing-box 切到 eBPF"
+summary = "把 TUN 入站换成 eBPF 入站（本机流量在内核 socket 层接管）"
+domain = "网络"
+tags = ["sing-box", "模式"]
+program = "sing-box-switch-ebpf"
+mode = "interactive"
+danger = "caution"
+install = "./scripts/sing-box/install.sh"
+input = "当前配置（TUN，或已是 eBPF 时只改数据面）"
+output = "切换后的配置 + 备份 + eBPF 专属健康检查"
+features = "内核能力预检；健康判据是「不设代理的请求是否走代理」；失败自动回滚到 TUN"
+
+[[action.argument]]
+key = "data_plane"
+label = "数据面"
+kind = "choice"
+flag = "--data-plane"
+default = "cgroup"
+help = "cgroup = 内核 socket 钩子（推荐）；tc = 跟随默认接口，但需要内核支持 TC eBPF —— 不支持时脚本会提前拦住"
+choices = [
+  { label = "cgroup（推荐）", value = "cgroup" },
+  { label = "tc（接口级，可抓到 pasta 的包）", value = "tc" },
+]
+
+[[action.argument]]
+key = "shared"
+label = "一并接管下游接口"
+kind = "text"
+flag = "--shared"
+help = "留空 = 只接管本机。填接口名（如 virbr0 / podman0）则同时接管从该接口进来的流量；该路径同样依赖 TC，本机不支持时会提前拦住"
+
+[[action]]
+id = "sing-box-to-tun"
+name = "sing-box 切回 TUN"
+summary = "从 eBPF 切回 TUN：容器 / 虚拟机也能被代理（auto_route 覆盖转发流量）"
+domain = "网络"
+tags = ["sing-box", "模式"]
+program = "sing-box-switch-tun"
+allow_empty = true            # 所有开关都可留空 → 默认就是「不带参数跑脚本」
+mode = "interactive"
+danger = "caution"
+install = "./scripts/sing-box/install.sh"
+input = "当前 eBPF 配置；TUN 定义取自最近的 config.*.pre-ebpf.json 备份"
+output = "切换后的配置 + 备份 + 健康检查（tun0 / 出口 / 分流 / DNS）"
+features = "只替换 inbound：DNS 故障转移组、广告规则、规则集路径全部原样保留；失败自动回滚"
+
+[[action.argument]]
+key = "from"
+label = "TUN 定义来源"
+kind = "path"
+flag = "--from"
+help = "留空 = 自动用最近一份 pre-ebpf 备份；也可以指定某一份"
+
+[[action]]
+id = "sing-box-container-proxy"
+name = "sing-box 容器代理"
+summary = "让容器也走代理：在 podman 网桥上开 eBPF shared 数据面"
+domain = "网络"
+tags = ["sing-box", "容器"]
+program = "sing-box-container-proxy"
+allow_empty = true            # 所有开关都可留空 → 默认就是「不带参数跑脚本」
+mode = "interactive"
+danger = "caution"
+install = "./scripts/sing-box/install.sh"
+input = "当前 eBPF 配置 + rootful podman 网桥"
+output = "开启 / 关闭 shared 后的配置，并起一个真容器验证出口"
+features = "先用 --mode all 预检拦掉内核不支持的 TC 路径（本机就是不支持的那种）；起真容器实测出口；失败自动回滚"
+
+[[action.argument]]
+key = "iface"
+label = "下游接口"
+kind = "text"
+flag = "--iface"
+help = "留空 = 自动找 podman 网桥（找不到就用 rootful podman 建一个）"
+
+[[action.argument]]
+key = "disable"
+label = "关闭 shared"
+kind = "toggle"
+flag = "--disable"
+default = "false"
+help = "回到「容器只走直连」；容器要用代理就给它 --network=host"

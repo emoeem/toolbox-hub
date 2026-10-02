@@ -317,6 +317,36 @@ main ─► cli ──► packages ──► libalpm       （命令行模式：
 - 二进制**动态链接 libalpm**：只支持 Arch（这个工具箱本来就一半是 pacman / paru）；
 - 「可更新数」按本地同步库算，库旧了会偏小（状态行会说出来）。
 
+## sing-box：一套内置的本机代理运维动作
+
+`manifests/sing-box.toml` 里带了 5 个「网络」域的动作，真正干活的是 `scripts/sing-box/`
+下的脚本 —— 动作只负责把开关填成表单，**改配置的安全管线全在脚本里**：
+
+```text
+改配置（内存里）→ sing-box check（不过就什么都不做）→ 时间戳备份 → 原子替换
+  → 重启 → 健康检查 → 任一环节失败就自动回滚 + 重启
+```
+
+| 动作 | 干什么 |
+| --- | --- |
+| **sing-box 体检** | 只读：模式 / 入站 / 出口 / 分流 / DNS 拦截 / 规则集构成 / 备份，一屏看完（`--fast` 跳过联网检查） |
+| **sing-box 审计修复** | 补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则；6 个开关（国内 IP 表 / 直连清单 / 广告补漏 / DNS 故障转移组 / 规则集走包路径 / 广告改 NXDOMAIN） |
+| **sing-box 切到 eBPF** | TUN → eBPF：本机流量在内核 socket 层接管；可选数据面 `cgroup`/`tc`、可一并接管下游接口 |
+| **sing-box 切回 TUN** | eBPF → TUN：**容器 / 虚拟机也能被代理**（TUN 用 `auto_route` 覆盖转发流量） |
+| **sing-box 容器代理** | 在 podman 网桥上开 eBPF `shared` 数据面，让 rootful 容器也走代理 |
+
+源码用户先 `./scripts/sing-box/install.sh`（装到 `~/.local/bin`）；装了 Arch 包的不用管，
+PKGBUILD 已经把它们放进 `/usr/bin`。细节与踩过的坑见 [`scripts/sing-box/README.md`](scripts/sing-box/README.md)。
+
+**危险度是认真的**：四个会改配置的动作都是 `caution` + `interactive`（要 sudo 密码、
+也要能看见回滚日志），只有体检是 `safe` + `capture`。有测试盯着这条策略
+（`sing_box_actions_drive_the_ops_scripts`），以后谁把开关名写错、或者忘了标危险度，CI 会红。
+
+**诚实提醒**：`tc` 数据面与 `shared` 都依赖内核的 TC eBPF 支持，而**本机内核不支持**
+（实跑报 `register TC eBPF TCP listener: operation not supported`）；注意预检
+`--mode local` 全绿**并不代表** TC 可用（那 28 项要 `--mode all` 才涉及，结果是 inconclusive）。
+所以脚本会在动配置**之前**先拦下这两条路，并提示容器改用 `--network=host`。
+
 ## 打包与分发
 
 `packaging/` 里有 PKGBUILD、手册页（roff）和源码包脚本：

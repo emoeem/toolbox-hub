@@ -57,6 +57,11 @@ package() {
   install -Dm644 completions/toolbox-hub.fish \
     "$pkgdir/usr/share/fish/vendor_completions.d/toolbox-hub.fish"
 
+  # sing-box 那 5 个内置动作真正执行的脚本（manifests/sing-box.toml）。
+  # manifest 的 program 写的是**裸命令名**、走 PATH 解析，所以必须放在 PATH 上的目录：
+  # 放 /usr/bin 而不是 /usr/local/bin —— 后者是留给用户自己覆盖系统文件的地方。
+  install -m755 scripts/sing-box/sing-box-* "$pkgdir/usr/bin/"
+
   # 许可证文件还没进仓库，有 LICENSE 之后取消注释
   # install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
