@@ -7,20 +7,18 @@
 //! 另外两个浮层（排序菜单、执行确认）盖在最上面：确认面板上那条命令就是马上要跑
 //! 的那条（[`crate::packages::command_preview`] 算的），不是另写一遍的说明文字。
 
-use ratatui::{
-    layout::{Constraint, Flex, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
-};
-use unicode_width::UnicodeWidthStr;
-
 use crate::{
     app::{
         App,
         package_view::{Confirm, PackageMode, PackageView, Pane},
     },
-    ui::theme,
+    ui::{display_width, theme},
+};
+use ratatui::{
+    layout::{Constraint, Flex, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -87,10 +85,6 @@ pub fn tab_hits(view: &PackageView, area: Rect) -> Vec<(Rect, TabTarget)> {
     }
 
     hits
-}
-
-fn display_width(text: &str) -> u16 {
-    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -209,12 +203,12 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     ));
 
     // 右端：键提示（paru 那行 `Tab:多选 | Enter:安装 | …`）
-    let hint = "打字:过滤 · Space:多选 · Enter:装 · Esc:清空筛选 · Ctrl+R:上网搜";
+    let hint = "打字:过滤 · 1-4:模式 · Space:多选 · Enter:装 · Esc:清空 · Ctrl+R:上网搜";
     let used: usize = spans
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .map(|span| display_width(span.content.as_ref()) as usize)
         .sum();
-    let room = (area.width as usize).saturating_sub(used + UnicodeWidthStr::width(hint) + 2);
+    let room = (area.width as usize).saturating_sub(used + display_width(hint) as usize + 2);
     spans.push(Span::raw(" ".repeat(room)));
     spans.push(Span::styled(hint, Style::default().fg(theme::FAINT)));
 
@@ -704,7 +698,7 @@ fn draw_info(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
 
 fn pad_to_width(value: &str, width: usize) -> String {
     let mut padded = value.to_string();
-    padded.push_str(&" ".repeat(width.saturating_sub(UnicodeWidthStr::width(value))));
+    padded.push_str(&" ".repeat(width.saturating_sub(display_width(value) as usize)));
     padded
 }
 

@@ -98,6 +98,8 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  输出视图", Style::default().fg(theme::DIM)),
             Span::styled("  ·  ", Style::default().fg(theme::FAINT)),
+            Span::styled("←→ 横向滚动", Style::default().fg(theme::DIM)),
+            Span::styled("  ·  ", Style::default().fg(theme::FAINT)),
             Span::styled("q 关闭", theme::title_style()),
         ])
     } else if app.form.is_some() {

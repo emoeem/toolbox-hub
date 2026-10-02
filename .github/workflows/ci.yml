@@ -9,6 +9,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 冒烟测试要真跑 ffmpeg / 7z / jq / pandoc / exiftool / magick，还要联网问 AUR 与
+  # 新闻源 —— 放进每次 PR 只会又慢又飘。所以每周跑一次，也能手动触发。
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,3 +47,36 @@ jobs:
 
       - name: 测试
         run: cargo test
+
+  # README 里那句「行为用测试钉住，工具链用冒烟钉住」的后半句。
+  # 这批 `--ignored` 测试抓的都是只有真跑才看得见的问题（7z 只认 -mx9、
+  # ImageMagick 要求输入在前、ffmpeg 漏 -i 会把输入当输出…），所以别删。
+  smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链与冒烟要用到的 CLI
+        run: >-
+          pacman -Syu --noconfirm --needed
+          base-devel git rust pkgconf chafa
+          ffmpeg p7zip jq pandoc perl-image-exiftool imagemagick
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-smoke-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # 这里会真跑 ffmpeg / 7z / jq / pandoc / exiftool / magick，
+      # 并真读本机 pacman 数据库、真联网问 AUR 与 Arch 新闻。
+      - name: 冒烟（真跑外部工具 + 真读数据库/联网）
+        run: cargo test -- --ignored
+
+      - name: 打包用的 tarball 还能生成
+        run: bash packaging/make-source-tarball.sh

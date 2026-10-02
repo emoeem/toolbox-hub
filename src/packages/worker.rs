@@ -39,7 +39,10 @@ use super::{
 
 /// 发给数据库线程的请求。
 pub enum DbRequest {
-    Search(String),
+    Search {
+        search_id: u64,
+        term: String,
+    },
     /// 整个同步库（paru 那个「一进来就有 38869 个包」的列表）。
     AllPackages,
     Info(String),
@@ -58,7 +61,10 @@ pub enum DbRequest {
 /// 发给网络线程的请求。
 pub enum NetRequest {
     /// AUR 搜索（顺带缓存整包信息，之后看信息不用再联网）。
-    AurSearch(String),
+    AurSearch {
+        search_id: u64,
+        term: String,
+    },
     AurInfo(String),
     News,
 }
@@ -66,15 +72,22 @@ pub enum NetRequest {
 /// 从两个线程回来的东西（共用一个 channel）。
 pub enum Response {
     /// 官方源搜索结果。
-    Official(Vec<PackageHit>),
+    Official {
+        search_id: u64,
+        hits: Vec<PackageHit>,
+    },
     /// 全部包（浏览模式）。
     AllPackages(Vec<PackageHit>),
     /// AUR 搜索结果。
-    Aur(Vec<PackageHit>),
+    Aur {
+        search_id: u64,
+        hits: Vec<PackageHit>,
+    },
     /// 某一路失败了（`source` 是「官方源」或「AUR」）。
     Failed {
         source: &'static str,
         error: String,
+        search_id: Option<u64>,
     },
     Info(InfoOutcome),
     Installed(Result<Vec<InstalledPackage>, String>),
@@ -145,9 +158,15 @@ impl Worker {
     }
 
     /// 搜两路：官方源走数据库线程，AUR 走网络线程，谁先回来谁先上屏。
-    pub fn search(&self, term: &str) {
-        self.db(DbRequest::Search(term.to_string()));
-        self.net(NetRequest::AurSearch(term.to_string()));
+    pub fn search(&self, term: &str, search_id: u64) {
+        self.db(DbRequest::Search {
+            search_id,
+            term: term.to_string(),
+        });
+        self.net(NetRequest::AurSearch {
+            search_id,
+            term: term.to_string(),
+        });
     }
 
     /// 查包信息：AUR 走网络（多半命中搜索缓存），其余走数据库。
@@ -220,17 +239,18 @@ fn spawn_db(
             };
             while let Ok(request) = db_rx.recv() {
                 let response = match request {
-                    DbRequest::Search(term) => match db.search(&term) {
+                    DbRequest::Search { search_id, term } => match db.search(&term) {
                         Ok(hits) => {
                             // 顺手把本地版本表刷新一份给网络线程用
                             if let Ok(mut shared) = local.write() {
                                 *shared = db.local_versions().clone();
                             }
-                            Response::Official(hits)
+                            Response::Official { search_id, hits }
                         }
                         Err(error) => Response::Failed {
                             source: "官方源",
                             error,
+                            search_id: Some(search_id),
                         },
                     },
                     DbRequest::Info(name) => Response::Info(match db.info(&name) {
@@ -284,13 +304,14 @@ fn spawn_net(
             let mut net = Net::new();
             while let Ok(request) = net_rx.recv() {
                 let response = match request {
-                    NetRequest::AurSearch(term) => {
+                    NetRequest::AurSearch { search_id, term } => {
                         let installed = local.read().map(|map| map.clone()).unwrap_or_default();
                         match net.search_aur(&term, &installed) {
-                            Ok(hits) => Response::Aur(hits),
+                            Ok(hits) => Response::Aur { search_id, hits },
                             Err(error) => Response::Failed {
                                 source: "AUR",
                                 error,
+                                search_id: Some(search_id),
                             },
                         }
                     }
@@ -342,9 +363,15 @@ fn file_integrity_output() -> Result<Vec<String>, String> {
 /// 数据库打不开时，把错误翻译成「这次请求该回什么」。
 fn failed_for(request: &DbRequest, error: &str) -> Response {
     match request {
-        DbRequest::AllPackages | DbRequest::Search(_) => Response::Failed {
+        DbRequest::AllPackages => Response::Failed {
             source: "官方源",
             error: error.to_string(),
+            search_id: None,
+        },
+        DbRequest::Search { search_id, .. } => Response::Failed {
+            source: "官方源",
+            error: error.to_string(),
+            search_id: Some(*search_id),
         },
         DbRequest::Info(name) => Response::Info(InfoOutcome {
             name: name.clone(),
@@ -413,9 +440,9 @@ mod tests {
 
     fn describe(response: &Response) -> &'static str {
         match response {
-            Response::Official(_) => "官方源结果",
+            Response::Official { .. } => "官方源结果",
             Response::AllPackages(_) => "全部包",
-            Response::Aur(_) => "AUR 结果",
+            Response::Aur { .. } => "AUR 结果",
             Response::Failed { .. } => "失败",
             Response::Info(_) => "包信息",
             Response::Installed(_) => "已安装",

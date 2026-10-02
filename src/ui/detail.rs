@@ -81,11 +81,18 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     ];
 
     // 只有缺依赖时才多画这一行：直接告诉用户怎么把缺的装上。
+    //
+    // 插在**标题行之后**，而不是排在最后：详情面板的高度是定死的（24 行终端只给
+    // 6 行内容），长摘要还会换行多吃一两行 —— 排最后正好会被裁掉，而缺依赖时
+    // 这一行恰恰是此刻唯一要照做的东西。
     if let Some(hint) = tool.install_label() {
-        lines.push(Line::from(vec![
-            Span::styled("安装  ", Style::default().fg(theme::DIM)),
-            Span::styled(hint, Style::default().fg(theme::YELLOW)),
-        ]));
+        lines.insert(
+            1,
+            Line::from(vec![
+                Span::styled("安装  ", Style::default().fg(theme::DIM)),
+                Span::styled(hint, Style::default().fg(theme::YELLOW)),
+            ]),
+        );
     }
 
     frame.render_widget(

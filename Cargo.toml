@@ -2,6 +2,9 @@
 name = "toolbox-hub"
 version = "0.1.0"
 edition = "2024"
+description = "Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管理（直连 libalpm）"
+license = "MIT"
+repository = "https://github.com/emoeem/toolbox-hub"
 
 [dependencies]
 # libalpm 直连：搜索 / 包信息 / 已安装 / 可更新数都走它，不再解析 pacman 的文本输出。

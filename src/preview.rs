@@ -65,8 +65,7 @@ impl Preview {
         Self {
             picker: None,
             detected: false,
-            // 标题上先写「图片预览」：协议要真去问终端才知道，
-            // 而问一次要等到第一次真要画图时才做（见 detect 的注释）。
+            // 标题上先写「图片预览」：协议要真去问终端才知道。
             protocol: String::from("图片预览"),
             state: None,
             shown: None,
@@ -89,9 +88,9 @@ impl Preview {
         preview
     }
 
-    /// 探测一次终端能力（懒执行，只做一次）。
+    /// 探测一次终端能力（懒执行，只做一次；由主循环在 draw 回调之外调用）。
     ///
-    /// 这一步会往终端写一个查询序列并等回答（最多 1 秒）。所以它必须发生在
+    /// 这一步会往终端写一个查询序列并等回答（最多 2 秒）。所以它必须发生在
     /// **已经进了备用屏幕、开了 raw 模式**之后：不然终端的回答会显示在屏幕上，
     /// 而没进 raw 模式时回车也会被回显。
     pub fn detect(&mut self) {
@@ -119,6 +118,10 @@ impl Preview {
         }
     }
 
+    pub fn needs_detection(&self) -> bool {
+        self.pending.is_some() && !self.detected
+    }
+
     /// 当前协议名（界面显示用）。
     pub fn protocol(&self) -> &str {
         &self.protocol
@@ -143,7 +146,6 @@ impl Preview {
             return;
         }
 
-        self.detect();
         self.pending = Some(path.to_path_buf());
         self.problem = None;
 

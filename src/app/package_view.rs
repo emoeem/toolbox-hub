@@ -152,6 +152,7 @@ pub struct PackageView {
     pub selected: usize,
     pub searched: Option<String>,
     pub searching: bool,
+    search_id: u64,
     pub errors: Vec<String>,
 
     // ── 已安装 ──
@@ -247,6 +248,7 @@ impl PackageView {
             selected: 0,
             searched: None,
             searching: false,
+            search_id: 0,
             errors: Vec::new(),
             installed: Vec::new(),
             installed_visible: Vec::new(),
@@ -383,6 +385,8 @@ impl PackageView {
         let _ = packages::save_searches_to(&packages::searches_path(), &self.history);
 
         self.searching = true;
+        self.search_id = self.search_id.wrapping_add(1);
+        let search_id = self.search_id;
         self.awaiting_official = true;
         self.awaiting_aur = true;
         self.searched = Some(term.clone());
@@ -398,7 +402,7 @@ impl PackageView {
         self.selected = 0;
         self.message = format!("搜「{term}」…（官方源 + AUR 两路并行，先到的先显示）");
 
-        worker.search(&term);
+        worker.search(&term, search_id);
     }
 
     /// 已安装包浏览器：`pacman -Q/-Qe/-Qm/-Qtd`（都是本地查询，很快）。
@@ -507,13 +511,15 @@ impl PackageView {
         self.auto_searched = Some(term.clone());
         self.searched = Some(term.clone());
         self.searching = true;
+        self.search_id = self.search_id.wrapping_add(1);
+        let search_id = self.search_id;
         self.awaiting_official = true;
         self.awaiting_aur = true;
         self.official_hits.clear();
         self.aur_hits.clear();
         self.message = format!("本地没有「{term}」，正在问官方源与 AUR…");
         if let Some(worker) = self.worker.as_ref() {
-            worker.search(&term);
+            worker.search(&term, search_id);
         }
         true
     }
@@ -528,17 +534,26 @@ impl PackageView {
                     self.rebuild_hits();
                 }
             }
-            Response::Official(hits) => {
+            Response::Official { search_id, hits } if search_id == self.search_id => {
                 self.awaiting_official = false;
                 self.official_hits = hits;
                 self.rebuild_hits();
             }
-            Response::Aur(hits) => {
+            Response::Official { .. } => {}
+            Response::Aur { search_id, hits } if search_id == self.search_id => {
                 self.awaiting_aur = false;
                 self.aur_hits = hits;
                 self.rebuild_hits();
             }
-            Response::Failed { source, error } => {
+            Response::Aur { .. } => {}
+            Response::Failed {
+                source,
+                error,
+                search_id,
+            } => {
+                if search_id.is_some_and(|search_id| search_id != self.search_id) {
+                    return;
+                }
                 if source == "官方源" {
                     self.awaiting_official = false;
                 } else {
@@ -842,7 +857,7 @@ impl PackageView {
     /// 搜索词同时干两件事：`Enter` 拿去问官方源与 AUR（远端），打字则**本地**
     /// 模糊过滤已有结果 —— 这就是 pac（fzf 那一层）的手感：键入即筛、回车才上网找。
     pub fn apply_filter(&mut self) {
-        let needle = self.query.text().trim().to_string();
+        let needle = self.query.text().trim().to_lowercase();
         let mut rows: Vec<(usize, i32)> = Vec::new();
 
         for (index, hit) in self.hits.iter().enumerate() {
@@ -861,13 +876,16 @@ impl PackageView {
                 continue;
             }
 
-            // 名字优先，其次描述与仓库名（各降一档）
-            let mut best = fuzzy_score(&needle, &hit.name);
-            if let Some(score) = fuzzy_score(&needle, &hit.description) {
+            // 名字优先，其次描述与仓库名（各降一档）。
+            //
+            // 用 `fuzzy_score_ci` 而不是先 `to_lowercase()`：全库三万个包 × 三路
+            // × 每敲一个键，这几行 `to_lowercase()` 曾经是近十万次分配。
+            let mut best = packages::fuzzy_score_ci(&needle, &hit.name);
+            if let Some(score) = packages::fuzzy_score_ci(&needle, &hit.description) {
                 let score = score - 2;
                 best = Some(best.map_or(score, |current: i32| current.max(score)));
             }
-            if let Some(score) = fuzzy_score(&needle, &hit.repo) {
+            if let Some(score) = packages::fuzzy_score_ci(&needle, &hit.repo) {
                 let score = score - 4;
                 best = Some(best.map_or(score, |current: i32| current.max(score)));
             }
@@ -1818,6 +1836,35 @@ mod tests {
         assert!(view.maybe_auto_search());
         assert!(view.searching, "自动搜索在响应前就应阻止重复请求");
         assert!(!view.maybe_auto_search(), "同一查询不能重复发起");
+    }
+
+    #[test]
+    fn stale_search_responses_cannot_replace_current_results() {
+        let original = hit("extra", "current-package", None);
+        let mut view = view_with(vec![original.clone()]);
+        view.search_id = 2;
+        view.searched = Some(String::from("current"));
+        view.searching = true;
+        view.awaiting_official = true;
+        view.awaiting_aur = true;
+
+        view.handle(Response::Official {
+            search_id: 1,
+            hits: vec![hit("extra", "stale-official", None)],
+        });
+        view.handle(Response::Aur {
+            search_id: 1,
+            hits: vec![hit("aur", "stale-aur", Some(1))],
+        });
+        view.handle(Response::Failed {
+            source: "AUR",
+            error: String::from("stale failure"),
+            search_id: Some(1),
+        });
+
+        assert_eq!(view.hits, vec![original]);
+        assert!(view.awaiting_official && view.awaiting_aur);
+        assert!(view.errors.is_empty());
     }
 
     /// 仓库标签与排序都作用在同一份结果上；标签带命中数。

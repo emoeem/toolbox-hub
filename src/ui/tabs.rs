@@ -11,6 +11,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, Scope},
@@ -18,16 +19,26 @@ use crate::{
     ui::theme,
 };
 
-pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+#[derive(Clone, Debug)]
+pub struct DomainTab {
+    pub index: usize,
+    pub label: String,
+    pub style: Style,
+    pub hit: Rect,
+}
+
+/// 域标签的文字、渲染样式与鼠标矩形共用一个计算结果。
+pub fn domain_tabs(app: &App, area: Rect) -> Vec<DomainTab> {
     let current = app.current_domain();
     let compact = area.width < 100;
+    let mut x = area.x;
 
-    let titles: Vec<Line> = Domain::ALL
+    Domain::ALL
         .iter()
-        .map(|domain| {
+        .enumerate()
+        .map(|(index, domain)| {
             let count = app.registry.tool_count_in(*domain);
-            let selected = *domain == current;
-            let style = if selected {
+            let style = if *domain == current {
                 Style::default()
                     .fg(theme::BG)
                     .bg(theme::domain_color(*domain))
@@ -44,13 +55,30 @@ pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             } else {
                 format!(" {} {} ", domain.label(), count)
             };
-            Line::from(Span::styled(label, style))
+            let width = UnicodeWidthStr::width(label.as_str()).min(u16::MAX as usize) as u16;
+            let hit = Rect::new(x, area.y, width, 1);
+            x = x.saturating_add(width).saturating_add(1);
+            DomainTab {
+                index,
+                label,
+                style,
+                hit,
+            }
         })
+        .collect()
+}
+
+pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let compact = area.width < 100;
+    let titles: Vec<Line> = domain_tabs(app, area)
+        .into_iter()
+        .map(|tab| Line::from(Span::styled(tab.label, tab.style)))
         .collect();
 
     frame.render_widget(
         Tabs::new(titles)
             .select(app.domain)
+            .padding("", "")
             .divider(if compact {
                 Span::raw(" ")
             } else {

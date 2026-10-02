@@ -253,9 +253,58 @@ pub struct Viewer {
     pub status: String,
     /// 已滚动行数；渲染时按可视高度夹紧。
     pub scroll: usize,
+    /// 已横向滚动的终端列数。
+    pub horizontal_scroll: u16,
+    /// 最长那一行的显示宽度（列）。横向滚动按它夹紧 —— 否则一直按 `→`
+    /// 会滚进一片空白，看着像界面卡死了。
+    pub max_line_width: u16,
 }
 
 impl Viewer {
+    /// 竖直滚动（负数向上）。渲染时还会按可视高度夹紧。
+    pub fn scroll_by(&mut self, delta: isize) {
+        self.scroll = (self.scroll as isize + delta).max(0) as usize;
+    }
+
+    /// 横向滚动（负数向左）。最多到最长行的最后一列 —— 再往右是空白，
+    /// 看不出「已经到头了」。
+    pub fn scroll_horizontal_by(&mut self, delta: i16) {
+        let limit = self.max_line_width.saturating_sub(1);
+        self.horizontal_scroll =
+            (self.horizontal_scroll as i32 + i32::from(delta)).clamp(0, i32::from(limit)) as u16;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = self.body.lines().count();
+    }
+
+    /// 把一个字符串包成可滚动的视图（`toolbox-hub ui pager` 用）。
+    pub fn from_text(title: String, body: String) -> Self {
+        let body = if body.ends_with('\n') {
+            body
+        } else {
+            format!("{body}\n")
+        };
+        let max_line_width = body
+            .lines()
+            .map(unicode_width::UnicodeWidthStr::width)
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
+        Self {
+            title,
+            body,
+            status: String::new(),
+            scroll: 0,
+            horizontal_scroll: 0,
+            max_line_width,
+        }
+    }
+
     /// 由一批捕获结果拼成一个视图。没有结果时返回 `None`。
     pub fn from_captured(captured: &[Captured]) -> Option<Self> {
         let first = captured.first()?;
@@ -284,15 +333,25 @@ impl Viewer {
             first.summary()
         };
 
+        let body = format!("{}\n", body.trim_end());
+        let max_line_width = body
+            .lines()
+            .map(unicode_width::UnicodeWidthStr::width)
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
+
         Some(Self {
             title: if multiple {
                 format!("{} 个命令", captured.len())
             } else {
                 first.command.clone()
             },
-            body: format!("{}\n", body.trim_end()),
+            body,
             status,
             scroll: 0,
+            horizontal_scroll: 0,
+            max_line_width,
         })
     }
 }
@@ -609,6 +668,22 @@ impl App {
         self.table.select(Some(self.selected));
     }
 
+    pub fn select_first(&mut self) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        self.selected = 0;
+        self.table.select(Some(0));
+    }
+
+    pub fn select_last(&mut self) {
+        let Some(last) = self.filtered.len().checked_sub(1) else {
+            return;
+        };
+        self.selected = last;
+        self.table.select(Some(last));
+    }
+
     pub fn toggle_mark(&mut self) {
         let Some(&index) = self.filtered.get(self.selected) else {
             return;
@@ -899,19 +974,25 @@ impl App {
     /// 滚动输出视图；负数向上。渲染时还会按可视高度夹紧。
     pub fn viewer_scroll(&mut self, delta: isize) {
         if let Some(viewer) = self.viewer.as_mut() {
-            viewer.scroll = (viewer.scroll as isize + delta).max(0) as usize;
+            viewer.scroll_by(delta);
+        }
+    }
+
+    pub fn viewer_scroll_horizontal(&mut self, delta: i16) {
+        if let Some(viewer) = self.viewer.as_mut() {
+            viewer.scroll_horizontal_by(delta);
         }
     }
 
     pub fn viewer_to_top(&mut self) {
         if let Some(viewer) = self.viewer.as_mut() {
-            viewer.scroll = 0;
+            viewer.scroll_to_top();
         }
     }
 
     pub fn viewer_to_bottom(&mut self) {
         if let Some(viewer) = self.viewer.as_mut() {
-            viewer.scroll = viewer.body.lines().count();
+            viewer.scroll_to_bottom();
         }
     }
 
@@ -2612,6 +2693,59 @@ mod tests {
         App::new(registry, PathBuf::from("/tmp/bin"), ReloadReport::default())
     }
 
+    /// 列表上直接按 Enter（不走表单）也必须把 `base_argv` 带上。
+    ///
+    /// 这条抓到过真漏：列表/批量那条路曾经把 `argv` 写成空 `Vec`，于是
+    /// `journalctl -p err -b` 变成光跑 `journalctl`（dump 整个日志），
+    /// `systemctl` / `lsblk` / `lspci` 那几个则是**静默**给出错误结果。
+    #[test]
+    fn a_no_argument_capture_tool_keeps_its_base_argv() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // 借一件无参的 capture 动作，只换掉程序（换成 echo，真跑也无害）
+        // 与 base_argv（放一个能认出来的标记）。
+        let mut action_tool = crate::providers::manifest::bundled_tools()
+            .into_iter()
+            .find(|tool| {
+                tool.mode == RunMode::Capture
+                    && tool
+                        .action
+                        .as_ref()
+                        .is_some_and(|action| action.arguments.is_empty())
+            })
+            .expect("system.toml 提供了无参数的 capture 动作");
+        // 放进「媒体」域：`App::new` 默认停在第一个域，域不对列表就是空的。
+        action_tool.domain = Domain::Media;
+        action_tool.path = PathBuf::from("/usr/bin/echo");
+        action_tool.ready = true;
+        action_tool.missing_deps.clear();
+        action_tool.danger = Danger::Safe;
+        action_tool.action.as_mut().expect("带动作").base_argv =
+            vec![String::from("base-argv-marker")];
+
+        let registry = Registry::from_tools(vec![action_tool]);
+        let mut app = App::new(registry, PathBuf::from("/tmp/bin"), ReloadReport::default());
+        let cwd = app.work_dir.clone();
+
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &cwd,
+        )
+        .expect("按下 Enter");
+
+        let command = app
+            .running
+            .as_ref()
+            .map(|running| running.job.command.clone())
+            .unwrap_or_default();
+        assert!(
+            command.contains("base-argv-marker"),
+            "无参数动作把 base_argv 丢了，实际跑的是：{command}"
+        );
+        app.cancel_job();
+    }
+
     #[test]
     fn enter_opens_the_form_only_for_tools_that_need_arguments() {
         let mut app = action_app();
@@ -4025,5 +4159,117 @@ mod tests {
         app.switch_domain(Domain::Network.index());
         app.move_selection(1); // 空视图下不该 panic
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn package_center_numbers_switch_modes_and_alt_numbers_filter() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = action_app();
+        let mut packages = crate::app::package_view::PackageView::new(
+            Vec::new(),
+            None,
+            crate::config::PackagePrefs::default(),
+        );
+        packages.repos = vec![crate::app::package_view::RepoChip {
+            name: String::from("extra"),
+            enabled: true,
+            count: 1,
+        }];
+        app.packages = Some(packages);
+        let cwd = app.work_dir.clone();
+
+        for (digit, expected) in [
+            ('1', crate::app::package_view::PackageMode::Search),
+            ('2', crate::app::package_view::PackageMode::Installed),
+            ('3', crate::app::package_view::PackageMode::News),
+            ('4', crate::app::package_view::PackageMode::Health),
+        ] {
+            crate::app::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE),
+                &cwd,
+            )
+            .expect("handle key");
+            assert_eq!(app.packages.as_ref().map(|view| view.mode), Some(expected));
+        }
+
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &cwd,
+        )
+        .expect("search mode");
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+            &cwd,
+        )
+        .expect("toggle repo");
+        assert!(!app.packages.as_ref().expect("package view").repos[0].enabled);
+
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &cwd,
+        )
+        .expect("type search digit");
+        assert_eq!(
+            app.packages.as_ref().map(|view| view.query.text()),
+            Some("7"),
+            "普通数字仍可输入搜索词"
+        );
+    }
+
+    #[test]
+    fn list_navigation_keys_jump_and_page_through_results() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = app();
+        let cwd = app.work_dir.clone();
+        let press = |app: &mut App, code: KeyCode, modifiers: KeyModifiers| {
+            crate::app::handle_key(app, KeyEvent::new(code, modifiers), &cwd).expect("handle key");
+        };
+
+        press(&mut app, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.selected, 2);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(app.selected, 0);
+        press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(app.selected, 2);
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.selected, 0);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn f1_opens_and_closes_help_while_package_center_is_active() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = action_app();
+        app.packages = Some(crate::app::package_view::PackageView::new(
+            Vec::new(),
+            None,
+            crate::config::PackagePrefs::default(),
+        ));
+        let cwd = app.work_dir.clone();
+
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+            &cwd,
+        )
+        .expect("open help");
+        assert!(app.is_help_open());
+
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &cwd,
+        )
+        .expect("close help");
+        assert!(!app.is_help_open());
+        assert!(app.packages.is_some(), "关闭帮助不应退出包中心");
     }
 }

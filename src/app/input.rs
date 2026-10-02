@@ -16,13 +16,6 @@
 
 use std::{path::Path, path::PathBuf, time::Instant};
 
-use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
-    crossterm::terminal::size,
-    layout::{Position, Rect},
-};
-use unicode_width::UnicodeWidthStr;
-
 use crate::{
     app::{
         App, Viewer,
@@ -30,6 +23,11 @@ use crate::{
     },
     model::{Domain, RunMode},
     runtime,
+};
+use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    crossterm::terminal::size,
+    layout::{Position, Rect},
 };
 
 /// 处理鼠标输入。
@@ -52,24 +50,6 @@ pub fn handle_mouse(
         return handle_packages_mouse(app, mouse, cwd);
     }
 
-    if app.viewer.is_some() {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => app.viewer_scroll(-3),
-            MouseEventKind::ScrollDown => app.viewer_scroll(3),
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    if app.files.is_some()
-        || app.history.is_some()
-        || app.picker.is_some()
-        || app.form.is_some()
-        || app.is_editing_dir()
-    {
-        return Ok(());
-    }
-
     let (width, height) = size().unwrap_or((80, 24));
     let screen = Rect::new(0, 0, width, height);
     let areas = crate::ui::main_layout(app, screen);
@@ -77,10 +57,65 @@ pub fn handle_mouse(
         return Ok(());
     }
     let point = Position::new(mouse.column, mouse.row);
+    let content = areas.list.union(areas.detail);
+
+    if app.viewer.is_some() {
+        if content.contains(point) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.viewer_scroll(-3),
+                MouseEventKind::ScrollDown => app.viewer_scroll(3),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+    if app.files.is_some() {
+        if content.contains(point) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.files_move(-3),
+                MouseEventKind::ScrollDown => app.files_move(3),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+    if app.history.is_some() {
+        if content.contains(point) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.history_move(-3),
+                MouseEventKind::ScrollDown => app.history_move(3),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+    if app.picker.is_some() {
+        if content.contains(point) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.picker_move(-3),
+                MouseEventKind::ScrollDown => app.picker_move(3),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+    if app.form.is_some() {
+        if areas.list.contains(point) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.form_move(-1),
+                MouseEventKind::ScrollDown => app.form_move(1),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+    if app.is_editing_dir() {
+        return Ok(());
+    }
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.move_selection(-3),
-        MouseEventKind::ScrollDown => app.move_selection(3),
+        MouseEventKind::ScrollUp if areas.list.contains(point) => app.move_selection(-3),
+        MouseEventKind::ScrollDown if areas.list.contains(point) => app.move_selection(3),
         MouseEventKind::Down(MouseButton::Left) => {
             if areas.domains.contains(point) {
                 if let Some(index) = domain_at(areas.domains, mouse.column, app) {
@@ -162,27 +197,10 @@ fn is_double_click(mouse: MouseEvent) -> bool {
 }
 
 fn domain_at(area: Rect, x: u16, app: &App) -> Option<usize> {
-    let mut cursor = area.x;
-    for (index, domain) in Domain::ALL.iter().enumerate() {
-        let count = app.registry.tool_count_in(*domain);
-        let label = if area.width < 100 {
-            domain.label().to_string()
-        } else if count == 0 {
-            format!(" {} ", domain.label())
-        } else {
-            format!(" {} {} ", domain.label(), count)
-        };
-        let width = UnicodeWidthStr::width(label.as_str()).min(u16::MAX as usize) as u16;
-        let end = cursor.saturating_add(width);
-        if x >= cursor && x < end {
-            return Some(index);
-        }
-        cursor = end.saturating_add(1);
-        if cursor >= area.right() {
-            break;
-        }
-    }
-    None
+    crate::ui::domain_tabs(app, area)
+        .into_iter()
+        .find(|tab| tab.hit.contains(Position::new(x, area.y)))
+        .map(|tab| tab.index)
 }
 
 fn package_panel_area(app: &App, screen: Rect) -> Rect {
@@ -357,6 +375,29 @@ pub fn handle_key(
     key: KeyEvent,
     cwd: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    if key.code == KeyCode::F(1) {
+        if app.is_help_open() {
+            app.close_help();
+        } else {
+            app.open_help();
+        }
+        return Ok(false);
+    }
+
+    // 帮助是盖在所有模式上的全局面板，优先于包管理和其它专属输入处理。
+    if app.is_help_open() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_help(),
+            KeyCode::Up | KeyCode::Char('k') => app.scroll_help(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.scroll_help(1),
+            KeyCode::PageUp => app.scroll_help(-10),
+            KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_help(10),
+            KeyCode::Home | KeyCode::Char('g') => app.help = Some(0),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     // 原生包管理视图开着时它吃掉所有按键（它有搜索框和队列两种焦点）。
     if app.packages.is_some() {
         return handle_packages_key(app, key, cwd);
@@ -389,20 +430,6 @@ pub fn handle_key(
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.files_push(ch);
             }
-            _ => {}
-        }
-        return Ok(false);
-    }
-
-    // 帮助屏开着时它吃掉所有按键（它是盖在最上面的一层）。
-    if app.is_help_open() {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_help(),
-            KeyCode::Up | KeyCode::Char('k') => app.scroll_help(-1),
-            KeyCode::Down | KeyCode::Char('j') => app.scroll_help(1),
-            KeyCode::PageUp => app.scroll_help(-10),
-            KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_help(10),
-            KeyCode::Home | KeyCode::Char('g') => app.help = Some(0),
             _ => {}
         }
         return Ok(false);
@@ -477,6 +504,12 @@ pub fn handle_key(
 
         KeyCode::Up | KeyCode::Char('k') if !ctrl => app.move_selection(-1),
         KeyCode::Down | KeyCode::Char('j') if !ctrl => app.move_selection(1),
+        KeyCode::Char('g') if !ctrl => app.select_first(),
+        KeyCode::Char('G') if !ctrl => app.select_last(),
+        KeyCode::Home => app.select_first(),
+        KeyCode::End => app.select_last(),
+        KeyCode::Char('u') if ctrl => app.move_selection(-8),
+        KeyCode::Char('d') if ctrl => app.move_selection(8),
         KeyCode::PageUp => app.move_selection(-8),
         KeyCode::PageDown => app.move_selection(8),
 
@@ -538,6 +571,8 @@ pub fn handle_key(
 fn handle_viewer_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => app.close_viewer(),
+        KeyCode::Left => app.viewer_scroll_horizontal(-8),
+        KeyCode::Right => app.viewer_scroll_horizontal(8),
         KeyCode::Up | KeyCode::Char('k') => app.viewer_scroll(-1),
         KeyCode::Down | KeyCode::Char('j') => app.viewer_scroll(1),
         KeyCode::PageUp | KeyCode::Char('b') => app.viewer_scroll(-15),
@@ -891,6 +926,7 @@ fn handle_packages_key(
     cwd: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let mode = app
         .packages
@@ -1047,7 +1083,11 @@ fn handle_packages_key(
             }
             KeyCode::Char('d') => {
                 if let Some(view) = app.packages.as_mut() {
-                    view.clear_queue();
+                    if view.pane == Pane::Rows {
+                        view.move_selection(10);
+                    } else {
+                        view.clear_queue();
+                    }
                 }
             }
             KeyCode::Char('s') => {
@@ -1103,6 +1143,27 @@ fn handle_packages_key(
 
     // ── 其余的键 ──
     match key.code {
+        // Alt+数字切筛选，数字键本身留给搜索词。
+        KeyCode::Char(digit @ '1'..='9') if alt => {
+            let index = digit as usize - '1' as usize;
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_chip(index);
+            }
+        }
+        KeyCode::Char('0') if alt => {
+            if let Some(view) = app.packages.as_mut() {
+                view.enable_all_chips();
+            }
+        }
+        // 1-4 直达四种模式。
+        KeyCode::Char(digit @ '1'..='4') => {
+            let index = digit as usize - '1' as usize;
+            if let Some(mode) = PackageMode::ALL.get(index).copied()
+                && let Some(view) = app.packages.as_mut()
+            {
+                view.set_mode(mode);
+            }
+        }
         // 切模式（输入态下 `←→` 归光标，所以模式放这两个键上）
         KeyCode::Char('[') => {
             if let Some(view) = app.packages.as_mut() {
@@ -1149,18 +1210,6 @@ fn handle_packages_key(
         KeyCode::Delete => {
             if let Some(view) = app.packages.as_mut() {
                 view.remove_from_queue();
-            }
-        }
-        // 数字键＝仓库/分类/已读标签开关（维护面板没有标签）
-        KeyCode::Char(digit @ '1'..='9') => {
-            let index = digit as usize - '1' as usize;
-            if let Some(view) = app.packages.as_mut() {
-                view.toggle_chip(index);
-            }
-        }
-        KeyCode::Char('0') => {
-            if let Some(view) = app.packages.as_mut() {
-                view.enable_all_chips();
             }
         }
         // Enter：上网搜 / 摆出要跑的命令 / 处理维护项
@@ -1299,14 +1348,29 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
         app.enqueue_captures(
             capture
                 .into_iter()
-                .map(|tool| crate::app::CaptureRequest {
-                    tool,
-                    argv: Vec::new(),
-                    record_argv: Vec::new(),
-                    values: Vec::new(),
-                    ok_exit_codes: vec![0],
-                    // 批量走列表路径，没有表单取值可探，所以没有百分比。
-                    total_seconds: None,
+                .map(|tool| {
+                    // 无参数的动作也必须把 `base_argv` 带上。`journalctl -p err -b`
+                    // 这类动作的参数全在 base_argv 里，丢了就变成光跑 `journalctl`：
+                    // 实测会 dump 整个日志；`systemctl` / `lsblk` / `lspci` 那几个
+                    // 则是**静默**给出错误结果（列出全部单元、丢掉 -f / -k 的信息）。
+                    let argv = tool
+                        .action
+                        .as_ref()
+                        .and_then(|action| action.build_argv(&action.default_values()).ok())
+                        .unwrap_or_default();
+                    crate::app::CaptureRequest {
+                        tool: tool.clone(),
+                        ok_exit_codes: tool
+                            .action
+                            .as_ref()
+                            .map(|action| action.ok_exit_codes.clone())
+                            .unwrap_or_else(|| vec![0]),
+                        // 列表路径没有表单取值，所以没有百分比。
+                        total_seconds: None,
+                        record_argv: argv.clone(),
+                        values: Vec::new(),
+                        argv,
+                    }
                 })
                 .collect(),
         );

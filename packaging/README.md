@@ -42,11 +42,10 @@ sudo pacman -U toolbox-hub-*.pkg.tar.zst
 `Cargo.lock` 在这个仓库里是**提交进去**的。`--locked` 让它按锁定版本构建 ——
 不写的话，某天某个依赖发新版就可能让打包突然失败，而失败原因跟你的改动毫无关系。
 
-## 交到 AUR（两件事还没做）
+## 交到 AUR（还剩一件事没做）
 
-1. **许可证**：仓库里还没有 `LICENSE`，`PKGBUILD` 里现在写的是 `license=('unknown')`。
-   AUR 要求这个字段真实有效 —— 定了许可证之后：提交 `LICENSE`、改 `license=()`、
-   把 `package()` 里那行 `install -Dm644 LICENSE …` 的注释打开。
+1. ~~**许可证**~~ —— 已经是 MIT 了：`LICENSE` 在仓库根目录，`PKGBUILD` 里是
+   `license=('MIT')`，`package()` 会把许可证装到 `/usr/share/licenses/toolbox-hub/`。
 2. **公开的源码地址**：`source=()` 现在指的是本地 tarball（`sha256sums=('SKIP')`），
    AUR 打包机拿不到。仓库推上去之后：
 

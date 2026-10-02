@@ -21,11 +21,13 @@ mod header;
 mod help;
 mod history;
 pub mod packages;
-mod picker;
+pub(crate) mod picker;
 mod run;
 mod table;
 mod tabs;
-mod viewer;
+pub(crate) mod viewer;
+
+pub(crate) use tabs::domain_tabs;
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -37,6 +39,14 @@ use ratatui::{
 use std::path::Path;
 
 use crate::app::{App, Scope};
+
+/// 一段文字在屏幕上占几列（中文 / emoji 是 2 列，不是 1）。
+///
+/// 凡是「按列算位置」的地方都走它 —— `chars().count()` 在中英混排时会少数，
+/// 算出来的命中区和换行数都会偏。
+pub(crate) fn display_width(text: &str) -> u16 {
+    unicode_width::UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
+}
 
 /// 把 `$HOME` 缩写成 `~`，让长路径在状态行与预览里放得下。
 pub(crate) fn short_path(path: &Path) -> String {
@@ -166,7 +176,9 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // 输出视图占满表格 + 详情两块；表单模式顶掉表格与详情；
     // 都没有就是普通的列表 + 详情。
     if app.viewer.is_some() {
-        viewer::draw(frame, app, list.union(detail));
+        if let Some(viewer) = app.viewer.as_ref() {
+            viewer::draw(frame, viewer, list.union(detail));
+        }
     } else if app.history.is_some() {
         history::draw(frame, app, list.union(detail));
     } else if app.packages.is_some() {
@@ -174,7 +186,9 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     } else if app.files.is_some() {
         files::draw(frame, app, list.union(detail));
     } else if app.picker.is_some() {
-        picker::draw(frame, app, list.union(detail));
+        if let Some(picker) = app.picker.as_ref() {
+            picker::draw(frame, picker, list.union(detail));
+        }
     } else if app.form.is_some() {
         form::draw_fields(frame, app, list);
         form::draw_preview(frame, app, detail);
@@ -953,6 +967,71 @@ mod tests {
             assert!(text.contains(domain), "54 列域栏少了 {domain}: {text}");
         }
         assert!(!text.contains("当前工具"), "紧凑模式收起详情面板: {text}");
+    }
+
+    #[test]
+    fn clicking_any_column_of_a_domain_label_hits_that_domain() {
+        for width in [140, 100, 99, 80, 60] {
+            let app = app();
+            let area = ratatui::layout::Rect::new(0, 4, width, 1);
+            let tabs = super::domain_tabs(&app, area);
+
+            for tab in &tabs {
+                for x in tab.hit.x..tab.hit.right() {
+                    let hit = tabs
+                        .iter()
+                        .find(|candidate| {
+                            candidate
+                                .hit
+                                .contains(ratatui::layout::Position::new(x, area.y))
+                        })
+                        .map(|candidate| candidate.index);
+                    assert_eq!(
+                        hit,
+                        Some(tab.index),
+                        "宽度 {width} 第 {x} 列应命中域 {}",
+                        tab.index
+                    );
+                }
+            }
+        }
+    }
+
+    /// 域标签**真的画在**它的命中矩形上。
+    ///
+    /// 上一条测试只证明 [`super::domain_tabs`] 自己前后一致；而它要防的是
+    /// 「渲染走 `Tabs` 部件、命中另算一套 x」这类漂移 —— 两边各自都对，
+    /// 合起来就是点「工具」跳到「包管理」。所以必须拿渲染结果再对一遍：
+    /// 去掉 `tabs.rs` 里的 `.padding("", "")`，这条就会红。
+    #[test]
+    fn rendered_domain_labels_sit_on_their_hit_rects() {
+        let squeeze =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+
+        for width in [140u16, 100, 99, 80, 60] {
+            let mut app = app();
+            let screen = render(&mut app, width, 24);
+            // 找第一行出现域名的：域标签条在表格之前，所以这样定位不怕布局改行数。
+            let row: Vec<char> = screen
+                .lines()
+                .find(|line| line.contains('媒'))
+                .expect("域标签行")
+                .chars()
+                .collect();
+
+            for tab in super::domain_tabs(&app, ratatui::layout::Rect::new(0, 4, width, 1)) {
+                let start = tab.hit.x as usize;
+                let cols = unicode_width::UnicodeWidthStr::width(tab.label.as_str());
+                let painted: String = row[start..(start + cols).min(row.len())].iter().collect();
+                assert_eq!(
+                    squeeze(&painted),
+                    squeeze(&tab.label),
+                    "宽度 {width}: 标签 {:?} 应画在 x={start}，那里实际是 {:?}",
+                    tab.label,
+                    painted
+                );
+            }
+        }
     }
 
     /// 执行中面板：命令、耗时、进度、输出尾巴、取消提示。

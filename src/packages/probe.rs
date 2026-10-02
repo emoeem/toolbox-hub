@@ -18,6 +18,8 @@
 
 use std::{collections::HashMap, time::Duration};
 
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
 use super::{
     AurPackage, InstalledState, NewsItem, PackageHit, aur_info_url, aur_search_url, parse_aur_one,
     parse_aur_search, parse_news_rss,
@@ -67,13 +69,23 @@ impl Net {
     }
 
     fn get(&self, url: &str) -> Result<String, String> {
-        self.agent
-            .get(url)
-            .call()
-            .map_err(|error| format!("请求失败：{error}"))?
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| format!("读取响应失败：{error}"))
+        for attempt in 0..=2 {
+            match self.agent.get(url).call() {
+                Ok(mut response) => {
+                    return response
+                        .body_mut()
+                        .with_config()
+                        .limit(MAX_RESPONSE_BYTES)
+                        .read_to_string()
+                        .map_err(|error| format!("读取响应失败：{error}"));
+                }
+                Err(ureq::Error::StatusCode(429)) if attempt < 2 => {
+                    std::thread::sleep(Duration::from_millis(250 << attempt));
+                }
+                Err(error) => return Err(format!("请求失败：{error}")),
+            }
+        }
+        Err(String::from("请求失败：服务器持续限流（HTTP 429）"))
     }
 
     /// AUR 搜索；顺手把结果存起来，后面看信息就不用再问了。

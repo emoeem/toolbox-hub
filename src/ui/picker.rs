@@ -9,13 +9,13 @@ use ratatui::{
     widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::{app::App, ui::theme};
+use crate::{app::Picker, ui::theme};
 
-pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let Some(picker) = app.picker.as_ref() else {
-        return;
-    };
-
+/// 画文件选择器。
+///
+/// 只依赖 [`Picker`] 而不是整个 `App` —— 这样 `toolbox-hub ui pick` 那个
+/// 给脚本用的独立组件能用同一份渲染（见 `crate::components`）。
+pub fn draw(frame: &mut ratatui::Frame, picker: &Picker, area: Rect) {
     let block = theme::panel(" 选文件 ");
     let inner = block.inner(area);
     frame.render_widget(block, area);

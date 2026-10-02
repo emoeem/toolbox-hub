@@ -112,21 +112,49 @@ impl PackageHit {
 ///
 /// 返回 `None` 表示不命中。
 pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    score_subsequence(
+        &needle.trim().to_lowercase(),
+        &haystack.to_lowercase(),
+        |a, b| a == b,
+    )
+}
+
+/// 大小写无关的子序列匹配，**一次分配都不做**。
+///
+/// 调用方要保证 `needle` 已经是小写；`haystack` 保持原样，逐字符
+/// [`char::eq_ignore_ascii_case`] 比较。
+///
+/// 为什么需要它：搜索是全库（三万个包）逐行打分，名字/描述/仓库三路各来一次 ——
+/// 每行 `to_lowercase()` 就是每敲一个键近十万次分配。ASCII 折叠覆盖了实际会遇到的
+/// 输入（包名与描述是英文，中文没有大小写）；`Ü/ü` 这类非 ASCII 按精确匹配处理，
+/// 这也和大多数模糊查找器一致。
+pub(crate) fn fuzzy_score_ci(needle: &str, haystack: &str) -> Option<i32> {
+    score_subsequence(needle, haystack, |a, b| a.eq_ignore_ascii_case(&b))
+}
+
+/// 子序列打分：`same` 决定两个字符算不算命中。打分规则只有这一份。
+fn score_subsequence(
+    needle: &str,
+    haystack: &str,
+    same: impl Fn(char, char) -> bool,
+) -> Option<i32> {
     if needle.trim().is_empty() {
         return Some(0);
     }
 
-    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
     let mut cursor = 0usize;
     let mut score = 0i32;
     let mut previous: Option<usize> = None;
 
-    for ch in needle.trim().to_lowercase().chars() {
+    for ch in needle.chars() {
         if ch == ' ' {
             continue;
         }
-        let offset = hay.get(cursor..)?.iter().position(|item| *item == ch)?;
-        let found = cursor + offset;
+        let found = haystack
+            .chars()
+            .enumerate()
+            .skip(cursor)
+            .find_map(|(index, item)| same(item, ch).then_some(index))?;
 
         score += 1;
         if found == 0 {
@@ -1031,6 +1059,29 @@ mod tests {
 
     /// 真实 AUR RPC 回复（裁到两个结果，字段一个不少）。
     const AUR_SEARCH: &str = r#"{"resultcount":1,"results":[{"Description":"Fast TUI for searching","FirstSubmitted":1759428378,"ID":2171380,"LastModified":1784573962,"Maintainer":"Firstpick","Name":"pacsea-bin","NumVotes":5,"OutOfDate":null,"PackageBase":"pacsea-bin","PackageBaseID":223019,"Popularity":0.093482,"URL":"https://github.com/Firstp1ck/Pacsea","URLPath":"/cgit/aur.git/snapshot/pacsea-bin.tar.gz","Version":"0.8.2-2"}]}"#;
+
+    /// 大小写无关的打分器**不分配**，且结论与「两边先折小写」完全一致。
+    #[test]
+    fn the_case_insensitive_scorer_matches_the_folding_one() {
+        for (needle, haystack) in [
+            ("fzf", "FZF"),
+            ("fzf", "Fuzzy Finder ZF"),
+            ("rg", "ripgrep"),
+            ("7z", "p7zip"),
+        ] {
+            assert_eq!(
+                fuzzy_score_ci(needle, haystack),
+                fuzzy_score(needle, haystack),
+                "「{needle}」打「{haystack}」两种算法该给一样的结论"
+            );
+        }
+        assert!(fuzzy_score_ci("zzz", "fzf").is_none());
+        assert!(fuzzy_score_ci("fzf", "FZF").is_some(), "ASCII 大小写要折叠");
+        // 非 ASCII 按精确匹配：有意的取舍（中文没有大小写，包名是英文），
+        // 换来的是热路径上一次分配都不做。
+        assert!(fuzzy_score_ci("ü", "Über").is_none());
+        assert!(fuzzy_score("ü", "Über").is_some(), "老的折叠版本仍然认");
+    }
 
     #[test]
     fn fuzzy_matching_prefers_prefix_and_consecutive_hits() {

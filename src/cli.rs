@@ -37,6 +37,8 @@ pub enum Action {
     RemoveOrphans,
     /// `--clear-cache`：清下载缓存。
     ClearCache,
+    /// `ui …`：给脚本用的界面组件（确认框 / 翻页器 / 选文件）。
+    Ui(crate::components::UiCommand),
     Help,
     Version,
 }
@@ -125,6 +127,10 @@ where
             "--orphans" => set_action(&mut action, Action::List(InstalledFilter::Orphan))?,
             "--remove-orphans" => set_action(&mut action, Action::RemoveOrphans)?,
             "--clear-cache" => set_action(&mut action, Action::ClearCache)?,
+            "ui" => {
+                let command = parse_ui(&mut args)?;
+                set_action(&mut action, Action::Ui(command))?;
+            }
 
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("不认识的选项：{other}（看 toolbox-hub --help）"));
@@ -222,6 +228,117 @@ fn package_values<I: Iterator<Item = String>>(
     Ok(names)
 }
 
+/// 解析 `ui <组件> …`。
+///
+/// 组件后面不再接受通用选项（`--dry-run` 之类对界面没意义），所以这里把剩下的
+/// 参数一次吃干净，遇到不认识的选项直接报错 —— 比默默忽略强。
+fn parse_ui<I>(args: &mut std::iter::Peekable<I>) -> Result<crate::components::UiCommand, String>
+where
+    I: Iterator<Item = String>,
+{
+    use crate::components::{Confirm, Pager, Pick, UiCommand};
+
+    let Some(name) = args.next() else {
+        return Err(String::from(
+            "ui 后面要跟组件名：confirm / pager / pick（看 toolbox-hub --help）",
+        ));
+    };
+
+    match name.as_str() {
+        "confirm" => {
+            let mut message: Option<String> = None;
+            let mut yes = String::from("确认");
+            let mut no = String::from("取消");
+            let mut danger = false;
+            let mut fallback: Option<bool> = None;
+
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--yes" => yes = one_value(args, &arg)?,
+                    "--no" => no = one_value(args, &arg)?,
+                    "--danger" => danger = true,
+                    "--default" => {
+                        let value = one_value(args, &arg)?;
+                        fallback = Some(match value.as_str() {
+                            "yes" | "y" | "true" | "是" => true,
+                            "no" | "n" | "false" | "否" => false,
+                            other => {
+                                return Err(format!("--default 只认 yes / no，收到：{other}"));
+                            }
+                        });
+                    }
+                    other if other.starts_with('-') && other != "-" => {
+                        return Err(format!("confirm 不认识的选项：{other}"));
+                    }
+                    other => message = Some(other.to_string()),
+                }
+            }
+
+            let Some(message) = message else {
+                return Err(String::from("confirm 要一句要确认的话"));
+            };
+            Ok(UiCommand::Confirm(Confirm {
+                message,
+                yes,
+                no,
+                danger,
+                fallback,
+            }))
+        }
+
+        "pager" => {
+            let mut title = String::from("输出");
+            let mut file: Option<PathBuf> = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--title" => title = one_value(args, &arg)?,
+                    other if other.starts_with('-') && other != "-" => {
+                        return Err(format!("pager 不认识的选项：{other}"));
+                    }
+                    other => file = Some(PathBuf::from(other)),
+                }
+            }
+            Ok(UiCommand::Pager {
+                options: Pager { title },
+                file,
+            })
+        }
+
+        "pick" => {
+            let mut dir = None;
+            let mut filter = String::new();
+            let mut multi = false;
+            let mut dir_only = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--dir" => dir = Some(PathBuf::from(one_value(args, &arg)?)),
+                    "--filter" => filter = one_value(args, &arg)?,
+                    "--multi" => multi = true,
+                    "--dir-only" => dir_only = true,
+                    other => return Err(format!("pick 不认识的选项：{other}")),
+                }
+            }
+            // 默认当前目录：调用方多半已经 cd 到目标目录了。
+            let dir = match dir {
+                Some(dir) => dir,
+                None => {
+                    std::env::current_dir().map_err(|error| format!("取不到当前目录：{error}"))?
+                }
+            };
+            Ok(UiCommand::Pick(Pick {
+                dir,
+                filter,
+                multi,
+                dir_only,
+            }))
+        }
+
+        other => Err(format!(
+            "不认识的组件：{other}（有 confirm / pager / pick）"
+        )),
+    }
+}
+
 /// 跑一个动作。返回给用户看的错误（已经打印过的就不重复了）。
 pub fn run(options: &Options) -> Result<(), String> {
     match &options.action {
@@ -254,6 +371,15 @@ pub fn run(options: &Options) -> Result<(), String> {
             let (program, argv) = packages::escalate(&program, &argv);
             execute(&program, &argv, options.dry_run, "清包缓存")
         }
+        // 组件自己管退出码（0 选了 / 1 取消 / 2 环境不支持），所以在这里就地退出：
+        // 让 main 再映射一遍会把 1 和 2 混成同一个。
+        Action::Ui(command) => match crate::components::run(command.clone()) {
+            Ok(outcome) => std::process::exit(outcome.code()),
+            Err(message) => {
+                eprintln!("toolbox-hub: {message}");
+                std::process::exit(crate::components::UNSUPPORTED_CODE);
+            }
+        },
     }
 }
 
@@ -279,6 +405,20 @@ Toolbox Hub —— Linux CLI 工具箱（TUI + 命令行两用）
       --orphans              列出孤儿包（没人依赖、你也没点名装）
       --remove-orphans       卸载孤儿包
       --clear-cache          清包缓存（paccache -rk1，没有 paccache 才退回 pacman -Sc）
+
+界面组件（给你自己的脚本用；结果走 stdout，界面走 stderr）:
+  ui confirm <文案>          弹一个确认框。退出码 0=确认 1=取消
+      --yes <文字>           确认按钮的文字（默认「确认」）
+      --no <文字>            取消按钮的文字（默认「取消」）
+      --danger               红框 + 默认停在「取消」（危险动作用）
+      --default yes|no       没有终端时用这个答案（cron / CI 用）
+  ui pager [文件]            翻页器：`cmd | toolbox-hub ui pager`；不是终端就原样透传
+      --title <文字>         标题（默认「输出」）
+  ui pick                    在终端里挑文件，选中的路径打到 stdout（一行一个）
+      --dir <目录>           从哪个目录开始（默认当前目录）
+      --filter <词>          预先填进过滤框
+      --multi                多选（Tab 标记，Enter 收工）
+      --dir-only             只让选目录
 
 通用:
       --dry-run              只打印将要执行的命令，不动系统

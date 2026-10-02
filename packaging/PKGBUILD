@@ -12,9 +12,7 @@ pkgrel=1
 pkgdesc="Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管理（直连 libalpm）"
 arch=('x86_64' 'aarch64')
 url="https://github.com/emoeem/toolbox-hub"
-# TODO: 仓库里还没有 LICENSE 文件。定了许可证之后把这里改掉，
-# 并把 LICENSE 提交进去 —— AUR 要求许可证字段是真实有效的。
-license=('unknown')
+license=('MIT')
 # 为什么只写 pacman：二进制直接链接了 libalpm.so，而 libalpm 自己的依赖
 # （libarchive / openssl / curl / gpgme / brotli / bzip2 / acl …）都由 pacman 包
 # 声明并安装。同理 gcc-libs 提供 libgcc_s。
@@ -76,11 +74,13 @@ package() {
   install -Dm644 completions/toolbox-hub.fish \
     "$pkgdir/usr/share/fish/vendor_completions.d/toolbox-hub.fish"
 
+  # 脚本侧小库（`source /usr/share/toolbox-hub/tbx.sh`），给写脚本的人用。
+  install -Dm644 scripts/tbx.sh "$pkgdir/usr/share/toolbox-hub/tbx.sh"
+
   # sing-box 那 5 个内置动作真正执行的脚本（manifests/sing-box.toml）。
   # manifest 的 program 写的是**裸命令名**、走 PATH 解析，所以必须放在 PATH 上的目录：
   # 放 /usr/bin 而不是 /usr/local/bin —— 后者是留给用户自己覆盖系统文件的地方。
   install -m755 scripts/sing-box/sing-box-* "$pkgdir/usr/bin/"
 
-  # 许可证文件还没进仓库，有 LICENSE 之后取消注释
-  # install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

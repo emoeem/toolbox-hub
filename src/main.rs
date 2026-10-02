@@ -12,6 +12,7 @@
 
 mod app;
 mod cli;
+mod components;
 mod config;
 mod history;
 mod media;
@@ -170,6 +171,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
         if dirty {
             terminal.draw(|frame| ui::draw(frame, app))?;
             dirty = false;
+        }
+        // 能力探测会同步等待终端应答；让 UI 先画出“准备预览”，并且不要放在 draw 回调里。
+        if app.preview.needs_detection() {
+            app.preview.detect();
+            dirty = true;
         }
         // 每轮都重新取一次：用户可能刚按 `d` 改过工作目录。
         let cwd = app.work_dir.clone();
