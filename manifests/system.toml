@@ -1,0 +1,99 @@
+# 系统域：常见只读巡检动作。缺少可选命令时会在列表里显示安装提示。
+
+[[action]]
+id = "disk-space"
+name = "磁盘空间"
+summary = "查看文件系统总量、已用与剩余空间"
+domain = "系统"
+tags = ["磁盘", "空间"]
+program = "df"
+base_argv = ["-hT"]
+mode = "capture"
+danger = "safe"
+install = "自带（coreutils）"
+input = "挂载点"
+output = "磁盘用量表"
+
+[[action.argument]]
+key = "path"
+label = "路径（可留空）"
+kind = "path"
+help = "留空显示全部挂载点；也可以填写一个目录"
+
+[[action]]
+id = "directory-usage"
+name = "目录占用"
+summary = "按深度汇总目录体积，找出占空间最多的位置"
+domain = "系统"
+tags = ["磁盘", "空间"]
+program = "du"
+base_argv = ["-h", "--max-depth=2"]
+mode = "capture"
+danger = "safe"
+install = "自带（coreutils）"
+input = "目录"
+output = "目录占用汇总"
+
+[[action.argument]]
+key = "path"
+label = "目录"
+kind = "path"
+default = "."
+required = true
+help = "从当前工作目录开始扫描"
+
+[[action]]
+id = "boot-errors"
+name = "本次启动错误"
+summary = "查看本次启动以来的错误级别系统日志（最多 200 行）"
+domain = "系统"
+tags = ["日志", "诊断"]
+program = "journalctl"
+base_argv = ["-p", "err", "-b", "--no-pager", "-n", "200"]
+mode = "capture"
+danger = "safe"
+install = "自带（systemd）"
+input = "无"
+output = "错误日志"
+
+[[action]]
+id = "failed-units"
+name = "失败的 systemd 单元"
+summary = "列出当前处于失败状态的服务和单元"
+domain = "系统"
+tags = ["服务", "诊断"]
+program = "systemctl"
+base_argv = ["--failed", "--no-pager"]
+mode = "capture"
+danger = "safe"
+install = "自带（systemd）"
+input = "无"
+output = "失败单元列表"
+
+[[action]]
+id = "block-devices"
+name = "磁盘与挂载"
+summary = "查看块设备、文件系统与挂载点"
+domain = "系统"
+tags = ["磁盘", "设备"]
+program = "lsblk"
+base_argv = ["-f"]
+mode = "capture"
+danger = "safe"
+install = "自带（util-linux）"
+input = "无"
+output = "块设备树"
+
+[[action]]
+id = "pci-devices"
+name = "PCI 设备与驱动"
+summary = "列出 PCI 设备及当前绑定的内核驱动"
+domain = "系统"
+tags = ["硬件", "驱动"]
+program = "lspci"
+base_argv = ["-k"]
+mode = "capture"
+danger = "safe"
+install = "sudo pacman -S pciutils"
+input = "无"
+output = "PCI 设备与驱动列表"
