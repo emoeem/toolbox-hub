@@ -857,7 +857,7 @@ mod tests {
 
         // 孙子进程要跟着走（SIGTERM 之后可能先变僵尸，所以给它一点时间）
         let mut gone = false;
-        for _ in 0..100 {
+        for _ in 0..250 {
             if !alive(grandchild) {
                 gone = true;
                 break;
@@ -871,6 +871,15 @@ mod tests {
 
     /// 这个 pid 还活着吗（`kill(pid, 0)` 不发信号，只做存在性检查）。
     fn alive(pid: i32) -> bool {
+        // 先看 /proc 里的状态：僵尸进程（Z）虽然还能被 kill(pid, 0) 命中，
+        // 但它已经不占资源了。容器里 PID 1 常常不回收孤儿，孙子进程会长期停在 Z，
+        // 只按 kill(pid,0) 判活会让这个测试在没有 PID 1 回收的环境里永远失败。
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r)
+            && rest.split_whitespace().next() == Some("Z")
+        {
+            return false;
+        }
         // SAFETY: 信号 0 不发送任何东西，只检查进程是否存在。
         unsafe { libc::kill(pid, 0) == 0 }
     }

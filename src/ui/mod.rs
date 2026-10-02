@@ -703,8 +703,11 @@ mod tests {
         assert!(text.contains("2/3"), "顶部栏应显示命中/总数: {text}");
         // 曾经的 bug：顶部栏高度不足，第二行被边框整个裁掉。
         // 第二行现在显示「工作目录」（工具在哪儿执行/找文件）+「扫描」（脚本来自哪）。
+        // 这里**不能**断言 `~/.local/bin`：`~` 缩写取决于运行环境的 `$HOME`
+        // （开发机是 /home/emo，CI 里不是），断言整个路径会让测试变成环境相关。
+        // 要验的是"第二行可见"，所以只看路径的不变部分。
         assert!(
-            text.contains("扫描~/.local/bin"),
+            text.contains("扫描") && text.contains(".local/bin"),
             "顶部栏第二行必须可见: {text}"
         );
         assert!(text.contains("工作目录"), "{text}");
