@@ -32,6 +32,28 @@ default = "false"
 help = "只读配置与内核状态，不测出口 / DNS —— 秒出"
 
 [[action]]
+id = "sing-box-why"
+name = "sing-box 排查"
+summary = "查一个域名/IP：为什么被拦、走哪条规则、从哪个出口出去，并给出放行办法"
+domain = "网络"
+tags = ["sing-box", "诊断"]
+program = "sing-box-why"
+mode = "capture"
+allow_empty = true            # 参数必填，但默认值是空 —— 由表单的 required 拦住，不靠 argv
+install = "./scripts/sing-box/install.sh"
+input = "一个域名，或一个 IP"
+output = "DNS 判定 / 命中的路由规则 / 出口链路 / 出口实测 / 放行片段"
+features = "用 Clash API 读**实际命中**的规则（不是猜）；被 DNS 拦的域名逐个规则集判定命中哪个；区分 NXDOMAIN 与超时；被拦时直接给该往哪条规则前插什么"
+
+[[action.argument]]
+key = "target"
+label = "域名或 IP"
+kind = "text"
+required = true
+placement = "leading"
+help = "例：tr.outbrain.com（看被谁拦）/ www.google.com（看走哪条路）/ 8.8.8.8"
+
+[[action]]
 id = "sing-box-audit"
 name = "sing-box 审计修复"
 summary = "补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则与 dns-local"
@@ -85,6 +107,14 @@ kind = "toggle"
 flag = "--use-package-paths"
 default = "false"
 help = "改指向 /usr/share/sing-box-rule-sets —— 规则集就跟着 pacman 更新，而不是躺在 /etc 的副本里"
+
+[[action.argument]]
+key = "abf"
+label = "加 adblockfilters 聚合表"
+kind = "toggle"
+flag = "--with-abf"
+default = "false"
+help = "217heidai/adblockfilters：215k 条域名后缀（EasyPrivacy / AdGuard 全家桶 / OISD…）。实测与 anti-AD 只重叠 35%，对照组 27 个域名 0 误伤"
 
 [[action.argument]]
 key = "nxdomain"

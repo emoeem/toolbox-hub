@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# sing-box-why:summary=查一个域名/IP 为什么被拦、会走哪条路、从哪个出口出去，并给出精确的放行办法
+# sing-box-why:domain=网络
+# sing-box-why:tags=sing-box,诊断,排查
+# sing-box-why:input=一个域名（或 IP）
+# sing-box-why:output=DNS 判定 / 命中的路由规则 / 出口链路 / 放行片段
+# sing-box-why:features=用 Clash API 读**实际命中**的规则（不是猜的）；被 DNS 拦的域名去逐个规则集判定命中哪一个；区分 NXDOMAIN 与超时（丢掉 dig 的 stderr 会把两者混为一谈）；被拦时直接打印该往哪条规则前插什么；--json 给出机器可读结果
+# sing-box-why:requires=sing-box,jq,curl,dig
+# sing-box-why:install=~/code/toolbox-hub/scripts/sing-box/install.sh
+# sing-box-why:internal=true
+# sing-box-why:mode=capture
+#
+# ↑ 注解契约见 ~/.config/toolbox-hub/tools/README.md；本脚本由 manifest 的 sing-box.toml 驱动。
+#
+# 为什么这么做（踩过的坑）：
+#   1. 判断"被拦"不能只看 `dig +short` 有没有输出 —— REFUSED/NXDOMAIN/超时在 stdout 上都是空，
+#      必须看完整输出的 status 行。
+#   2. 被 DNS 拦下的域名**不会产生连接记录**，所以拿不到"实际命中的规则"；
+#      只能退一步：把该规则涉及的规则集逐个判定（AdGuard 来源的 .srs 不能反编译，会如实标注）。
+#   3. 没被拦的域名用 Clash API 读 `rule` / `rulePayload` / `chains` —— 这是**权威**结果。
+
+set -Eeuo pipefail
+
+CONF="${CONF:-/etc/sing-box/config.json}"
+BIN="${BIN:-sing-box}"
+CLASH="${CLASH:-http://127.0.0.1:9090}"
+TARGET=""
+JSON_OUT=0
+for arg in "$@"; do
+    case "$arg" in
+        --json) JSON_OUT=1 ;;
+        -h|--help)
+            printf '用法：sing-box-why <域名|IP> [--json]\n'
+            printf '  例：sing-box-why tr.outbrain.com     # 被谁拦的、怎么放行\n'
+            printf '       sing-box-why www.google.com      # 走哪条规则、哪个出口\n'
+            printf '       sing-box-why 8.8.8.8             # IP 走哪条规则\n'
+            exit 0 ;;
+        -*) printf '不认识的参数：%s\n' "$arg" >&2; exit 2 ;;
+        *) TARGET="$arg" ;;
+    esac
+done
+[[ -n $TARGET ]] || { printf '用法：sing-box-why <域名|IP> [--json]\n' >&2; exit 2; }
+[[ -r $CONF ]] || { printf '读不到 %s\n' "$CONF" >&2; exit 2; }
+command -v jq >/dev/null || { printf '缺少 jq：sudo pacman -S jq\n' >&2; exit 2; }
+
+if [[ -t 1 ]]; then
+    C_DIM=$'\033[2m'; C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'; C_KEY=$'\033[36m'; C_OFF=$'\033[0m'
+else
+    C_DIM=""; C_OK=""; C_BAD=""; C_WARN=""; C_KEY=""; C_OFF=""
+fi
+line() { (( JSON_OUT )) && return 0; printf '  %-9s %s\n' "$1" "$2" 2>/dev/null || true; }
+say() { (( JSON_OUT )) && return 0; printf '%s\n' "$1" 2>/dev/null || true; }
+
+SECRET="$(jq -r '.experimental.clash_api.secret // ""' "$CONF" 2>/dev/null || echo '')"
+CACHE_DIR="$(mktemp -d /tmp/sing-box-why.XXXXXX)"
+trap 'rm -rf "$CACHE_DIR"' EXIT
+
+# ── 规则集判定：能反编译的就精确判，AdGuard 来源的如实说"判不了" ───────────────
+declare -A SET_FILE
+while IFS=$'\t' read -r tag path; do
+    [[ -n $tag && -n $path && $path != "null" ]] || continue
+    SET_FILE["$tag"]="$path"
+done < <(jq -r '.route.rule_set[] | [(.tag|if type=="array" then .[0] else . end), (.path // "null")] | @tsv' "$CONF" 2>/dev/null)
+
+set_matches() { # $1=tag $2=值(域名或 IP)  → 打印 ok/noag/missing/notfound
+    local tag="$1" val="$2" file="${SET_FILE[$1]:-}"
+    [[ -n $file ]] || { printf 'missing'; return; }
+    local dec="$CACHE_DIR/${tag//\//_}.json"
+    if [[ ! -f $dec ]]; then
+        if "$BIN" rule-set decompile "$file" -o "$dec" >/dev/null 2>&1; then :; else printf 'noag'; return; fi
+    fi
+    python3 - "$dec" "$val" <<'PY'
+import ipaddress, json, sys
+path, val = sys.argv[1], sys.argv[2]
+d = json.load(open(path, encoding="utf-8"))
+v = val.lower().rstrip(".")
+try:
+    ip = ipaddress.ip_address(val)
+except ValueError:
+    ip = None
+for r in d.get("rules", []):
+    dom = {x.lower() for x in r.get("domain", [])}
+    suf = {x.lower().lstrip(".") for x in r.get("domain_suffix", [])}
+    kw  = {x.lower() for x in r.get("domain_keyword", [])}
+    cid = r.get("ip_cidr", [])
+    if ip is not None:
+        for c in cid:
+            try:
+                if ip in ipaddress.ip_network(c, strict=False):
+                    print("hit"); raise SystemExit
+            except ValueError:
+                continue
+    else:
+        if v in dom or any(v == x or v.endswith("." + x) for x in suf) or any(k in v for k in kw):
+            print("hit"); raise SystemExit
+        for rx in r.get("domain_regex", []):
+            import re
+            try:
+                if re.search(rx, v):
+                    print("hit"); raise SystemExit
+            except re.error:
+                continue
+print("miss")
+PY
+}
+
+# ── 探测一次真实连接，读 Clash API 里命中的规则 ────────────────────────────────
+probe_connection() { # $1=连接地址(IP 或域名) $2=端口 $3=SNI/原目标 $4=期望IP列表 → JSON 一行
+    python3 - "$CLASH" "$SECRET" "$1" "$2" "$3" "${4:-}" <<'PYEOF'
+import json, subprocess, sys, threading, time, urllib.request
+clash, secret, dial, port, sni, ips = sys.argv[1:7]
+wanted = {x for x in ips.split() if x}
+def conns():
+    r = urllib.request.Request(f"{clash}/connections")
+    if secret: r.add_header("Authorization", f"Bearer {secret}")
+    with urllib.request.urlopen(r, timeout=6) as x:
+        return json.loads(x.read().decode()).get("connections", [])
+try:
+    base = {c.get("id") for c in conns()}
+except Exception as e:
+    print(json.dumps({"error": f"读不到 Clash API：{e}"})); raise SystemExit
+
+def snap(c, md):
+    return {"rule": c.get("rule", ""), "payload": str(c.get("rulePayload", "")),
+            "chains": list(reversed(c.get("chains", []))),
+            "destIP": md.get("destinationIP", ""), "destPort": md.get("destinationPort", ""),
+            "host": (md.get("host") or "").lower(), "sniffHost": md.get("sniffHost", "")}
+
+found, loose, stop = {}, [], threading.Event()
+def poll():
+    while not stop.is_set():
+        try:
+            for c in conns():
+                if c.get("id") in base:
+                    continue
+                md = c.get("metadata", {}) or {}
+                dip, h = md.get("destinationIP", ""), (md.get("host") or "").lower()
+                loose.append(snap(c, md))
+                if dip == dial or h == dial.lower() or h == sni.lower() or (dip and dip in wanted):
+                    found[c.get("id")] = snap(c, md)
+        except Exception:
+            pass
+        time.sleep(0.03)
+
+t = threading.Thread(target=poll, daemon=True); t.start()
+cmd = f"(sleep 2) | timeout 6 openssl s_client -connect {dial}:{port} -servername {sni} -quiet"
+subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=16)
+time.sleep(0.4); stop.set(); t.join(timeout=2)
+if found:
+    print(json.dumps(next(iter(found.values())), ensure_ascii=False))
+else:
+    cand = [c for c in loose if c.get("destPort") == port]
+    print(json.dumps(cand[0] if len(cand) == 1 else {}, ensure_ascii=False))
+PYEOF
+}
+
+# ── 主流程 ────────────────────────────────────────────────────────────────────
+say "$(printf '\n%s sing-box 排查%s  %s' "$C_DIM" "$C_OFF" "$TARGET")"
+say "$(printf '%s──────────────────────────────────────────────────────────%s' "$C_DIM" "$C_OFF")" 
+
+IS_IP=0
+python3 -c "import ipaddress,sys; ipaddress.ip_address(sys.argv[1])" "$TARGET" 2>/dev/null && IS_IP=1
+
+DNS_STATUS=""; DNS_ANSWER=""; DNS_ALL=""; HIT_RULE=""; HIT_PAYLOAD=""; CHAINS=""; DEST_IP=""
+BLOCKED_AT=""; SUGGEST=""; MEMBERS=""
+
+if (( IS_IP == 0 )); then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+    dig_out="$(dig +time=4 +tries=1 "$TARGET" 2>&1 || true)"
+    DNS_STATUS="$(printf '%s' "$dig_out" | grep -oE 'status: [A-Z]+' | head -1 | awk '{print $2}' || true)"
+    DNS_ALL="$(printf '%s' "$dig_out" | grep -A30 'ANSWER SECTION' 2>/dev/null | grep -E '^[^;].*IN[[:space:]]+(A|AAAA)' 2>/dev/null | awk '{print $5}' | tr '\n' ' ' || true)"
+    DNS_ANSWER="$(printf '%s' "$DNS_ALL" | tr ' ' '\n' | head -3 | tr '\n' ' ' || true)"
+    if printf '%s' "$dig_out" | grep -q "communications error" 2>/dev/null; then
+        DNS_STATUS="TIMEOUT/REFUSED（客户端没拿到应答）"
+    fi
+    line DNS "$TARGET → status=${DNS_STATUS:-?}  ${DNS_ANSWER:-（无应答）}"
+else
+    line 目标 "IP（跳过 DNS 判定）"
+fi
+
+# DNS 层是否被拦？
+if (( IS_IP == 0 )) && [[ -z ${DNS_ANSWER// /} ]]; then
+    # 找出 dns.rules 里那条广告规则的规则集清单
+    dns_sets="$(jq -r '[.dns.rules[] | select(.action=="predefined" or .action=="reject")][0].rule_set // [] | .[]' "$CONF" 2>/dev/null | tr '\n' ' ')"
+    if [[ -n ${dns_sets// /} ]]; then
+        BLOCKED_AT="DNS（广告规则）"
+        line 判定 "$(printf '%s%s 被 DNS 广告规则拦下%s' "$C_BAD" "✗" "$C_OFF")"
+        for s in $dns_sets; do
+            r="$(set_matches "$s" "$TARGET")"
+            case "$r" in
+                hit)      MEMBERS+="$s(命中) " ;;
+                noag)     MEMBERS+="$s(无法判定:AdGuard来源) " ;;
+                missing)  MEMBERS+="$s(文件缺失) " ;;
+            esac
+        done
+        line 规则集 "${MEMBERS:-（无）}"
+    fi
+fi
+
+# 没被 DNS 拦 → 实测连接，读命中的路由规则
+if [[ -z $BLOCKED_AT ]]; then
+    # 连**指定 IP**而不是域名：系统可能优先走 IPv6、也可能按 CNAME 重新解析，
+    # 目的 IP 一变就匹配不上；固定 IP + 保留 SNI，才能既确定匹配、又让分流按原域名判。
+    DIAL="$TARGET"
+    if (( IS_IP == 0 )); then
+        cand_ip="$(printf '%s' "$DNS_ALL" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+        [[ -n $cand_ip ]] && DIAL="$cand_ip"
+    fi
+    json="$(probe_connection "$DIAL" 443 "$TARGET" "${DNS_ALL:-$DNS_ANSWER}")"
+    if ! printf '%s' "$json" | jq -e '.rule or .chains' >/dev/null 2>&1; then
+        sleep 1
+        json="$(probe_connection "$DIAL" 443 "$TARGET" "${DNS_ALL:-$DNS_ANSWER}")"
+    fi
+    HIT_RULE="$(printf '%s' "$json" | jq -r '.rule // ""' 2>/dev/null || echo '')"
+    HIT_PAYLOAD="$(printf '%s' "$json" | jq -r '.payload // ""' 2>/dev/null || echo '')"
+    CHAINS="$(printf '%s' "$json" | jq -r '.chains // [] | join(" → ")' 2>/dev/null || echo '')"
+    DEST_IP="$(printf '%s' "$json" | jq -r '.destIP // ""' 2>/dev/null || echo '')"
+    err="$(printf '%s' "$json" | jq -r '.error // ""' 2>/dev/null || echo '')"
+    if [[ -n $err ]]; then
+        line API "$(printf '%s%s%s' "$C_WARN" "$err" "$C_OFF")"
+    elif [[ -n $HIT_RULE || -n $CHAINS ]]; then
+        line 命中 "$(printf '%s%s%s' "$C_KEY" "${HIT_RULE:-?}" "$C_OFF")  ${HIT_PAYLOAD:+[$HIT_PAYLOAD]}"
+        line 出口 "$(printf '%s%s%s' "$C_OK" "${CHAINS:-?}" "$C_OFF")${DEST_IP:+  目的 $DEST_IP}"
+        if [[ $HIT_PAYLOAD == rule_set=* ]]; then
+            payload_sets="$(printf '%s' "$HIT_PAYLOAD" | sed 's/.*rule_set=\[//; s/\].*//')"
+            for s in $payload_sets; do
+                [[ -n ${SET_FILE[$s]:-} ]] || continue
+                r="$(set_matches "$s" "${DEST_IP:-$TARGET}")"
+                [[ $r == hit ]] && MEMBERS+="$s(命中) "
+            done
+            [[ -n $MEMBERS ]] && line 规则集 "$MEMBERS"
+        fi
+        # 出口实测
+        if [[ -n $CHAINS ]]; then
+            if [[ $CHAINS == *direct* ]]; then
+                ip="$(curl -s -m 8 https://myip.ipip.net 2>/dev/null | tr -d '\n' || true)"
+                line 出口实测 "${ip:0:70}"
+            elif [[ $CHAINS == *Proxy* || $CHAINS == *Auto* ]]; then
+                ip="$(curl -s -m 8 -x http://127.0.0.1:7892 https://api.ipify.org 2>/dev/null || true)"
+                line 出口实测 "${ip:-（探测失败）}"
+            fi
+        fi
+    else
+        line 连接 "没有捕获到记录（站点可能无 A 记录 / 443 未开 / 域名已废）"
+    fi
+fi
+
+# 被拦 → 给放行办法
+if [[ -n $BLOCKED_AT ]]; then
+    route_idx="$(jq -r '[.route.rules | to_entries[] | select(.value.action=="predefined" or .value.action=="reject")][0].key // "?"' "$CONF" 2>/dev/null)"
+    SUGGEST="在 route.rules 第 $((route_idx + 1)) 条（广告 reject）**之前**插入：
+    { \"domain_suffix\": [\"$TARGET\"], \"action\": \"route\", \"outbound\": \"direct\" }
+  并在 dns.rules 的广告规则之前插入：
+    { \"domain_suffix\": [\"$TARGET\"], \"action\": \"route\", \"server\": \"dns-direct\" }"
+fi
+
+if (( JSON_OUT == 1 )); then
+    jq -n --arg target "$TARGET" --arg dns "$DNS_STATUS" --arg answer "$DNS_ANSWER" \
+          --arg blocked "$BLOCKED_AT" --arg rule "$HIT_RULE" --arg payload "$HIT_PAYLOAD" \
+          --arg chains "$CHAINS" --arg dest "$DEST_IP" --arg members "$MEMBERS" \
+          '{target:$target, dns_status:$dns, dns_answer:$answer, blocked_at:$blocked,
+            rule:$rule, rule_payload:$payload, chains:$chains, dest_ip:$dest, rule_sets:$members}'
+else
+    if [[ -n $BLOCKED_AT ]]; then
+        line 放行 "$SUGGEST"
+        say "$(printf '  %s提示：也可在面板/ zashboard 里临时放行；若确认是上游规则错了，向规则集上游反馈。%s' "$C_DIM" "$C_OFF")"
+    fi
+    printf '%s──────────────────────────────────────────────────────────%s\n\n' "$C_DIM" "$C_OFF" 2>/dev/null || true
+fi

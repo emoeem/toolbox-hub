@@ -56,6 +56,7 @@ const BUNDLED: &[(&str, &str)] = &[
         "packages.toml",
         include_str!("../../manifests/packages.toml"),
     ),
+    ("system.toml", include_str!("../../manifests/system.toml")),
     // sing-box 的运维动作：真正干活的是 scripts/sing-box/ 下的脚本（PKGBUILD 装到
     // /usr/bin；源码用户跑那个目录里的 install.sh）。动作这边只管把开关填成表单。
     (
@@ -69,11 +70,22 @@ const BUNDLED: &[(&str, &str)] = &[
 /// **加/删 `manifests/*.toml` 里的动作后要更新这里**：测试拿它对账，
 /// 某个 manifest 悄悄解析失败时（例如拼错一个键），工具数会立刻对不上。
 #[cfg(test)]
-const BUNDLED_ACTION_COUNT: usize = 38;
+const BUNDLED_ACTION_COUNT: usize = 45;
 
 /// 内置动作里 `mode = "native"` 的那些：`program` 写的是**界面名**（不是命令）。
 #[cfg(test)]
-const NATIVE_ACTIONS: &[&str] = &["manifest:pkg-center"];
+fn bundled_native_actions() -> Vec<String> {
+    BUNDLED
+        .iter()
+        .flat_map(|(source, text)| {
+            let file: ManifestFile =
+                toml::from_str(text).unwrap_or_else(|error| panic!("{source}: {error}"));
+            file.action
+        })
+        .filter(|action| action.mode.as_deref() == Some("native"))
+        .map(|action| format!("manifest:{}", action.id))
+        .collect()
+}
 
 pub struct ManifestProvider {
     /// 用户 manifest 目录，按顺序读；先读到的占住 id。
@@ -514,7 +526,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{BUNDLED_ACTION_COUNT, ManifestProvider, NATIVE_ACTIONS};
+    use super::{BUNDLED_ACTION_COUNT, ManifestProvider, bundled_native_actions};
     use crate::{
         model::Domain,
         providers::{Discovery, Provider},
@@ -561,13 +573,9 @@ mod tests {
     #[test]
     fn native_actions_are_not_commands() {
         let discovery = bundled_discovery();
-        for id in NATIVE_ACTIONS {
-            let tool = by_id(&discovery, id);
+        for id in bundled_native_actions() {
+            let tool = by_id(&discovery, &id);
             let action = tool.action.as_ref().expect("带动作");
-            assert_eq!(
-                action.program, "package-center",
-                "{id} 的 program 应该是界面名"
-            );
             assert!(
                 matches!(tool.mode, crate::model::RunMode::Native),
                 "{id} 该是 native 模式"
@@ -941,6 +949,7 @@ mod tests {
             "dns_groups",
             "pkg_paths",
             "nxdomain",
+            "abf",
         ] {
             values.set(key, "true");
         }
@@ -954,6 +963,7 @@ mod tests {
             "--with-dns-groups",
             "--use-package-paths",
             "--nxdomain-ads",
+            "--with-abf",
         ] {
             assert!(
                 argv.iter().any(|arg| arg == flag),

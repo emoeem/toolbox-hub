@@ -4,7 +4,7 @@
 # sing-box-container-proxy:tags=sing-box,容器,podman
 # sing-box-container-proxy:input=当前 eBPF 配置 + rootful podman 网桥
 # sing-box-container-proxy:output=开启/关闭 shared 后的配置 + 真实容器验证
-# sing-box-container-proxy:features=自动探测网桥；先用 --mode all 预检拦掉内核不支持的 TC 路径；起真容器实测出口；失败自动回滚
+# sing-box-container-proxy:features=自动探测网桥；按数据面分别做只读内核探测（socket_assign / packet_rewrite 独立判定）；起真容器实测出口；失败自动回滚
 # sing-box-container-proxy:requires=sing-box,sudo,python3,curl,podman
 # sing-box-container-proxy:install=~/code/toolbox-hub/scripts/sing-box/install.sh
 # sing-box-container-proxy:internal=true
@@ -35,13 +35,15 @@ API_URL="${API_URL:-http://127.0.0.1:9091}"
 BACKUP_DIR="/etc/sing-box/backups"
 MODE="enable"
 FORCE=0
+DATA_PLANE="auto"
 IFACE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --disable) MODE="disable"; shift ;;
     --iface)   IFACE="${2:-}"; shift 2 ;;
     --force)   FORCE=1; shift ;;
-    *) printf 'FATAL 未知参数：%s（可用：--disable --iface <接口> | --force）\n' "$1" >&2; exit 1 ;;
+    --data-plane) DATA_PLANE="${2:-auto}"; shift 2 ;;
+    *) printf 'FATAL 未知参数：%s（可用：--disable --iface <接口> | --data-plane auto|packet_rewrite|socket_assign | --force）\n' "$1" >&2; exit 1 ;;
   esac
 done
 
@@ -80,26 +82,48 @@ print('ebpf' if 'ebpf' in t else ('tun' if 'tun' in t else 'other'))")"
 say "   eBPF 模式确认"
 
 if [[ $MODE == "enable" ]]; then
-  say "①a 检查内核是否支持 shared 所需的 TC / packet_rewrite 路径"
-  _pf="$("$BIN" tools ebpf status --mode all --json 2>/dev/null || true)"
-  _res="$(printf '%s' "$_pf" | python3 -c "
-import sys,json
-try: print(json.load(sys.stdin).get('result','unknown'))
+  say "①a 按数据面探测内核能力（**只读**，不挂载任何东西）"
+  # 官方文档明确：四条数据面**互相独立**（cgroup / local-tc / packet_rewrite / socket_assign），
+  # 一条不可用**不能推断**另一条不可用 —— 早先"shared 也是 TC 所以不行"的结论是错的，
+  # 必须按要用的那条路径单独探测，并以真实启动成功为最终判据。
+  probe_plane() { # $1=数据面 $2=接口
+    local dp="$1" iface="$2" out res
+    [[ -n $iface ]] || { printf 'unknown'; return; }
+    out="$("$BIN" tools ebpf status --shared-data-plane "$dp" --interface "$iface" --json 2>/dev/null || true)"
+    res="$(printf '%s' "$out" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin); s=d.get('summary',{})
+    print(f\"{d.get('result','unknown')}|pass={s.get('pass',0)} fail={s.get('fail',0)} unknown={s.get('unknown',0)}\")
 except Exception: print('unknown')" 2>/dev/null || echo unknown)"
-  printf '   --mode all 预检：result=%s\n' "$_res"
-  if [[ $_res != passed ]]; then
-    warn "shared 数据面（packet_rewrite）依赖 TC eBPF，而预检未确认支持（result=$_res）。"
-    warn "本机内核实测会失败于：register TC eBPF TCP listener: operation not supported"
-    cat <<'EOT' >&2
-
-   结论：这台机器上 shared 方案不可用（改配置只会让 sing-box 起不来）。
-   容器走代理的可行办法（已实测）：
-       podman run --rm --network=host <镜像> ...
-   此时容器直接用宿主 socket，能被 eBPF 的 local cgroup 数据面接管。
+    printf '%s' "$res"
+  }
+  CHOSEN=""
+  if [[ $DATA_PLANE == "auto" ]]; then
+    for dp in socket_assign packet_rewrite; do
+      r="$(probe_plane "$dp" "$IFACE")"; printf '   %-14s → %s\n' "$dp" "$r"
+      [[ $r == passed* ]] && { CHOSEN="$dp"; break; }
+    done
+    [[ -n $CHOSEN ]] || {
+      warn "两种 shared 数据面都没探测通过（上面是实际结果）。"
+      warn "注意：探测必须以**服务相同的权限**运行（本脚本已是 root）；若是 unknown 居多，多半是权限/安全策略问题。"
+      cat <<'EOT' >&2
+   替代方案：容器/虚拟机用 --network=host 或切回 TUN（TUN 的 auto_route 覆盖转发流量）。
+   要强行尝试：--force --data-plane socket_assign
 EOT
-    (( FORCE )) || exit 3
-    warn "已按 --force 继续（大概率失败，失败会自动回滚）"
+      (( FORCE )) || exit 3
+      CHOSEN="socket_assign"
+    }
+  else
+    CHOSEN="$DATA_PLANE"
+    r="$(probe_plane "$CHOSEN" "$IFACE")"; printf '   %-14s → %s\n' "$CHOSEN" "$r"
+    [[ $r == passed* ]] || {
+      warn "$CHOSEN 未探测通过：$r"
+      (( FORCE )) || die "已中止（要强行尝试请加 --force）"
+    }
   fi
+  say "   选用数据面：$CHOSEN"
+  DATA_PLANE="$CHOSEN"
 fi
 
 if [[ $MODE == "disable" ]]; then
@@ -162,19 +186,19 @@ EOT
   say "③ 生成新配置（给 ebpf 入站开启 shared）"
   python3 - "$CONF" "$NEW_JSON" "$IFACE" <<'PY'
 import json, sys
-conf_path, out_path, iface = sys.argv[1], sys.argv[2], sys.argv[3]
+conf_path, out_path, iface, data_plane = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 cfg = json.load(open(conf_path, encoding="utf-8"))
 for i in cfg["inbounds"]:
     if i.get("type") == "ebpf":
         i["shared"] = {
             "enabled": True,
-            "data_plane": "packet_rewrite",
+            "data_plane": data_plane,
             "interface": [iface],
             "dns_mode": "hijack",
             "bypass_private_address": True,
             "ipv6": True,
         }
-        print(f"   shared: enabled, packet_rewrite, interface={iface}")
+        print(f"   shared: enabled, {data_plane}, interface={iface}")
 json.dump(cfg, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PY
 fi
