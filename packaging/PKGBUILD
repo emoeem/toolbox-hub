@@ -18,7 +18,9 @@ license=('unknown')
 # 为什么只写 pacman：二进制直接链接了 libalpm.so，而 libalpm 自己的依赖
 # （libarchive / openssl / curl / gpgme / brotli / bzip2 / acl …）都由 pacman 包
 # 声明并安装。同理 gcc-libs 提供 libgcc_s。
-depends=('glibc' 'gcc-libs' 'pacman')
+# chafa：二进制**动态链接** libchafa.so.0（ldd 可见），所以是运行期依赖；
+# 它同时提供 chafa.pc，构建期 ratatui-image 的 build.rs 也要用它探测版本 >= 1.8.0。
+depends=('glibc' 'gcc-libs' 'pacman' 'chafa')
 makedepends=('cargo' 'rust' 'pkgconf')
 optdepends=(
   'paru: 搜索与安装 AUR 包'

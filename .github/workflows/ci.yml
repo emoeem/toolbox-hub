@@ -21,7 +21,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 装工具链
-        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf
+        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa
+        # chafa 是 ratatui-image 的硬依赖：它的 build.rs 用 pkg-config 探测 chafa >= 1.8.0，
+        # 缺了就直接构建失败（这是这个仓库第一次跑 CI 时踩到的）
 
       - name: 缓存 cargo
         uses: actions/cache@v4
