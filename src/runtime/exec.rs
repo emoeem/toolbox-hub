@@ -97,7 +97,14 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// 把终端交给某个程序跑一遍（安装、交互式确认这类）。
@@ -107,7 +114,7 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 pub fn run_in_terminal(program: &str, argv: &[String], cwd: &Path) -> io::Result<Option<i32>> {
     let program_path = if program.contains('/') {
         let path = PathBuf::from(program);
-        if !path.is_file() {
+        if !is_executable(&path) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("找不到 {program}"),
@@ -178,7 +185,7 @@ pub fn browse_directories(program: &str, cwd: &Path) -> io::Result<BrowsedBack> 
     // 调用方就没法据此给一句「没装 yazi」了（这条顺序是测试抓出来的）。
     let program_path = if program.contains('/') {
         let path = PathBuf::from(program);
-        if !path.is_file() {
+        if !is_executable(&path) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("找不到 {program}"),
@@ -675,7 +682,26 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{Captured, ExecReport, JobEvent, spawn_captured};
+    use super::{Captured, ExecReport, JobEvent, is_executable, spawn_captured};
+
+    #[test]
+    fn executable_check_requires_an_execute_permission_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("toolbox-hub-not-executable-{}", std::process::id()));
+        std::fs::write(&path, "not an executable").expect("write fixture");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, permissions.clone()).expect("remove execute bit");
+        assert!(!is_executable(&path));
+
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("add execute bit");
+        assert!(is_executable(&path));
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn captured_splits_stdout_and_stderr_and_summarises() {

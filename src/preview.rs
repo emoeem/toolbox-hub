@@ -26,14 +26,12 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 
-/// 认得出来的图片后缀（不认识的就不去解码，免得对着一个 40MB 的二进制乱试）。
-const IMAGE_SUFFIXES: [&str; 8] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "avif"];
-
-/// 这个文件看起来是图片吗（只看后缀）。
+/// 当前构建确实能解码这个后缀吗（不支持的格式不去读完整文件试运气）。
 pub fn looks_like_image(path: &Path) -> bool {
     path.extension()
-        .map(|extension| extension.to_string_lossy().to_lowercase())
-        .is_some_and(|extension| IMAGE_SUFFIXES.contains(&extension.as_str()))
+        .map(|extension| extension.to_string_lossy())
+        .and_then(|extension| image::ImageFormat::from_extension(extension.as_ref()))
+        .is_some_and(|format| format.reading_enabled())
 }
 
 /// 预览状态。
@@ -243,6 +241,8 @@ mod tests {
         assert!(looks_like_image(Path::new("/tmp/a.png")));
         assert!(looks_like_image(Path::new("/tmp/a.JPG")));
         assert!(looks_like_image(Path::new("/tmp/a.jpeg")));
+        assert!(looks_like_image(Path::new("/tmp/a.tiff")));
+        assert!(!looks_like_image(Path::new("/tmp/a.avif")));
         assert!(!looks_like_image(Path::new("/tmp/a.mp4")));
         assert!(!looks_like_image(Path::new("/tmp/a")));
         assert!(!looks_like_image(Path::new("/tmp/a.png.txt")));

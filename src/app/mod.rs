@@ -2160,7 +2160,7 @@ impl App {
         // 非多值字段是「替换」，所以起点是空的。
         let mut items: Vec<String> = if repeatable && !current.is_empty() {
             current
-                .split(',')
+                .split(&argument.separator)
                 .map(|item| item.trim().to_string())
                 .filter(|item| !item.is_empty())
                 .collect()
@@ -2180,7 +2180,12 @@ impl App {
 
         // 单值字段只认第一条（调用方已经拦过「标记了多个」的情况）。
         let value = if repeatable {
-            items.join(", ")
+            let separator = if argument.separator == "," {
+                ", "
+            } else {
+                &argument.separator
+            };
+            items.join(separator)
         } else {
             items.first().cloned().unwrap_or_default()
         };
@@ -3351,6 +3356,34 @@ mod tests {
         }
         let _ = std::fs::remove_file(&app.state_path);
         let _ = ArgumentValues::new();
+    }
+
+    #[test]
+    fn typing_q_while_searching_does_not_cancel_a_background_job() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = action_app();
+        let job = crate::runtime::spawn_captured(
+            std::path::Path::new("/usr/bin/sleep"),
+            &[String::from("5")],
+            std::path::Path::new("/tmp"),
+            "后台任务",
+        )
+        .expect("启动后台任务");
+        app.running = Some(crate::app::RunningJobView::for_test(
+            job,
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.searching = true;
+
+        let cwd = app.work_dir.clone();
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let quit = crate::app::handle_key(&mut app, key, &cwd).expect("不该出错");
+
+        assert!(!quit, "q 在搜索输入态不是退出命令");
+        assert!(app.is_running(), "搜索输入不应取消后台任务");
+        app.cancel_job();
     }
 
     /// `?` 打开帮助，`q` / `Esc` 关掉；开着时别的键不该漏到列表上。

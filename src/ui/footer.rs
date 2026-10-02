@@ -1,8 +1,6 @@
 //! 底部状态栏：左快捷键提示，右状态消息与队列计数。
 //!
-//! 两栏用固定比例切分，而不是把两段文本拼成一行 —— 拼成一行时，长长的快捷键提示
-//! 会先把状态消息挤出屏幕，而状态消息是应用唯一能回话的地方（「已加入队列」、
-//! 「Provider 失败」等）。现在窄终端下优先牺牲的是快捷键提示。
+//! 状态消息按内容宽度占位，剩余空间交给快捷键提示；空间不足时优先保留状态消息。
 //!
 //! 快捷键按重要性从左到右排列，被截断时先丢掉的是不常用的那几个。
 
@@ -12,15 +10,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{app::App, ui::theme};
 
-/// 快捷键提示占的行宽比例，其余留给状态消息。
-const KEYS_WIDTH: u16 = 52;
-const MESSAGE_WIDTH: u16 = 48;
-
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let keys = if app.packages.is_some() {
+    let all_keys = if app.packages.is_some() {
         "打字即过滤 · Space 多选/取消 · Enter 装 · Esc 清空筛选 · Tab 队列 · Ctrl+R 上网搜 · Ctrl+K 检查"
     } else if app.files.is_some() {
         "↑↓ 选择 · Enter 切到该文件所在目录 · 打字过滤 · Esc 关闭"
@@ -59,14 +54,17 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let right_width = message_column_width(inner.width, &message);
+    let left_width = inner.width.saturating_sub(right_width);
     let columns = Layout::horizontal([
-        Constraint::Percentage(KEYS_WIDTH),
-        Constraint::Percentage(MESSAGE_WIDTH),
+        Constraint::Length(left_width),
+        Constraint::Length(right_width),
     ])
     .split(inner);
     let (Some(left), Some(right)) = (columns.first().copied(), columns.get(1).copied()) else {
         return;
     };
+    let keys = fit_key_hints(all_keys, left.width.saturating_sub(1) as usize);
 
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -82,4 +80,57 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         ])),
         right,
     );
+}
+
+fn fit_key_hints(hints: &str, width: usize) -> String {
+    let mut fitted = String::new();
+    for hint in hints.split(" · ") {
+        let separator_width = if fitted.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(" · ")
+        };
+        let needed = separator_width + UnicodeWidthStr::width(hint);
+        if UnicodeWidthStr::width(fitted.as_str()) + needed > width {
+            break;
+        }
+        if !fitted.is_empty() {
+            fitted.push_str(" · ");
+        }
+        fitted.push_str(hint);
+    }
+    fitted
+}
+
+fn message_column_width(available: u16, message: &str) -> u16 {
+    (UnicodeWidthStr::width(message) + 2).min(available.saturating_sub(12) as usize) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit_key_hints, message_column_width};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn key_hints_fit_by_terminal_width_without_cutting_a_hint() {
+        let hints = "搜索 · Enter执行 · Ctrl+R上网搜";
+        let fitted = fit_key_hints(hints, 17);
+
+        assert_eq!(fitted, "搜索 · Enter执行");
+        assert!(UnicodeWidthStr::width(fitted.as_str()) <= 17);
+    }
+
+    #[test]
+    fn status_column_uses_its_text_width_and_leaves_room_for_key_hints() {
+        let message = "就绪 · 79 个工具";
+        assert_eq!(
+            message_column_width(100, message) as usize,
+            UnicodeWidthStr::width(message) + 2
+        );
+        assert_eq!(
+            message_column_width(200, message) as usize,
+            UnicodeWidthStr::width(message) + 2
+        );
+        assert_eq!(message_column_width(20, message), 8);
+    }
 }

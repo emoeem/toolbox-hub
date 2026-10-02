@@ -19,12 +19,13 @@ use std::{path::Path, path::PathBuf, time::Instant};
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     crossterm::terminal::size,
-    layout::{Constraint, Layout, Position, Rect},
+    layout::{Position, Rect},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        App, Scope, Viewer,
+        App, Viewer,
         package_view::{ConfirmAction, PackageMode, Pane},
     },
     model::{Domain, RunMode},
@@ -51,9 +52,17 @@ pub fn handle_mouse(
         return handle_packages_mouse(app, mouse, cwd);
     }
 
+    if app.viewer.is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.viewer_scroll(-3),
+            MouseEventKind::ScrollDown => app.viewer_scroll(3),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if app.files.is_some()
         || app.history.is_some()
-        || app.viewer.is_some()
         || app.picker.is_some()
         || app.form.is_some()
         || app.is_editing_dir()
@@ -63,36 +72,31 @@ pub fn handle_mouse(
 
     let (width, height) = size().unwrap_or((80, 24));
     let screen = Rect::new(0, 0, width, height);
-    let (domains, list) = main_mouse_areas(app, screen);
+    let areas = crate::ui::main_layout(app, screen);
+    if areas.too_small {
+        return Ok(());
+    }
     let point = Position::new(mouse.column, mouse.row);
 
     match mouse.kind {
         MouseEventKind::ScrollUp => app.move_selection(-3),
         MouseEventKind::ScrollDown => app.move_selection(3),
         MouseEventKind::Down(MouseButton::Left) => {
-            if domains.contains(point) {
-                if let Some(index) = domain_at(domains, mouse.column, app) {
+            if areas.domains.contains(point) {
+                if let Some(index) = domain_at(areas.domains, mouse.column, app) {
                     app.switch_domain(index);
                 }
                 return Ok(());
             }
 
-            if list.contains(point) {
-                let inner = Rect::new(
-                    list.x.saturating_add(1),
-                    list.y.saturating_add(1),
-                    list.width.saturating_sub(2),
-                    list.height.saturating_sub(2),
-                );
-                if inner.contains(point) {
-                    let row = mouse.row.saturating_sub(inner.y) as usize;
-                    if row < app.filtered.len() {
-                        app.selected = row;
-                        app.table.select(Some(row));
-                        if is_double_click(mouse) {
-                            execute_or_open_form(app, cwd)?;
-                        }
-                    }
+            if areas.list.contains(point)
+                && let Some(row) = main_tool_row(areas.list, point)
+                && row < app.filtered.len()
+            {
+                app.selected = row;
+                app.table.select(Some(row));
+                if is_double_click(mouse) {
+                    execute_or_open_form(app, cwd)?;
                 }
             }
         }
@@ -102,30 +106,33 @@ pub fn handle_mouse(
     Ok(())
 }
 
-/// 主界面的可点击区域。这里刻意只复用布局约束，不依赖渲染状态。
-fn main_mouse_areas(app: &App, screen: Rect) -> (Rect, Rect) {
-    let show_sub = app.viewer.is_none()
-        && app.history.is_none()
-        && app.files.is_none()
-        && app.packages.is_none()
-        && app.picker.is_none()
-        && app.form.is_none()
-        && (app.is_global_search() || app.scope != Scope::All || app.has_sub_tabs());
+fn main_tool_row(list: Rect, point: Position) -> Option<usize> {
+    let inner = Rect::new(
+        list.x.saturating_add(1),
+        list.y.saturating_add(1),
+        list.width.saturating_sub(2),
+        list.height.saturating_sub(2),
+    );
+    (inner.contains(point) && point.y > inner.y)
+        .then(|| point.y.saturating_sub(inner.y).saturating_sub(1) as usize)
+}
 
-    let mut constraints = vec![Constraint::Length(4), Constraint::Length(2)];
-    if show_sub {
-        constraints.push(Constraint::Length(2));
-    }
-    let (table_min, detail_height) = if screen.height >= 30 { (9, 10) } else { (6, 8) };
-    constraints.push(Constraint::Min(table_min));
-    constraints.push(Constraint::Length(detail_height));
-    constraints.push(Constraint::Length(2));
+fn package_result_row(results: Rect, point: Position) -> Option<usize> {
+    results
+        .contains(point)
+        .then(|| point.y.saturating_sub(results.y) as usize)
+}
 
-    let chunks = Layout::vertical(constraints).split(screen);
-    let domains = chunks.get(1).copied().unwrap_or_default();
-    let list_index = if show_sub { 3 } else { 2 };
-    let list = chunks.get(list_index).copied().unwrap_or_default();
-    (domains, list)
+fn package_queue_row(results: Rect, point: Position) -> Option<usize> {
+    let inner = Rect::new(
+        results.x.saturating_add(1),
+        results.y.saturating_add(1),
+        results.width.saturating_sub(2),
+        results.height.saturating_sub(2),
+    );
+    inner
+        .contains(point)
+        .then(|| point.y.saturating_sub(inner.y) as usize)
 }
 
 /// 从当前鼠标事件中获得一个稳定的双击判定。
@@ -158,12 +165,14 @@ fn domain_at(area: Rect, x: u16, app: &App) -> Option<usize> {
     let mut cursor = area.x;
     for (index, domain) in Domain::ALL.iter().enumerate() {
         let count = app.registry.tool_count_in(*domain);
-        let label = if count == 0 {
+        let label = if area.width < 100 {
+            domain.label().to_string()
+        } else if count == 0 {
             format!(" {} ", domain.label())
         } else {
             format!(" {} {} ", domain.label(), count)
         };
-        let width = label.encode_utf16().count() as u16;
+        let width = UnicodeWidthStr::width(label.as_str()).min(u16::MAX as usize) as u16;
         let end = cursor.saturating_add(width);
         if x >= cursor && x < end {
             return Some(index);
@@ -177,21 +186,11 @@ fn domain_at(area: Rect, x: u16, app: &App) -> Option<usize> {
 }
 
 fn package_panel_area(app: &App, screen: Rect) -> Rect {
-    let show_sub = false;
-    let (table_min, detail_height) = if screen.height >= 30 { (9, 10) } else { (6, 8) };
-    let mut constraints = vec![Constraint::Length(4), Constraint::Length(2)];
-    if show_sub {
-        constraints.push(Constraint::Length(2));
+    let layout = crate::ui::main_layout(app, screen);
+    if layout.too_small {
+        return Rect::default();
     }
-    constraints.push(Constraint::Min(table_min));
-    constraints.push(Constraint::Length(detail_height));
-    constraints.push(Constraint::Length(2));
-    let chunks = Layout::vertical(constraints).split(screen);
-    let list_index = if show_sub { 3 } else { 2 };
-    let list = chunks.get(list_index).copied().unwrap_or_default();
-    let detail = chunks.get(list_index + 1).copied().unwrap_or_default();
-    let _ = app;
-    list.union(detail)
+    layout.list.union(layout.detail)
 }
 
 fn handle_packages_mouse(
@@ -235,6 +234,9 @@ fn handle_packages_mouse(
     let (width, height) = size().unwrap_or((80, 24));
     let screen = Rect::new(0, 0, width, height);
     let area = package_panel_area(app, screen);
+    if area.width < 2 || area.height < 2 {
+        return Ok(());
+    }
     let inner = Rect::new(
         area.x.saturating_add(1),
         area.y.saturating_add(1),
@@ -316,26 +318,26 @@ fn handle_packages_mouse(
         .as_ref()
         .is_some_and(|view| view.pane == Pane::Queue)
     {
-        if let Some(view) = app.packages.as_mut() {
-            let row = point.y.saturating_sub(areas.results.y).saturating_sub(1) as usize;
+        if let Some(row) = package_queue_row(areas.results, point)
+            && let Some(view) = app.packages.as_mut()
+        {
             if row < view.queue.len() {
                 view.queue_selected = row;
-            } else {
-                view.queue_selected = view.queue.len().saturating_sub(1);
-            }
-            if double {
+                if double {
+                    view.toggle_queue();
+                }
+            } else if double {
                 view.toggle_queue();
             }
         }
         return Ok(());
     }
 
-    if !areas.results.contains(point) {
+    let Some(row) = package_result_row(areas.results, point) else {
         return Ok(());
-    }
+    };
 
-    // 结果表第一行是表头，行号要减 1。
-    let row = point.y.saturating_sub(areas.results.y).saturating_sub(1) as usize;
+    // 搜索、已安装、新闻、维护列表都没有表头；区域第一行就是第一个结果。
     if let Some(view) = app.packages.as_mut() {
         view.pane = Pane::Rows;
         if row < view.rows_len() {
@@ -412,6 +414,11 @@ pub fn handle_key(
         && app.viewer.is_none()
         && app.files.is_none()
         && app.packages.is_none()
+        && !app.searching
+        && app.history.is_none()
+        && app.picker.is_none()
+        && app.form.is_none()
+        && !app.is_editing_dir()
         && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             || (matches!(key.code, KeyCode::Char('c')) && key.modifiers == KeyModifiers::CONTROL))
     {
@@ -749,11 +756,19 @@ fn execute_form(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Err
             let requests: Vec<crate::app::CaptureRequest> = runs
                 .into_iter()
                 .map(|(argv, values)| {
-                    // 每个输入各自探一次时长（批量裁剪时各文件的时长并不一样）。
-                    let total_seconds = tool
-                        .action
-                        .as_ref()
-                        .and_then(|action| app.total_seconds_for(action, &values));
+                    // 单文件可同步探测源时长；foreach 可能有很多文件，不能在 UI
+                    // 线程里逐个等待 ffprobe。批量时仍保留用户显式填写的裁剪时长。
+                    let total_seconds = tool.action.as_ref().and_then(|action| {
+                        if count > 1 {
+                            action
+                                .limit_from
+                                .as_deref()
+                                .and_then(|key| values.get(key))
+                                .and_then(crate::runtime::parse_duration)
+                        } else {
+                            app.total_seconds_for(action, &values)
+                        }
+                    });
                     let record_argv = match tool.action.as_ref() {
                         Some(action) => action.redacted(&values, &argv),
                         None => argv.clone(),
@@ -1316,4 +1331,47 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
     app.clear_marks(&targets);
     app.message = parts.join(" · ");
     Ok(())
+}
+
+#[cfg(test)]
+mod mouse_row_tests {
+    use ratatui::layout::{Position, Rect};
+
+    use super::{main_tool_row, package_queue_row, package_result_row};
+
+    #[test]
+    fn main_table_mouse_mapping_skips_border_and_header() {
+        let list = Rect::new(0, 10, 80, 10);
+
+        assert_eq!(
+            main_tool_row(list, Position::new(3, 10)),
+            None,
+            "边框不命中"
+        );
+        assert_eq!(
+            main_tool_row(list, Position::new(3, 11)),
+            None,
+            "表头不命中"
+        );
+        assert_eq!(main_tool_row(list, Position::new(3, 12)), Some(0));
+        assert_eq!(main_tool_row(list, Position::new(3, 13)), Some(1));
+    }
+
+    #[test]
+    fn package_result_mouse_mapping_does_not_skip_the_first_row() {
+        let results = Rect::new(5, 8, 60, 12);
+
+        assert_eq!(package_result_row(results, Position::new(5, 8)), Some(0));
+        assert_eq!(package_result_row(results, Position::new(5, 9)), Some(1));
+        assert_eq!(package_result_row(results, Position::new(5, 20)), None);
+    }
+
+    #[test]
+    fn package_queue_mouse_mapping_ignores_its_panel_border() {
+        let results = Rect::new(5, 8, 60, 12);
+
+        assert_eq!(package_queue_row(results, Position::new(5, 8)), None);
+        assert_eq!(package_queue_row(results, Position::new(6, 9)), Some(0));
+        assert_eq!(package_queue_row(results, Position::new(6, 10)), Some(1));
+    }
 }

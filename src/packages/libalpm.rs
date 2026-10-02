@@ -531,8 +531,8 @@ impl Db {
                     name: package.name().to_string(),
                     version: package.version().to_string(),
                     description: package.desc().unwrap_or_default().to_string(),
-                    installed_state: state_for_versions(
-                        self.handle.localdb().pkg(package.name()).ok(),
+                    installed_state: state_for_local_version(
+                        local.get(package.name()).map(String::as_str),
                         package.version(),
                     ),
                     votes: None,
@@ -540,7 +540,6 @@ impl Db {
                     maintainer: None,
                     out_of_date: false,
                 });
-                let _ = &local;
             }
         }
         Ok(hits)
@@ -619,8 +618,8 @@ impl Db {
                     name: package.name().to_string(),
                     version: package.version().to_string(),
                     description: package.desc().unwrap_or_default().to_string(),
-                    installed_state: state_for_versions(
-                        self.handle.localdb().pkg(package.name()).ok(),
+                    installed_state: state_for_local_version(
+                        local.get(package.name()).map(String::as_str),
                         package.version(),
                     ),
                     votes: None,
@@ -628,7 +627,6 @@ impl Db {
                     maintainer: None,
                     out_of_date: false,
                 });
-                let _ = local;
             }
         }
         hits
@@ -686,7 +684,7 @@ impl Db {
 
     /// 队列里这些包一共要下载多少字节（同步库里查得到的才算）。
     pub fn download_total(&self, names: &[String]) -> Option<u64> {
-        let wanted: Vec<&str> = names.iter().map(String::as_str).collect();
+        let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
         let mut claimed: HashSet<&str> = HashSet::new();
         let mut total = 0u64;
         let mut found = false;
@@ -702,20 +700,20 @@ impl Db {
         found.then_some(total)
     }
 
-    /// 同步库有多旧（最新的那个 `.db` 文件的 mtime 到现在）。
+    /// 同步库有多旧（最旧的 `.db` 文件 mtime 到现在）。
     ///
     /// **「有多少可更新」是按本地数据库算的**（和 `pacman -Qu` 同一口径），
     /// 数据库旧了这个数就偏小。`checkupdates` 之所以更「准」，是因为它每次都
     /// 重新下载数据库 —— 代价就是那 18 秒。库旧了就该说出来。
     pub fn sync_age(&self) -> Option<std::time::Duration> {
         let dir = std::path::Path::new(DB_PATH).join("sync");
-        let newest = std::fs::read_dir(dir)
+        let oldest = std::fs::read_dir(dir)
             .ok()?
             .flatten()
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".db"))
             .filter_map(|entry| entry.metadata().ok()?.modified().ok())
-            .max()?;
-        newest.elapsed().ok()
+            .min()?;
+        oldest.elapsed().ok()
     }
 }
 
@@ -759,9 +757,17 @@ fn state_of(repo: &::alpm::Ver, installed: Option<&::alpm::Ver>) -> InstalledSta
     }
 }
 
-/// 同上，但入口是「本地包对象」（列表路径拿到的是它）。
-fn state_for_versions(local: Option<&Package>, repo: &::alpm::Ver) -> InstalledState {
-    state_of(repo, local.map(|package| package.version()))
+fn state_for_local_version(local: Option<&str>, repo: &::alpm::Ver) -> InstalledState {
+    match local {
+        Some(local) => {
+            let repo_version = repo.to_string();
+            InstalledState::from_ordering(
+                ::alpm::vercmp(repo_version.as_str(), local),
+                local.to_string(),
+            )
+        }
+        None => InstalledState::NotInstalled,
+    }
 }
 
 /// 把 libalpm 的包对象翻成 [`Facts`]（这一层之外就全是纯逻辑了）。

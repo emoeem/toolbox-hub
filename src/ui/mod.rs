@@ -57,14 +57,22 @@ pub(crate) fn short_path(path: &Path) -> String {
     }
 }
 
-pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
-    let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MainLayout {
+    pub header: Rect,
+    pub domains: Rect,
+    pub sub: Option<Rect>,
+    pub list: Rect,
+    pub detail: Rect,
+    pub footer: Rect,
+    pub too_small: bool,
+    pub minimum_width: u16,
+    pub minimum_height: u16,
+}
 
-    // 顶部栏 4 行（边框 + 标题 + 搜索/提示）、域 Tabs 2 行、二级筛选 2 行、
-    // 表格、详情、状态栏。低于最低高度就无法表达两级层级，宁可给提示也不挤成一团。
-    //
-    // 跨域搜索时也要留出这一条：它显示的是「命中落在哪些域」，比分类条更重要。
+/// 主界面的唯一布局来源，渲染与鼠标命中共用同一组矩形。
+pub fn main_layout(app: &App, area: Rect) -> MainLayout {
+    // 跨域搜索时也要留出二级行：它显示「命中落在哪些域」，比分类条更重要。
     // 参数表单模式下则整条省掉，把行数让给字段。
     let show_sub = app.viewer.is_none()
         && app.history.is_none()
@@ -73,15 +81,41 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         && app.picker.is_none()
         && app.form.is_none()
         && (app.is_global_search() || app.scope != Scope::All || app.has_sub_tabs());
-    // 24 行是最常见的终端默认高度，所以布局按它来卡：
-    // 顶栏 4 + 域 2 (+ 二级筛选 2) + 表格 ≥6 + 详情 8 + 底栏 2 = 24（带筛选行时）。
-    // 实测过：早先要求 26 行，80×24 的终端直接显示「终端窗口太小」，等于不能用。
-    let (table_min, detail_height) = if area.height >= 30 { (9, 10) } else { (6, 8) };
+    // 小窗口下仅压缩主工具浏览页：隐藏详情与次要列，把空间留给可操作的列表。
+    // 其他视图各自有内部布局，仍使用完整模式，避免面板被挤成不可用的几行。
+    let can_compact = app.viewer.is_none()
+        && app.history.is_none()
+        && app.files.is_none()
+        && app.packages.is_none()
+        && app.picker.is_none()
+        && app.form.is_none()
+        && app.running.is_none();
     let min_height = if show_sub { 24 } else { 22 };
-    if area.height < min_height || area.width < 72 {
-        draw_too_small(frame, area, min_height);
-        return;
+    let compact = can_compact && (area.width < 72 || area.height < min_height);
+    let compact_min_height = if show_sub { 16 } else { 14 };
+    let minimum_width = if compact { 54 } else { 72 };
+    let required_height = if compact {
+        compact_min_height
+    } else {
+        min_height
+    };
+    if area.height < required_height || area.width < minimum_width {
+        return MainLayout {
+            too_small: true,
+            minimum_width,
+            minimum_height: required_height,
+            ..MainLayout::default()
+        };
     }
+
+    // 正常模式保留完整详情；紧凑模式用列表换空间。
+    let (table_min, detail_height) = if compact {
+        (6, 0)
+    } else if area.height >= 30 {
+        (9, 10)
+    } else {
+        (6, 8)
+    };
 
     let mut constraints = vec![Constraint::Length(4), Constraint::Length(2)];
     if show_sub {
@@ -92,15 +126,34 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     constraints.push(Constraint::Length(2));
 
     let chunks = Layout::vertical(constraints).split(area);
-    let mut rows = chunks.iter().copied();
+    let list_index = if show_sub { 3 } else { 2 };
+    MainLayout {
+        header: chunks.first().copied().unwrap_or_default(),
+        domains: chunks.get(1).copied().unwrap_or_default(),
+        sub: show_sub.then(|| chunks.get(2).copied().unwrap_or_default()),
+        list: chunks.get(list_index).copied().unwrap_or_default(),
+        detail: chunks.get(list_index + 1).copied().unwrap_or_default(),
+        footer: chunks.get(list_index + 2).copied().unwrap_or_default(),
+        too_small: false,
+        minimum_width,
+        minimum_height: required_height,
+    }
+}
 
-    let (Some(header), Some(domains)) = (rows.next(), rows.next()) else {
+pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+
+    let layout = main_layout(app, area);
+    if layout.too_small {
+        draw_too_small(frame, area, layout.minimum_width, layout.minimum_height);
         return;
-    };
-    header::draw(frame, app, header);
-    tabs::draw_domains(frame, app, domains);
+    }
 
-    if show_sub && let Some(sub) = rows.next() {
+    header::draw(frame, app, layout.header);
+    tabs::draw_domains(frame, app, layout.domains);
+
+    if let Some(sub) = layout.sub {
         if app.is_global_search() || app.scope != Scope::All {
             tabs::draw_scope(frame, app, sub);
         } else {
@@ -108,39 +161,41 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    if let (Some(list), Some(detail), Some(footer)) = (rows.next(), rows.next(), rows.next()) {
-        // 输出视图占满表格 + 详情两块；表单模式顶掉表格与详情；
-        // 都没有就是普通的列表 + 详情。
-        if app.viewer.is_some() {
-            viewer::draw(frame, app, list.union(detail));
-        } else if app.history.is_some() {
-            history::draw(frame, app, list.union(detail));
-        } else if app.packages.is_some() {
-            packages::draw(frame, app, list.union(detail));
-        } else if app.files.is_some() {
-            files::draw(frame, app, list.union(detail));
-        } else if app.picker.is_some() {
-            picker::draw(frame, app, list.union(detail));
-        } else if app.form.is_some() {
-            form::draw_fields(frame, app, list);
-            form::draw_preview(frame, app, detail);
-        } else {
-            table::draw(frame, app, list);
-            // 有任务在跑就用「执行中」面板顶掉详情区：列表照常可用，进度也看得见。
+    let list = layout.list;
+    let detail = layout.detail;
+    // 输出视图占满表格 + 详情两块；表单模式顶掉表格与详情；
+    // 都没有就是普通的列表 + 详情。
+    if app.viewer.is_some() {
+        viewer::draw(frame, app, list.union(detail));
+    } else if app.history.is_some() {
+        history::draw(frame, app, list.union(detail));
+    } else if app.packages.is_some() {
+        packages::draw(frame, app, list.union(detail));
+    } else if app.files.is_some() {
+        files::draw(frame, app, list.union(detail));
+    } else if app.picker.is_some() {
+        picker::draw(frame, app, list.union(detail));
+    } else if app.form.is_some() {
+        form::draw_fields(frame, app, list);
+        form::draw_preview(frame, app, detail);
+    } else {
+        table::draw(frame, app, list);
+        // 有任务在跑就用「执行中」面板顶掉详情区：列表照常可用，进度也看得见。
+        if detail.height > 0 {
             if app.running.is_some() {
                 run::draw(frame, app, detail);
             } else {
                 detail::draw(frame, app, detail);
             }
         }
-        footer::draw(frame, app, footer);
-
-        // 帮助屏最后画 —— 它是盖在所有东西上面的一层。
-        help::draw(frame, app);
     }
+    footer::draw(frame, app, layout.footer);
+
+    // 帮助屏最后画 —— 它是盖在所有东西上面的一层。
+    help::draw(frame, app);
 }
 
-fn draw_too_small(frame: &mut ratatui::Frame, area: Rect, min_height: u16) {
+fn draw_too_small(frame: &mut ratatui::Frame, area: Rect, min_width: u16, min_height: u16) {
     let text = Text::from(vec![
         Line::from(Span::styled(
             "Toolbox",
@@ -151,8 +206,8 @@ fn draw_too_small(frame: &mut ratatui::Frame, area: Rect, min_height: u16) {
         Line::from(""),
         Line::from("终端窗口太小"),
         Line::from(format!(
-            "当前: {} × {}   需要: ≥72 × ≥{}",
-            area.width, area.height, min_height
+            "当前: {} × {}   需要: ≥{} × ≥{}",
+            area.width, area.height, min_width, min_height
         )),
         Line::from("请放大终端窗口后继续。"),
     ]);
@@ -424,6 +479,18 @@ mod tests {
         ] {
             assert!(screen.contains(wanted), "屏幕上少了 {wanted}：\n{screen}");
         }
+
+        let compact = render_compact(&mut app, 72, 30);
+        for wanted in ["extra", "fzf", "0.74.4-1", "已安装"] {
+            assert!(
+                compact.contains(wanted),
+                "72 列紧凑布局少了 {wanted}：\n{compact}"
+            );
+        }
+        assert!(
+            !compact.contains("票23"),
+            "紧凑布局应优先隐藏 AUR 热度列：\n{compact}"
+        );
 
         // 队列（Tab 切过去）整块顶掉结果表
         if let Some(view) = app.packages.as_mut() {
@@ -854,10 +921,35 @@ mod tests {
         assert!(text.contains("Toolbox"), "顶栏要在: {text}");
         assert!(text.contains("工具"), "表格要在: {text}");
 
-        // 更矮就该明确说太小（而不是画出一堆挤压的块）
+        // 紧凑模式在 18 行仍保留列表；再矮就明确提示，而不是挤坏布局。
+        let mut compact = app();
+        let text = render_compact(&mut compact, 80, 18);
+        assert!(
+            !text.contains("终端窗口太小"),
+            "18 行应进入紧凑模式: {text}"
+        );
+        assert!(text.contains("工具"), "紧凑模式仍应显示列表: {text}");
+
         let mut tiny = app();
-        let text = render_compact(&mut tiny, 80, 18);
-        assert!(text.contains("终端窗口太小"), "18 行确实放不下: {text}");
+        let text = render_compact(&mut tiny, 80, 14);
+        assert!(text.contains("终端窗口太小"), "14 行确实放不下: {text}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_keeps_the_tool_list_usable() {
+        let mut app = app();
+        let text = render_compact(&mut app, 54, 16);
+
+        assert!(
+            !text.contains("终端窗口太小"),
+            "54×16 应进入紧凑布局: {text}"
+        );
+        assert!(text.contains("工具"), "工具列表标题要保留: {text}");
+        assert!(text.contains("trim-video"), "工具行要保留: {text}");
+        for domain in ["媒体", "图像", "系统", "网络", "开发", "工具", "包管理"] {
+            assert!(text.contains(domain), "54 列域栏少了 {domain}: {text}");
+        }
+        assert!(!text.contains("当前工具"), "紧凑模式收起详情面板: {text}");
     }
 
     /// 执行中面板：命令、耗时、进度、输出尾巴、取消提示。

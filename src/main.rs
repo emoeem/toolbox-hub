@@ -153,7 +153,13 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
     // 实测空转 3~4% CPU，纯属白烧。现在只有按键/鼠标/后台有变动/需要整屏重画
     // 这几种情况才画。
     let mut dirty = true;
+    let mut shown_reload_second = app.seconds_since_reload();
     loop {
+        let reload_second = app.seconds_since_reload();
+        if reload_second != shown_reload_second {
+            shown_reload_second = reload_second;
+            dirty = true;
+        }
         // 接管过终端（跑了交互式工具）以后，必须先丢掉 ratatui 的旧帧：
         // 它记着接管前那一帧，而离开备用屏幕时物理屏已经空了，直接 draw 会因为
         // 「没变化」而一个格子都不写 —— 界面看起来就只剩一行状态文字。

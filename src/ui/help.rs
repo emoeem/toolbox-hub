@@ -9,6 +9,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{app::App, ui::theme};
 
@@ -192,7 +193,14 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         )));
         for (key, what) in keys.iter() {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<18}"), Style::default().fg(theme::GREEN)),
+                Span::styled(
+                    format!(
+                        "  {}{}",
+                        key,
+                        " ".repeat(18usize.saturating_sub(UnicodeWidthStr::width(*key)))
+                    ),
+                    Style::default().fg(theme::GREEN),
+                ),
                 Span::styled(*what, Style::default().fg(theme::TEXT)),
             ]));
         }

@@ -20,6 +20,12 @@ serde_json = "1.0.151"
 ureq = "3"
 # 终端里画图片（F 视图的预览）。支持的协议由终端决定：kitty / sixel / iTerm2，
 # 都不是就退化成半块字符。探测懒执行，见 src/preview.rs。
-ratatui-image = "11"
-image = "0.25"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 toml = "1.1.6"
+unicode-width = "0.2"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

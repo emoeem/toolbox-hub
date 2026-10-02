@@ -20,15 +20,14 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let header = Row::new(vec![
-        Cell::from("工具"),
-        Cell::from("域"),
-        Cell::from("Provider"),
-        Cell::from("分类"),
-        Cell::from("状态"),
-        Cell::from("说明"),
-    ])
-    .style(Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
+    let compact = area.width < 72;
+    let headers = if compact {
+        vec!["工具", "域", "状态", "说明"]
+    } else {
+        vec!["工具", "域", "Provider", "分类", "状态", "说明"]
+    };
+    let header =
+        Row::new(headers).style(Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
 
     let rows = app.filtered.iter().map(|&index| {
         let tool = &app.registry.tools()[index];
@@ -39,49 +38,58 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             "  "
         };
-        let tags = if tool.tags.is_empty() {
-            "-".to_string()
-        } else {
-            tool.tags.join("/")
-        };
-        let tag_color = tool
-            .tags
-            .first()
-            .map_or(theme::PURPLE, |tag| theme::tag_color(tag));
         let status_style = if tool.ready {
             Style::default().fg(theme::GREEN)
         } else {
             Style::default().fg(theme::YELLOW)
         };
 
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(format!("{mark}{star}{}", tool.name)),
             // 跨域搜索时结果可能来自任何域，这一列让「这条是哪个域的」仍然一眼可见。
             Cell::from(tool.domain.label())
                 .style(Style::default().fg(theme::domain_color(tool.domain))),
-            Cell::from(tool.provider.clone()).style(Style::default().fg(theme::DIM)),
-            Cell::from(tags).style(Style::default().fg(tag_color)),
-            Cell::from(tool.status_label()).style(status_style),
-            Cell::from(tool.summary.clone()).style(Style::default().fg(theme::DIM)),
-        ])
-        .height(1)
+        ];
+        if !compact {
+            let tags = if tool.tags.is_empty() {
+                "-".to_string()
+            } else {
+                tool.tags.join("/")
+            };
+            let tag_color = tool
+                .tags
+                .first()
+                .map_or(theme::PURPLE, |tag| theme::tag_color(tag));
+            cells.push(Cell::from(tool.provider.clone()).style(Style::default().fg(theme::DIM)));
+            cells.push(Cell::from(tags).style(Style::default().fg(tag_color)));
+        }
+        cells.push(Cell::from(tool.status_label()).style(status_style));
+        cells.push(Cell::from(tool.summary.clone()).style(Style::default().fg(theme::DIM)));
+        Row::new(cells).height(1)
     });
 
-    let table = Table::new(
-        rows,
-        [
+    let widths = if compact {
+        vec![
+            Constraint::Percentage(45),
+            Constraint::Length(6),
+            Constraint::Length(13),
+            Constraint::Min(8),
+        ]
+    } else {
+        vec![
             Constraint::Percentage(24),
             Constraint::Length(6),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(13),
             Constraint::Min(16),
-        ],
-    )
-    .header(header)
-    .block(theme::panel(" 工具 "))
-    .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
-    .highlight_symbol("▸ ");
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(theme::panel(" 工具 "))
+        .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
+        .highlight_symbol("▸ ");
 
     frame.render_stateful_widget(table, area, &mut app.table);
 }

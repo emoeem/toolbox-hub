@@ -13,6 +13,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
@@ -70,15 +71,17 @@ pub fn tab_hits(view: &PackageView, area: Rect) -> Vec<(Rect, TabTarget)> {
     let mut x = area.x;
 
     for (index, (label, _)) in view.mode_tabs().iter().enumerate() {
-        let width = label.chars().count() as u16 + 4; // [ 搜索 ]
+        let rendered = format!(" {label} ");
+        let width = display_width(&rendered);
         hits.push((Rect::new(x, area.y, width, 1), TabTarget::Mode(index)));
         x = x.saturating_add(width + 1);
     }
 
-    x = x.saturating_add(1); // 模式与筛选之间的分隔
+    x = x.saturating_add(2); // `draw_tabs` 画出 `│ ` 两列
 
     for (index, (label, _, count)) in view.chips().iter().enumerate() {
-        let width = label.chars().count() as u16 + digits(*count) + 3; // [core 42✓]
+        let rendered = format!("[{label} {count}✓]");
+        let width = display_width(&rendered);
         hits.push((Rect::new(x, area.y, width, 1), TabTarget::Filter(index)));
         x = x.saturating_add(width + 1);
     }
@@ -86,8 +89,8 @@ pub fn tab_hits(view: &PackageView, area: Rect) -> Vec<(Rect, TabTarget)> {
     hits
 }
 
-fn digits(value: usize) -> u16 {
-    value.to_string().len() as u16
+fn display_width(text: &str) -> u16 {
+    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -207,8 +210,11 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
 
     // 右端：键提示（paru 那行 `Tab:多选 | Enter:安装 | …`）
     let hint = "打字:过滤 · Space:多选 · Enter:装 · Esc:清空筛选 · Ctrl+R:上网搜";
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    let room = (area.width as usize).saturating_sub(used + hint.chars().count() + 2);
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let room = (area.width as usize).saturating_sub(used + UnicodeWidthStr::width(hint) + 2);
     spans.push(Span::raw(" ".repeat(room)));
     spans.push(Span::styled(hint, Style::default().fg(theme::FAINT)));
 
@@ -338,7 +344,7 @@ fn row_style(view: &PackageView) -> Style {
 /// 窗口跟着选区走：选区永远落在窗口里，所以 `TableState` 的 `offset` 保持 0，
 /// 高亮行就是窗口内的相对下标。
 fn window(total: usize, selected: usize, height: u16) -> (usize, usize) {
-    let room = height.saturating_sub(1).max(1) as usize; // 表头占一行
+    let room = height.max(1) as usize;
     if total <= room {
         return (0, total);
     }
@@ -373,6 +379,7 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
         return;
     }
 
+    let compact = area.width < 104;
     let (start, end) = window(view.rows_len(), view.rows_selected(), area.height);
     let rows = (start..end)
         .filter_map(|row| view.visible_hit(row))
@@ -394,7 +401,7 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
             }
             let queued = view.queue.iter().any(|item| item.name == hit.name);
 
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(hit.repo.clone()).style(Style::default().fg(repo_color)),
                 Cell::from(format!("{}{}", if queued { "● " } else { "" }, hit.name)).style(
                     Style::default()
@@ -403,15 +410,24 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
                 ),
                 Cell::from(hit.version.clone()).style(Style::default().fg(theme::DIM)),
                 Cell::from(hit.description.clone()).style(Style::default().fg(theme::FAINT)),
-                Cell::from(extra).style(Style::default().fg(theme::YELLOW)),
-                Cell::from(hit.status_label()).style(Style::default().fg(theme::GREEN)),
-            ])
-            .height(1)
+            ];
+            if !compact {
+                cells.push(Cell::from(extra).style(Style::default().fg(theme::YELLOW)));
+            }
+            cells.push(Cell::from(hit.status_label()).style(Style::default().fg(theme::GREEN)));
+            Row::new(cells).height(1)
         });
 
-    let table = Table::new(
-        rows,
-        [
+    let widths = if compact {
+        vec![
+            Constraint::Length(16),
+            Constraint::Length(18),
+            Constraint::Length(12),
+            Constraint::Min(8),
+            Constraint::Length(12),
+        ]
+    } else {
+        vec![
             // 仓库列要放得下 `cachyos-extra-v3`（16 字符），不然会被截成
             // `cachyos-extra-`，看着像另一个仓库
             Constraint::Length(16),
@@ -420,10 +436,11 @@ fn draw_search_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
             Constraint::Min(16),
             Constraint::Length(12),
             Constraint::Length(18),
-        ],
-    )
-    .row_highlight_style(row_style(view))
-    .highlight_symbol("➤ ");
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .row_highlight_style(row_style(view))
+        .highlight_symbol("➤ ");
 
     // 预窗口化之后，高亮行是窗口内的相对下标
     let mut state =
@@ -501,7 +518,9 @@ fn draw_news_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     if view.rows_len() == 0 {
         empty_hint(
             frame,
-            if view.news.is_empty() {
+            if view.news_loading {
+                "正在抓取 Arch 新闻…"
+            } else if view.news.is_empty() {
                 "按 Enter 抓一次 Arch 新闻（archlinux.org/feeds/news）"
             } else {
                 "这个筛选下没有新闻：点上面的标签换一个"
@@ -659,7 +678,10 @@ fn draw_info(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     if let Some((_, fields)) = &view.info {
         for (key, value) in fields {
             lines.push(Line::from(vec![
-                Span::styled(format!(" {key:<16}"), Style::default().fg(theme::DIM)),
+                Span::styled(
+                    format!(" {}", pad_to_width(key, 16)),
+                    Style::default().fg(theme::DIM),
+                ),
                 Span::styled(value.clone(), Style::default().fg(theme::TEXT)),
             ]));
         }
@@ -678,6 +700,12 @@ fn draw_info(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
             .scroll((view.info_scroll.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    let mut padded = value.to_string();
+    padded.push_str(&" ".repeat(width.saturating_sub(UnicodeWidthStr::width(value))));
+    padded
 }
 
 // ── 浮层：排序菜单与执行确认 ────────────────────────────────────────────────
@@ -828,7 +856,15 @@ fn draw_confirm(frame: &mut ratatui::Frame, confirm: &Confirm, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::window;
+    use super::{pad_to_width, window};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn info_labels_pad_by_terminal_columns() {
+        let padded = pad_to_width("安装后大小", 16);
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 16);
+        assert!(padded.ends_with(" "));
+    }
 
     /// 窗口跟着选区走，且永远落在合法范围内 —— 越界会直接 panic 在切片上。
     #[test]
@@ -837,11 +873,11 @@ mod tests {
         assert_eq!(window(5, 0, 10), (0, 5));
         assert_eq!(window(0, 0, 10), (0, 0));
 
-        // 2271 行、视口 20 行：窗口始终 20 行，选区在里面
+        // 结果表没有表头，20 行视口应显示 20 个包
         let (start, end) = window(2271, 0, 20);
-        assert_eq!((start, end), (0, 19), "开头贴着顶");
+        assert_eq!((start, end), (0, 20), "开头贴着顶");
         let (start, end) = window(2271, 1000, 20);
-        assert_eq!(end - start, 19);
+        assert_eq!(end - start, 20);
         assert!(start <= 1000 && 1000 < end, "选区必须在窗口里");
 
         // 末尾不能越界（这是最容易写出 bug 的地方）

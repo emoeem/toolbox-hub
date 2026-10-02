@@ -167,6 +167,7 @@ pub struct PackageView {
     pub news_visible: Vec<usize>,
     pub news_filter: NewsFilter,
     pub news_selected: usize,
+    pub news_loading: bool,
     pub read_news: BTreeSet<String>,
     /// 有几条是「上次全系统升级之后发布的」（只是建议看一眼，不等于未读）。
     pub news_after_upgrade: Option<usize>,
@@ -257,6 +258,7 @@ impl PackageView {
             news_visible: Vec::new(),
             news_filter: NewsFilter::Unread,
             news_selected: 0,
+            news_loading: false,
             read_news: BTreeSet::new(),
             news_after_upgrade: None,
             news_mark: None,
@@ -419,10 +421,14 @@ impl PackageView {
     /// 以前它俩串在同一个线程里，而「可更新」那一步是 18 秒的 `checkupdates` ——
     /// 新闻就被它堵在后面。
     pub fn start_news(&mut self) {
+        if self.news_loading {
+            return;
+        }
         let Some(worker) = self.worker.as_ref() else {
             self.message = String::from("取数线程没起来，看不了新闻");
             return;
         };
+        self.news_loading = true;
         self.read_news = packages::load_read_news(&packages::read_news_path());
         self.message = String::from("正在看 Arch 新闻…");
         worker.news();
@@ -500,6 +506,7 @@ impl PackageView {
 
         self.auto_searched = Some(term.clone());
         self.searched = Some(term.clone());
+        self.searching = true;
         self.awaiting_official = true;
         self.awaiting_aur = true;
         self.official_hits.clear();
@@ -582,7 +589,7 @@ impl PackageView {
                 });
                 self.append_confirm_notes(note.into_iter().collect());
             }
-            Response::Health(items) => {
+            Response::Health(Ok(items)) => {
                 self.health_loading = false;
                 self.health_loaded = true;
                 let (bad, warn) = health::tally(&items);
@@ -596,12 +603,21 @@ impl PackageView {
                     self.health_selected = self.health.len().saturating_sub(1);
                 }
             }
-            Response::FileIntegrity(lines) => {
+            Response::Health(Err(error)) => {
+                self.health_loading = false;
+                self.health_loaded = false;
+                self.message = format!("维护检查失败：{error}");
+            }
+            Response::FileIntegrity(Ok(lines)) => {
                 self.health_checking_files = false;
                 self.message = format!("文件完整性：{} 行输出", lines.len());
                 self.pending_view = Some((String::from("pacman -Qk"), lines));
             }
-            Response::OrphanNames(names) => {
+            Response::FileIntegrity(Err(error)) => {
+                self.health_checking_files = false;
+                self.message = format!("文件完整性检查失败：{error}");
+            }
+            Response::OrphanNames(Ok(names)) => {
                 if names.is_empty() {
                     self.message = String::from("没有孤儿包，系统很干净");
                     return;
@@ -619,7 +635,11 @@ impl PackageView {
                     pending: false,
                 });
             }
+            Response::OrphanNames(Err(error)) => {
+                self.message = format!("读取孤儿包失败：{error}");
+            }
             Response::News(Ok(chunk)) => {
+                self.news_loading = false;
                 self.news_after_upgrade = Some(chunk.after_upgrade);
                 self.news_mark = chunk.mark;
                 let unread = chunk
@@ -636,6 +656,7 @@ impl PackageView {
                 self.rebuild_news();
             }
             Response::News(Err(error)) => {
+                self.news_loading = false;
                 self.message = format!("抓新闻失败：{error}");
             }
         }
@@ -1625,7 +1646,9 @@ impl PackageView {
                 }
             }
             PackageMode::News => {
-                if self.news.is_empty() {
+                if self.news_loading && self.news.is_empty() {
+                    String::from("正在抓取 Arch 新闻…")
+                } else if self.news.is_empty() {
                     String::from("按 Enter 抓一次 Arch 新闻")
                 } else {
                     format!("{} / {} 条新闻", self.news_visible.len(), self.news.len())
@@ -1784,6 +1807,17 @@ mod tests {
         view.query.set("zzzz");
         view.apply_filter();
         assert_eq!(view.rows_len(), 0);
+    }
+
+    #[test]
+    fn automatic_search_marks_itself_pending_before_dispatch() {
+        let mut view = view_with(Vec::new());
+        view.query.set("notfound");
+        view.last_edit = Some(std::time::Instant::now() - std::time::Duration::from_millis(401));
+
+        assert!(view.maybe_auto_search());
+        assert!(view.searching, "自动搜索在响应前就应阻止重复请求");
+        assert!(!view.maybe_auto_search(), "同一查询不能重复发起");
     }
 
     /// 仓库标签与排序都作用在同一份结果上；标签带命中数。
@@ -2021,6 +2055,18 @@ mod tests {
             view.selected_news().map(|item| item.title.as_str()),
             Some("新内核")
         );
+    }
+
+    #[test]
+    fn news_loading_state_is_visible_and_clears_after_failure() {
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
+        view.mode = PackageMode::News;
+        view.news_loading = true;
+        assert_eq!(view.status_line(), "正在抓取 Arch 新闻…");
+
+        view.handle(Response::News(Err(String::from("网络不可用"))));
+        assert!(!view.news_loading);
+        assert!(view.message.contains("网络不可用"));
     }
 
     /// 三种模式共用一个输入框：输入即筛，在哪一屏都成立。

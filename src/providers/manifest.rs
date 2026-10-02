@@ -65,12 +65,17 @@ const BUNDLED: &[(&str, &str)] = &[
     ),
 ];
 
-/// 内置动作总数。
-///
-/// **加/删 `manifests/*.toml` 里的动作后要更新这里**：测试拿它对账，
-/// 某个 manifest 悄悄解析失败时（例如拼错一个键），工具数会立刻对不上。
 #[cfg(test)]
-const BUNDLED_ACTION_COUNT: usize = 45;
+fn bundled_action_count() -> usize {
+    BUNDLED
+        .iter()
+        .map(|(source, text)| {
+            let file: ManifestFile =
+                toml::from_str(text).unwrap_or_else(|error| panic!("{source}: {error}"));
+            file.action.len()
+        })
+        .sum()
+}
 
 /// 内置动作里 `mode = "native"` 的那些：`program` 写的是**界面名**（不是命令）。
 #[cfg(test)]
@@ -526,7 +531,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{BUNDLED_ACTION_COUNT, ManifestProvider, bundled_native_actions};
+    use super::{ManifestProvider, bundled_action_count, bundled_native_actions};
     use crate::{
         model::Domain,
         providers::{Discovery, Provider},
@@ -575,7 +580,7 @@ mod tests {
         let discovery = bundled_discovery();
         for id in bundled_native_actions() {
             let tool = by_id(&discovery, &id);
-            let action = tool.action.as_ref().expect("带动作");
+            assert!(tool.action.is_some(), "{id} 必须保留动作定义");
             assert!(
                 matches!(tool.mode, crate::model::RunMode::Native),
                 "{id} 该是 native 模式"
@@ -593,19 +598,20 @@ mod tests {
         );
         assert_eq!(
             discovery.tools.len(),
-            BUNDLED_ACTION_COUNT,
+            bundled_action_count(),
             "内置动作数量变了？"
         );
         assert!(discovery.tools.iter().all(|tool| tool.action.is_some()));
         assert!(discovery.tools.iter().all(|tool| !tool.summary.is_empty()));
 
-        // 覆盖面：图像 / 媒体 / 网络 / 开发 / 工具 都该有内置动作。
+        // 各域都应有内置动作，系统域不能只依赖用户自己的脚本。
         for domain in [
             Domain::Image,
             Domain::Media,
             Domain::Network,
             Domain::Dev,
             Domain::Tools,
+            Domain::System,
         ] {
             assert!(
                 discovery.tools.iter().any(|tool| tool.domain == domain),
@@ -651,7 +657,7 @@ mod tests {
     #[test]
     fn app_and_ui_tests_get_real_actions_from_here() {
         let tools = super::bundled_tools();
-        assert_eq!(tools.len(), BUNDLED_ACTION_COUNT);
+        assert_eq!(tools.len(), bundled_action_count());
         assert!(tools.iter().all(|tool| tool.action.is_some()));
     }
 
@@ -1170,7 +1176,7 @@ help = "随便"
 
         assert_eq!(
             discovery.tools.len(),
-            BUNDLED_ACTION_COUNT,
+            bundled_action_count(),
             "坏文件不该影响内置动作: {:#?}",
             discovery.warnings
         );
@@ -1193,7 +1199,7 @@ help = "随便"
             .expect("discover");
         assert_eq!(
             discovery.tools.len(),
-            BUNDLED_ACTION_COUNT,
+            bundled_action_count(),
             "内置动作照常加载"
         );
         assert!(discovery.warnings.is_empty(), "没建目录不是问题");
@@ -1208,7 +1214,7 @@ help = "随便"
         let discovery = ManifestProvider::new(vec![dir.clone()])
             .discover()
             .expect("discover");
-        assert_eq!(discovery.tools.len(), BUNDLED_ACTION_COUNT);
+        assert_eq!(discovery.tools.len(), bundled_action_count());
         assert!(discovery.warnings.is_empty());
 
         fs::remove_dir_all(&dir).expect("cleanup");

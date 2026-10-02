@@ -31,13 +31,14 @@
 
 use std::{
     collections::HashMap,
-    fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
 /// 只读文件头部这么多行解析元数据。
 pub const HEAD_LINES: usize = 40;
+const HEAD_BYTES: u64 = 16 * 1024;
 
 /// 元数据前缀固定为 `# <脚本名>:`。
 const META_PREFIX: &str = "# ";
@@ -66,10 +67,14 @@ pub fn split_list(raw: &str) -> Vec<String> {
 /// 读取脚本头部（最多 [`HEAD_LINES`] 行）。读不出来就当空字符串，
 /// 调用方会自然退化成「无注解」，不会把不可读文件当成工具。
 pub fn read_head(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_default()
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    BufReader::new(file)
+        .take(HEAD_BYTES)
         .lines()
         .take(HEAD_LINES)
+        .filter_map(Result::ok)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -199,8 +204,8 @@ pub fn clear_command_cache() {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_command_cache, command_exists, dependencies, is_internal, lookup_command, meta,
-        split_list,
+        HEAD_LINES, clear_command_cache, command_exists, dependencies, is_internal, lookup_command,
+        meta, read_head, split_list,
     };
 
     #[test]
@@ -211,6 +216,23 @@ mod tests {
         assert_eq!(meta(head, "fzf-a", "output"), None);
         // 前缀必须完全匹配：`fzf-a` 不该读到 `fzf-ab` 的注解。
         assert_eq!(meta("# fzf-ab:summary=x\n", "fzf-a", "summary"), None);
+    }
+
+    #[test]
+    fn read_head_stops_after_the_declared_header_lines() {
+        let path =
+            std::env::temp_dir().join(format!("toolbox-hub-metadata-head-{}", std::process::id()));
+        let contents = (0..(HEAD_LINES + 2))
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, contents).expect("write header fixture");
+
+        let head = read_head(&path);
+        assert_eq!(head.lines().count(), HEAD_LINES);
+        assert!(!head.contains("line-40"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

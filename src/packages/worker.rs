@@ -86,11 +86,11 @@ pub enum Response {
     /// 卸载影响（补在确认面板上的那几行）。
     Removal(Vec<String>),
     DownloadTotal(Option<u64>),
-    OrphanNames(Vec<String>),
+    OrphanNames(Result<Vec<String>, String>),
     /// 维护面板的一屏检查。
-    Health(Vec<HealthItem>),
+    Health(Result<Vec<HealthItem>, String>),
     /// 文件完整性检查的输出（已经整理成行）。
-    FileIntegrity(Vec<String>),
+    FileIntegrity(Result<Vec<String>, String>),
     News(Result<NewsChunk, String>),
 }
 
@@ -260,8 +260,8 @@ fn spawn_db(
                     DbRequest::DownloadTotal(names) => {
                         Response::DownloadTotal(db.download_total(&names))
                     }
-                    DbRequest::OrphanNames => Response::OrphanNames(db.orphan_names()),
-                    DbRequest::Health => Response::Health(health::scan(&db)),
+                    DbRequest::OrphanNames => Response::OrphanNames(Ok(db.orphan_names())),
+                    DbRequest::Health => Response::Health(Ok(health::scan(&db))),
                     DbRequest::FileIntegrity => Response::FileIntegrity(file_integrity_output()),
                 };
                 if tx.send(response).is_err() {
@@ -326,18 +326,17 @@ fn spawn_net(
 }
 
 /// `pacman -Qk` 的输出整理成行（几秒级，只在用户按了才跑）。
-fn file_integrity_output() -> Vec<String> {
-    match std::process::Command::new("pacman").args(["-Qk"]).output() {
-        Ok(output) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            health::parse_file_check(&text, 200)
-        }
-        Err(error) => vec![format!("pacman -Qk 跑不起来：{error}")],
-    }
+fn file_integrity_output() -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("pacman")
+        .args(["-Qk"])
+        .output()
+        .map_err(|error| format!("pacman -Qk 跑不起来：{error}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(health::parse_file_check(&text, 200))
 }
 
 /// 数据库打不开时，把错误翻译成「这次请求该回什么」。
@@ -359,9 +358,9 @@ fn failed_for(request: &DbRequest, error: &str) -> Response {
         },
         DbRequest::Removal(_) => Response::Removal(Vec::new()),
         DbRequest::DownloadTotal(_) => Response::DownloadTotal(None),
-        DbRequest::OrphanNames => Response::OrphanNames(Vec::new()),
-        DbRequest::Health => Response::Health(Vec::new()),
-        DbRequest::FileIntegrity => Response::FileIntegrity(Vec::new()),
+        DbRequest::OrphanNames => Response::OrphanNames(Err(error.to_string())),
+        DbRequest::Health => Response::Health(Err(error.to_string())),
+        DbRequest::FileIntegrity => Response::FileIntegrity(Err(error.to_string())),
     }
 }
 
@@ -394,6 +393,22 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "等 10 秒还没等到回答");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn database_failures_are_not_reported_as_clean_results() {
+        assert!(matches!(
+            failed_for(&DbRequest::OrphanNames, "database unavailable"),
+            Response::OrphanNames(Err(error)) if error == "database unavailable"
+        ));
+        assert!(matches!(
+            failed_for(&DbRequest::Health, "database unavailable"),
+            Response::Health(Err(error)) if error == "database unavailable"
+        ));
+        assert!(matches!(
+            failed_for(&DbRequest::FileIntegrity, "database unavailable"),
+            Response::FileIntegrity(Err(error)) if error == "database unavailable"
+        ));
     }
 
     fn describe(response: &Response) -> &'static str {

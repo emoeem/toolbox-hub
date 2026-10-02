@@ -20,6 +20,7 @@ use crate::{
 
 pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let current = app.current_domain();
+    let compact = area.width < 100;
 
     let titles: Vec<Line> = Domain::ALL
         .iter()
@@ -36,7 +37,9 @@ pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(theme::DIM)
             };
-            let label = if count == 0 {
+            let label = if compact {
+                domain.label().to_string()
+            } else if count == 0 {
                 format!(" {} ", domain.label())
             } else {
                 format!(" {} {} ", domain.label(), count)
@@ -48,7 +51,11 @@ pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_widget(
         Tabs::new(titles)
             .select(app.domain)
-            .divider(Span::styled("│", Style::default().fg(theme::FAINT)))
+            .divider(if compact {
+                Span::raw(" ")
+            } else {
+                Span::styled("│", Style::default().fg(theme::FAINT))
+            })
             .block(
                 Block::default()
                     .borders(Borders::BOTTOM)
@@ -59,6 +66,42 @@ pub fn draw_domains(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 pub fn draw_sub(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    if area.width < 100 && !app.sub_tags.is_empty() {
+        let selected = app.sub.min(app.sub_tags.len() - 1);
+        let start = selected.saturating_sub(1);
+        let end = selected.saturating_add(2).min(app.sub_tags.len());
+        let mut spans = Vec::new();
+        if start > 0 {
+            spans.push(Span::styled("… ", Style::default().fg(theme::FAINT)));
+        }
+        for index in start..end {
+            if index > start {
+                spans.push(Span::styled(" · ", Style::default().fg(theme::FAINT)));
+            }
+            let tag = &app.sub_tags[index];
+            let style = if index == selected {
+                Style::default()
+                    .fg(theme::tag_color(tag))
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(theme::DIM)
+            };
+            spans.push(Span::styled(format!(" {tag} "), style));
+        }
+        if end < app.sub_tags.len() {
+            spans.push(Span::styled(" …", Style::default().fg(theme::FAINT)));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme::FAINT)),
+            ),
+            area,
+        );
+        return;
+    }
+
     let titles: Vec<Line> = app
         .sub_tags
         .iter()
