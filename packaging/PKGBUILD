@@ -4,14 +4,14 @@
 # 不依赖任何还没发布的远端。等仓库推到公开地址之后，把 source 与 sha256sums
 # 换成 URL 那一套就能交 AUR（步骤见 packaging/README.md）。
 #
-# 维护者: 待填 <you@example.com>      # AUR 要求填真名与邮箱
+# 维护者: emoeem <3353745917@qq.com>
 
 pkgname=toolbox-hub
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管理（直连 libalpm）"
 arch=('x86_64' 'aarch64')
-url="https://github.com/你的用户名/toolbox-hub"   # TODO: 换了远端记得改这里
+url="https://github.com/emoeem/toolbox-hub"
 # TODO: 仓库里还没有 LICENSE 文件。定了许可证之后把这里改掉，
 # 并把 LICENSE 提交进去 —— AUR 要求许可证字段是真实有效的。
 license=('unknown')
@@ -20,6 +20,23 @@ license=('unknown')
 # 声明并安装。同理 gcc-libs 提供 libgcc_s。
 depends=('glibc' 'gcc-libs' 'pacman')
 makedepends=('cargo' 'rust' 'pkgconf')
+optdepends=(
+  'paru: 搜索与安装 AUR 包'
+  'pacman-contrib: 清理缓存与检查更新'
+  'yazi: 浏览文件并选择输入路径'
+  'ffmpeg: 媒体转换与媒体工具动作'
+  'yt-dlp: 视频下载动作'
+  'imagemagick: 图像处理动作'
+  'perl-image-exiftool: 查看与编辑媒体元数据'
+  '7zip: 归档创建、解压与完整性测试'
+  'jq: JSON 查询动作'
+  'pandoc: 文档转换动作'
+  'aria2: 多连接下载动作'
+  'pciutils: 查看 PCI 设备与驱动'
+  'sing-box: 本机代理运维动作'
+  'wl-clipboard: Wayland 剪贴板复制'
+  'xclip: X11 剪贴板复制'
+)
 # options：不生成 debug 包（Rust 的调试符号很大，对使用者没用）。
 options=('!debug')
 # 本地打包：tarball 由 make-source-tarball.sh 生成在旁边，所以校验和写 SKIP。
