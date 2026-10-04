@@ -35,8 +35,10 @@ jobs:
 
       - name: 装工具链
         run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa
-        # chafa 是 ratatui-image 的硬依赖：它的 build.rs 用 pkg-config 探测 chafa >= 1.8.0，
-        # 缺了直接构建失败（和 ci.yml 同一组依赖）。
+        # chafa：ratatui-image 的**可选**图像后端。当前 feature 只用 crossterm
+        # （chafa 的探测在 chafa-dyn / chafa-static 里被 cfg 掉，实测 ldd 里没有
+        # libchafa），所以构建其实不需要它；这里仍装上是为了和 packaging/PKGBUILD
+        # 声明的运行时依赖保持一致，也免得将来打开 chafa 后端时 CI 才炸。
 
       - name: 缓存 cargo
         uses: actions/cache@v4
