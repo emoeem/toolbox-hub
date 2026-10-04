@@ -113,6 +113,24 @@ pub struct Service {
     agent: ureq::Agent,
 }
 
+/// 仓库 id 不认识时的那句话（带上「你是不是想找 X」）。
+///
+/// 单独一个函数是因为有三个地方要报同一件事：刷新 / 删除 / 启用停用。
+/// 打错字是命令行里最常见的错误，每次都要给同一个像样的答复。
+pub(crate) fn unknown_repository(id: &str, repositories: &Repositories) -> String {
+    let hint = crate::repository::suggest::did_you_mean(
+        id,
+        repositories
+            .repositories
+            .iter()
+            .map(|repo| repo.id.as_str()),
+    );
+    match hint {
+        Some(hint) => format!("没有叫「{id}」的仓库 —— {hint}\n（toolbox-hub repo list 看全部）"),
+        None => format!("没有叫「{id}」的仓库（toolbox-hub repo list）"),
+    }
+}
+
 impl Service {
     /// 用当前的配置目录/数据目录/缓存目录装配服务。**不联网**。
     pub fn from_config() -> Self {
@@ -188,11 +206,10 @@ impl Service {
 
     /// 刷新一个仓库（阻塞，会联网或读本地索引）。
     pub fn refresh(&self, id: &str) -> Result<FetchResult, String> {
-        let config = self
-            .repositories
-            .find(id)
-            .ok_or_else(|| format!("没有叫「{id}」的仓库（toolbox-hub repo list）"))?
-            .clone();
+        let Some(found) = self.repositories.find(id) else {
+            return Err(unknown_repository(id, &self.repositories));
+        };
+        let config = found.clone();
         Ok(cache::fetch(&config, &self.cache_root, &self.agent))
     }
 
@@ -301,9 +318,21 @@ impl Service {
 
     /// 为一个包造安装计划。
     pub fn plan(&self, id: &str) -> Result<InstallPlan, String> {
-        let (config, meta, _) = self
-            .find(id)
-            .ok_or_else(|| format!("在已启用的仓库里找不到「{id}」（先 repo update）"))?;
+        let Some((config, meta, _)) = self.find(id) else {
+            let hint = crate::repository::suggest::did_you_mean(
+                id,
+                self.indexes()
+                    .iter()
+                    .flat_map(|(_, index, _)| index.packages.iter())
+                    .map(|package| package.id.as_str()),
+            );
+            return Err(match hint {
+                Some(hint) => {
+                    format!("在已启用的仓库里找不到「{id}」—— {hint}（没取过索引先 repo update）")
+                }
+                None => format!("在已启用的仓库里找不到「{id}」（先 repo update）"),
+            });
+        };
         install::plan(&meta, &config, &self.roots)
     }
 

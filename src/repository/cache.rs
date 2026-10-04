@@ -420,6 +420,16 @@ fn http_get(
             }
         }
         Err(ureq::Error::StatusCode(304)) => HttpOutcome::NotModified,
+        // 404 是**建仓库时最常见的一种**：地址写错、忘了推、或者仓库还是私有的。
+        // 一句「http status: 404」帮不上忙，所以这里替用户把可能的原因列出来。
+        Err(ureq::Error::StatusCode(404)) => HttpOutcome::Failed(format!(
+            "404：{} 上没有这个文件。常见原因：\n               · 仓库还没 push 上去（先 git push，再等几秒）；\n               · 地址写错了（分支名要写 main/master 里的哪一个？路径对不对？）；\n               · 仓库是私有的（raw 链接读不到私有仓库）。\n               本地仓库可以直接用路径：toolbox-hub repo add ./registry/index.json",
+            config.index
+        )),
+        Err(ureq::Error::StatusCode(403)) => HttpOutcome::Failed(format!(
+            "403：读不了 {} —— 多半是私有仓库，或者被服务端限流了",
+            config.index
+        )),
         Err(error) => HttpOutcome::Failed(format!("请求失败：{error}")),
     }
 }

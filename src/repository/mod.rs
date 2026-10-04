@@ -25,6 +25,7 @@ pub mod install;
 pub mod installed;
 pub mod paths;
 pub mod service;
+pub mod suggest;
 pub mod version;
 pub mod worker;
 

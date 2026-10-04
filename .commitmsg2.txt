@@ -1,0 +1,12 @@
+fix(仓库): 名字打错时给建议 + 404 说清楚原因
+
+实测报障：`repo update officia` 只说「没有叫「officia」的仓库」，不说
+「你是不是想找 official」；`repo update official` 拿到 404 也只有一个
+http status 码，看不出是「还没推上去」还是「地址写错了」。
+
+- 新增 src/repository/suggest.rs：编辑距离 + 前缀/包含的「你是不是想找 X」。
+  阈值卡得紧 —— 只在足够近时才建议，乱猜比不说更烦人（单字母不再靠子串命中）。
+- 接进四处：未知仓库 id（refresh / remove / enable / disable）、未知包名
+  （install / info）、未知安装记录（uninstall）、未知工具名（run / info）。
+- 404 与 403 各给一段人话：404 列出「没 push / 地址写错 / 私有仓库」三种常见
+  原因并给出本地仓库的替代写法；403 提示私有或限流。

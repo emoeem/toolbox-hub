@@ -1003,8 +1003,17 @@ pub fn uninstall(
     id: &str,
     purge_modified: bool,
 ) -> Result<UninstallReport, String> {
-    let package = installed::load(data_dir, id)
-        .ok_or_else(|| format!("没有「{id}」的安装记录（toolbox-hub list 看看装了什么）"))?;
+    let Some(package) = installed::load(data_dir, id) else {
+        let (installed_packages, _) = installed::load_all(data_dir);
+        let hint = crate::repository::suggest::did_you_mean(
+            id,
+            installed_packages.iter().map(|package| package.id.as_str()),
+        );
+        return Err(match hint {
+            Some(hint) => format!("没有「{id}」的安装记录 —— {hint}"),
+            None => format!("没有「{id}」的安装记录（toolbox-hub list 看看装了什么）"),
+        });
+    };
 
     let mut removed = Vec::new();
     let mut kept = Vec::new();

@@ -656,7 +656,10 @@ fn run_repo(command: &RepoCommand, service: &Service, dry_run: bool) -> Result<(
         RepoCommand::Remove(id) => {
             let mut repositories = service.repositories.clone();
             if !repositories.remove(id) {
-                return Err(format!("没有叫「{id}」的仓库（toolbox-hub repo list）"));
+                return Err(crate::repository::service::unknown_repository(
+                    id,
+                    &repositories,
+                ));
             }
             save_or_preview(
                 &repositories,
@@ -669,7 +672,10 @@ fn run_repo(command: &RepoCommand, service: &Service, dry_run: bool) -> Result<(
             let enabled = matches!(command, RepoCommand::Enable(_));
             let mut repositories = service.repositories.clone();
             if !repositories.set_enabled(id, enabled) {
-                return Err(format!("没有叫「{id}」的仓库（toolbox-hub repo list）"));
+                return Err(crate::repository::service::unknown_repository(
+                    id,
+                    &repositories,
+                ));
             }
             let what = if enabled { "启用" } else { "停用" };
             save_or_preview(
@@ -1049,7 +1055,10 @@ fn package_actions<'a>(registry: &'a Registry, package: &str) -> Vec<&'a ToolDef
         .collect()
 }
 
-/// 找不到时给一句有用的：如果那是个包名，就把里面的动作列出来让用户挑。
+/// 找不到时给一句有用的。
+///
+/// 分三种情况：① 那是个包名，就把里面的动作列出来让用户挑；② 名字打错了，
+/// 给「你是不是想找 X」；③ 真的没有，让他去搜。
 fn tool_not_found(registry: &Registry, id: &str) -> String {
     let actions = package_actions(registry, id);
     if actions.len() > 1 {
@@ -1063,7 +1072,17 @@ fn tool_not_found(registry: &Registry, id: &str) -> String {
             lines.join("\n")
         );
     }
-    format!("找不到工具「{id}」（toolbox-hub search 找找）")
+
+    // 候选：工具名、动作 id 的尾段，以及标签（仓库装来的包会把包 id 放标签里）。
+    let names = registry.tools().iter().flat_map(|tool| {
+        std::iter::once(tool.name.as_str())
+            .chain(tool.id.rsplit(':').next())
+            .chain(tool.tags.iter().map(String::as_str))
+    });
+    match crate::repository::suggest::did_you_mean(id, names) {
+        Some(hint) => format!("找不到工具「{id}」—— {hint}"),
+        None => format!("找不到工具「{id}」（toolbox-hub search 找找）"),
+    }
 }
 
 fn tool_info(id: &str, service: &Service, bin_dir: &Path) -> Result<(), String> {
