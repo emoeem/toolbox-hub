@@ -416,6 +416,14 @@ pacman/AUR 那套**没有任何关系**，卸掉一个工具包只会删掉几�
 TUI 里不用记这个开关：发现面板按 Enter 摆出计划，第二次 Enter 才算确认。
 标 `safe` 的包不受影响，一次确认就装。
 
+还有一种情况会多问一次：**你装完之后自己改过那个文件**。卸载时这类文件是保留的
+（「你改过的文件不会被删」），所以升级也不能悄悄覆盖 —— 它会先列出你会被覆盖的文件：
+
+    toolbox-hub update                  # ✕ 列出你改过的文件，让你确认
+    toolbox-hub update --allow-modified # ✓ 你明确接受覆盖
+
+想留住自己的改动：先把那几行抄到别处，或者用 `--allow-modified` 之后重新贴回去。
+
 装完就能用：`toolbox-hub run disk-report-dirs --path ~/Downloads --depth 2`，
 或者在 TUI 里找它（数字键 9 进「发现」域，或它自己声明的域）。
 

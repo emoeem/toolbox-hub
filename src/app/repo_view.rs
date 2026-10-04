@@ -98,6 +98,12 @@ impl Confirm {
                 self.plan.danger.label()
             ));
         }
+        if self.plan.needs_modified_ack() {
+            reasons.push(format!(
+                "有 {} 个文件你装完之后改过，这次会覆盖它们",
+                self.plan.modified_files().len()
+            ));
+        }
         if reasons.is_empty() {
             reasons.push(String::from("请再确认一次"));
         }
@@ -361,10 +367,17 @@ impl RepositoryView {
     /// 安装与升级都走它 —— 升级同样是下载并执行别人新写的代码。
     fn offer(&mut self, plan: InstallPlan, upgrading: bool) {
         let caution = plan.needs_caution_ack();
+        // 你改过的文件也会被覆盖 —— 卸载那边是保留的，这里不能装作没看见。
+        let modified = plan.needs_modified_ack();
         // 先按「不额外开绿灯」检查一遍；只有「来源没给哈希」这一条能被放宽。
         match plan.check(&self.service.roots, false) {
             Ok(()) => {
-                if caution {
+                if modified {
+                    self.message = format!(
+                        "有 {} 个文件你装完之后改过，这次会覆盖它们 —— 再按一次 Enter 表示你接受",
+                        plan.modified_files().len()
+                    );
+                } else if caution {
                     self.message = String::from(
                         "这个包自标为「注意」：它的动作会改动系统 —— 再按一次 Enter 表示你知道",
                     );
@@ -372,7 +385,7 @@ impl RepositoryView {
                 self.confirm = Some(Box::new(Confirm {
                     plan,
                     allow_unverified: false,
-                    acknowledged: !caution,
+                    acknowledged: !(caution || modified),
                     upgrading,
                 }));
             }

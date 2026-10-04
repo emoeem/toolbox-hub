@@ -115,6 +115,8 @@ pub enum ToolCommand {
         allow_unverified: bool,
         /// 包自标为「注意」时需要它（它的动作会改动系统）。
         allow_caution: bool,
+        /// 覆盖「你装完之后改过」的文件时需要它。
+        allow_modified: bool,
     },
     Uninstall {
         names: Vec<String>,
@@ -128,6 +130,8 @@ pub enum ToolCommand {
         check: bool,
         /// 升级自标为「注意」的包时需要它。
         allow_caution: bool,
+        /// 覆盖你改过的文件时需要它。
+        allow_modified: bool,
     },
     List,
     Run {
@@ -148,7 +152,10 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
         }
         "info" => Ok(Command::Tool(ToolCommand::Info(one_name(rest, "info")?))),
         "install" => {
-            let (names, flags) = split_names(rest, &["--allow-unverified", "--allow-caution"])?;
+            let (names, flags) = split_names(
+                rest,
+                &["--allow-unverified", "--allow-caution", "--allow-modified"],
+            )?;
             if names.is_empty() {
                 return Err(String::from("install 后面要跟至少一个包名"));
             }
@@ -156,6 +163,7 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
                 names,
                 allow_unverified: is_flagged(&flags, "--allow-unverified"),
                 allow_caution: is_flagged(&flags, "--allow-caution"),
+                allow_modified: is_flagged(&flags, "--allow-modified"),
             }))
         }
         "uninstall" => {
@@ -171,11 +179,13 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
         "update" => {
             let mut allow_unverified = false;
             let mut allow_caution = false;
+            let mut allow_modified = false;
             let mut check = false;
             for arg in rest {
                 match arg.as_str() {
                     "--allow-unverified" => allow_unverified = true,
                     "--allow-caution" => allow_caution = true,
+                    "--allow-modified" => allow_modified = true,
                     "--check" => check = true,
                     other => return Err(format!("update 不认识的选项：{other}")),
                 }
@@ -184,6 +194,7 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
                 allow_unverified,
                 check,
                 allow_caution,
+                allow_modified,
             }))
         }
         "list" => {
@@ -898,9 +909,17 @@ fn run_tool(
             names,
             allow_unverified,
             allow_caution,
+            allow_modified,
         } => {
             for name in names {
-                tool_install(name, service, *allow_unverified, *allow_caution, dry_run)?;
+                tool_install(
+                    name,
+                    service,
+                    *allow_unverified,
+                    *allow_caution,
+                    *allow_modified,
+                    dry_run,
+                )?;
             }
             Ok(())
         }
@@ -928,7 +947,15 @@ fn run_tool(
             allow_unverified,
             check,
             allow_caution,
-        } => tool_update(service, *allow_unverified, *check, *allow_caution, dry_run),
+            allow_modified,
+        } => tool_update(
+            service,
+            *allow_unverified,
+            *check,
+            *allow_caution,
+            *allow_modified,
+            dry_run,
+        ),
         ToolCommand::Run { id, values } => tool_run(id, values, bin_dir, dry_run),
     }
 }
@@ -1251,6 +1278,7 @@ fn tool_install(
     service: &Service,
     allow_unverified: bool,
     allow_caution: bool,
+    allow_modified: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     let plan = service.plan(id)?;
@@ -1268,6 +1296,12 @@ fn tool_install(
             "「{}」被作者标为「注意」：它的动作会改动系统。确认要装的话加 --allow-caution（TUI 里会让你再确认一次）",
             plan.id
         ));
+    }
+
+    // 你装完之后改过的文件：装/升级会覆盖它们。卸载那边是**保留**的，
+    // 这里不能静默覆盖 —— 那是会丢改动的事。
+    if plan.needs_modified_ack() && !allow_modified {
+        return Err(modified_message(&plan));
     }
     if dry_run {
         println!("\n（演练，没有安装）");
@@ -1293,11 +1327,37 @@ fn tool_install(
 /// 有更新可用时的退出码（和 checkupdates 一路：0 = 无事可做，10 = 有更新）。
 pub const UPDATE_AVAILABLE_CODE: i32 = 10;
 
+/// 有「你改过的文件」时那句拦下来的话。
+fn modified_message(plan: &InstallPlan) -> String {
+    let mut lines = vec![format!(
+        "「{}」里有 {} 个你装完之后改过的文件，装下去会覆盖它们：",
+        plan.id,
+        plan.modified_files().len()
+    )];
+    for file in plan.modified_files().iter().take(8) {
+        lines.push(format!("  {}", file.target.display()));
+    }
+    if plan.modified_files().len() > 8 {
+        lines.push(format!(
+            "  …（还有 {} 个）",
+            plan.modified_files().len() - 8
+        ));
+    }
+    lines.push(String::from(
+        "确认要覆盖就加 --allow-modified；或者先把你的改动备份走（TUI 里会让你再确认一次）",
+    ));
+    lines.join(
+        "
+",
+    )
+}
+
 fn tool_update(
     service: &Service,
     allow_unverified: bool,
     check: bool,
     allow_caution: bool,
+    allow_modified: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     let (candidates, warnings) = service.update_candidates();
@@ -1325,6 +1385,13 @@ fn tool_update(
                 cautious.join("、")
             ));
         }
+    }
+    if !allow_modified
+        && let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.plan.needs_modified_ack())
+    {
+        return Err(modified_message(&candidate.plan));
     }
 
     println!("{} 个包可升级：\n", candidates.len());
@@ -1628,7 +1695,8 @@ mod tests {
             Ok(Command::Tool(ToolCommand::Install {
                 names: args(&["a", "b"]),
                 allow_unverified: false,
-                allow_caution: false
+                allow_caution: false,
+                allow_modified: false
             }))
         );
         assert_eq!(
@@ -1636,7 +1704,8 @@ mod tests {
             Ok(Command::Tool(ToolCommand::Install {
                 names: args(&["a"]),
                 allow_unverified: true,
-                allow_caution: false
+                allow_caution: false,
+                allow_modified: false
             }))
         );
         assert!(parse("install", &[]).unwrap_err().contains("包名"));
@@ -1701,7 +1770,8 @@ mod tests {
             Ok(Command::Tool(ToolCommand::Update {
                 allow_unverified: false,
                 check: false,
-                allow_caution: false
+                allow_caution: false,
+                allow_modified: false
             }))
         );
         assert!(parse("update", &args(&["--nope"])).is_err());

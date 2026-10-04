@@ -160,6 +160,11 @@ pub struct PlannedFile {
     pub sha256: Option<String>,
     /// 目标已存在时的问题说明（None = 没问题）。
     pub conflict: Option<String>,
+    /// 这个文件是**你装完之后改过**的（None = 没动过）。
+    ///
+    /// 它不是 conflict：文件确实是你的、也确实是这个包装的，装得下去。
+    /// 但装下去会**覆盖你的改动**，所以要单独拿出来给用户看一眼。
+    pub modified: Option<String>,
 }
 
 /// 一次安装的完整计划。**在执行之前**就把该给用户看的都摆出来。
@@ -214,6 +219,19 @@ impl InstallPlan {
     #[allow(dead_code)] // 计划面板用
     pub fn has_conflicts(&self) -> bool {
         !self.conflicts().is_empty()
+    }
+
+    /// 你改过、而且这次会被覆盖的文件。
+    pub fn modified_files(&self) -> Vec<&PlannedFile> {
+        self.files
+            .iter()
+            .filter(|file| file.modified.is_some())
+            .collect()
+    }
+
+    /// 有「你改过的文件」时，安装/升级前要你再确认一次。
+    pub fn needs_modified_ack(&self) -> bool {
+        self.files.iter().any(|file| file.modified.is_some())
     }
 
     /// 这个包自标为「会改动系统」，安装前要用户再确认一次。
@@ -293,12 +311,14 @@ pub fn plan(
         let kind = entry.kind();
         let target = target_for(roots, &id, &relative, kind)?;
         let conflict = conflict_for(roots, &id, &target, entry.sha256().as_deref())?;
+        let modified = modified_reason(roots, &id, &target)?;
         files.push(PlannedFile {
             source: relative.to_string_lossy().to_string(),
             target,
             kind,
             sha256: entry.sha256(),
             conflict,
+            modified,
         });
     }
 
@@ -447,6 +467,31 @@ fn target_for(roots: &Roots, id: &str, relative: &Path, kind: FileKind) -> Resul
             paths::resolve_under(&base, relative)
         }
     }
+}
+
+/// 这个文件是不是**你装完之后改过**的。
+///
+/// 账本里记着每个文件装好那一刻的 SHA-256（[`InstalledFile::sha256`]），和磁盘上现在
+/// 的对不上就说明你动过它。只有「本来就是自己装的」才谈得上改过 —— 别人的文件那是
+/// conflict 的事，归 conflict_for 管。
+///
+/// 为什么要单独判：卸载时这类文件是**保留**的（界面上写着「你改过的文件不会被删」），
+/// 而升级原来会**静默覆盖**它们 —— 同一件事两种待遇，用户会丢改动。
+fn modified_reason(roots: &Roots, id: &str, target: &Path) -> Result<Option<String>, String> {
+    let Some((owner, recorded)) = installed::owner_of(&roots.data, target) else {
+        return Ok(None);
+    };
+    if owner != id {
+        return Ok(None);
+    }
+    let current = sha256_file(target)?;
+    if current == recorded {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{} 你装完之后改过（现在的哈希和安装时不同）",
+        target.display()
+    )))
 }
 
 /// 目标已经存在时算什么。
@@ -1853,5 +1898,138 @@ mod tests {
         install(&plan, &roots, &agent(), false).expect("install");
         assert!(!roots.data.join(".staging").exists(), "暂存目录要清干净");
         fs::remove_dir_all(&base).expect("cleanup");
+    }
+}
+
+/// 「你改过的文件」这条门。
+///
+/// 起因是一次实测：消费者给装下来的脚本加了一行，作者升版本之后 `update` 把它
+/// **静默覆盖**了 —— 而卸载那边明明写着「你改过的文件不会被删」。同一件事两种
+/// 待遇，会让人丢改动。
+#[cfg(test)]
+mod modified_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::repository::{
+        cache,
+        config::{Repositories, RepositoryConfig},
+        installed::{self, SCHEMA_VERSION},
+        service::Service,
+    };
+
+    fn temp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("toolbox-hub-modified-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn hex(text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    const INDEX: &str = r#"{"schema_version": 1, "packages": [
+        {"id": "demo", "name": "Demo", "version": "2.0.0", "summary": "升到 2.0.0",
+         "files": [{"path": "scripts/demo", "kind": "bin"}]}
+    ]}"#;
+
+    /// 造一个「1.0.0 已装、磁盘上的内容由调用方决定」的环境。
+    fn service(base: &Path, on_disk: &str) -> Service {
+        let root = base.join("cache");
+        let meta = cache::IndexMeta {
+            fetched_at: Some(cache::now_secs()),
+            ..cache::IndexMeta::default()
+        };
+        cache::store(&root, "official", INDEX, &meta).expect("store");
+
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir bin");
+        let target = bin.join("demo");
+        std::fs::write(&target, on_disk).expect("write target");
+
+        let repositories = Repositories {
+            repositories: vec![RepositoryConfig {
+                id: String::from("official"),
+                name: String::from("ToolHub Official"),
+                index: base.join("index.json").display().to_string(),
+                enabled: true,
+                priority: 0,
+                trust: Some(String::from("trusted")),
+                note: None,
+            }],
+        };
+        let roots = Roots {
+            bin,
+            data: base.join("data"),
+            config: base.join("config"),
+        };
+        // 账本记的是**安装那一刻**的哈希：原始内容。
+        installed::save(
+            &roots.data,
+            &installed::InstalledPackage {
+                schema_version: SCHEMA_VERSION,
+                id: String::from("demo"),
+                name: String::from("Demo"),
+                version: String::from("1.0.0"),
+                repository: String::from("official"),
+                repository_name: String::from("ToolHub Official"),
+                trust: String::from("trusted"),
+                installed_at: 0,
+                source: None,
+                license: None,
+                requires_root: false,
+                danger: String::from("safe"),
+                artifact_sha256: None,
+                dependencies: Vec::new(),
+                files: vec![installed::InstalledFile {
+                    path: target,
+                    sha256: hex("原始内容"),
+                    kind: String::from("bin"),
+                    source: String::from("scripts/demo"),
+                }],
+                allow_unverified: false,
+            },
+        )
+        .expect("save ledger");
+        Service::with_parts(repositories, roots, base.join("cache"))
+    }
+
+    #[test]
+    fn a_file_you_edited_is_flagged_before_an_upgrade() {
+        let base = temp("edited");
+        let service = service(&base, "原始内容\n我自己加的一行\n");
+
+        let plan = service.plan("demo").expect("计划");
+        assert!(plan.needs_modified_ack(), "改过的文件必须在装之前被指出来");
+        assert_eq!(plan.modified_files().len(), 1);
+        assert!(
+            plan.modified_files()[0]
+                .modified
+                .as_deref()
+                .unwrap_or_default()
+                .contains("改过"),
+            "{:?}",
+            plan.modified_files()[0].modified
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 没动过的文件不该多要一次确认 —— 否则日常升级每次都要多按一下。
+    #[test]
+    fn an_untouched_file_is_not_flagged() {
+        let base = temp("untouched");
+        let service = service(&base, "原始内容");
+
+        let plan = service.plan("demo").expect("计划");
+        assert!(!plan.needs_modified_ack());
+        assert!(plan.modified_files().is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
