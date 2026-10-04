@@ -82,6 +82,29 @@ pub struct Confirm {
     pub upgrading: bool,
 }
 
+impl Confirm {
+    /// 还没确认时，面板上那句「再按一次」的理由；已确认就是 °None°。
+    pub fn pending_reason(&self) -> Option<String> {
+        if self.acknowledged {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        if self.allow_unverified {
+            reasons.push(String::from("来源没有提供 SHA-256，内容没法核对"));
+        }
+        if self.plan.needs_caution_ack() {
+            reasons.push(format!(
+                "这个包自标为「{}」，它的动作会改动系统",
+                self.plan.danger.label()
+            ));
+        }
+        if reasons.is_empty() {
+            reasons.push(String::from("请再确认一次"));
+        }
+        Some(reasons.join("；"))
+    }
+}
+
 /// 加仓库时的输入态。
 #[derive(Clone, Debug)]
 pub struct AddInput {
@@ -326,14 +349,30 @@ impl RepositoryView {
             }
         };
 
-        // 先按「不额外开绿灯」检查一遍；只有「来源没给哈希」这一条能被放宽，
-        // 而且要用户再确认一次。
+        self.offer(plan, upgrading);
+    }
+
+    /// 把一个安装计划摆成确认面板。
+    ///
+    /// 两种「要多按一次」的情况都在这里收口：
+    ///   * 来源没给哈希（内容没法核对）；
+    ///   * 包自标为「注意」（它的动作会改动系统）。
+    ///
+    /// 安装与升级都走它 —— 升级同样是下载并执行别人新写的代码。
+    fn offer(&mut self, plan: InstallPlan, upgrading: bool) {
+        let caution = plan.needs_caution_ack();
+        // 先按「不额外开绿灯」检查一遍；只有「来源没给哈希」这一条能被放宽。
         match plan.check(&self.service.roots, false) {
             Ok(()) => {
+                if caution {
+                    self.message = String::from(
+                        "这个包自标为「注意」：它的动作会改动系统 —— 再按一次 Enter 表示你知道",
+                    );
+                }
                 self.confirm = Some(Box::new(Confirm {
                     plan,
                     allow_unverified: false,
-                    acknowledged: true,
+                    acknowledged: !caution,
                     upgrading,
                 }));
             }
@@ -360,13 +399,31 @@ impl RepositoryView {
         };
         if !confirm.acknowledged {
             confirm.acknowledged = true;
-            self.message = String::from("已经知道没有哈希可核对 —— 再按一次 Enter 才真的装");
+            let what = if confirm.upgrading { "升级" } else { "装" };
+            let reason = confirm
+                .pending_reason()
+                .unwrap_or_else(|| String::from("确认过了"));
+            self.message = format!("{reason} —— 再按一次 Enter 才真的{what}");
             return;
         }
         let plan = confirm.plan.clone();
         let allow_unverified = confirm.allow_unverified;
-        match self.worker.install(plan, allow_unverified) {
-            Ok(()) => self.busy = Some(String::from("正在安装…")),
+        let upgrading = confirm.upgrading;
+        // 升级不用面板上那份计划：摆出来之后索引可能已经刷新过，按 id 重算一遍
+        // 再装才是「升到最新」。worker 的 Upgrade 分支就是干这个的。
+        let outcome = if upgrading {
+            self.worker.upgrade(plan.id.clone(), allow_unverified)
+        } else {
+            self.worker.install(plan, allow_unverified)
+        };
+        match outcome {
+            Ok(()) => {
+                self.busy = Some(String::from(if upgrading {
+                    "正在升级…"
+                } else {
+                    "正在安装…"
+                }));
+            }
             Err(problem) => {
                 self.message = problem;
                 self.confirm = None;
@@ -405,8 +462,9 @@ impl RepositoryView {
             self.message = String::from("这一项没有可升级的版本");
             return;
         };
-        match self.worker.upgrade(id.clone(), false) {
-            Ok(()) => self.busy = Some(format!("正在升级 {id}…")),
+        // 升级同样是下载并执行别人新写的代码，所以走和安装同一条确认路径。
+        match self.service.plan(&id) {
+            Ok(plan) => self.offer(plan, true),
             Err(problem) => self.message = problem,
         }
     }
@@ -1013,6 +1071,163 @@ mod tests {
         let view = RepositoryView::open(service).expect("open");
         assert!(!view.has_usable_index());
         assert!(view.hits.is_empty());
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+}
+
+/// 自标为「注意」的包：安装/升级确认要多按一次。
+///
+/// 单独一个模块是为了自带夹具 —— 主测试模块里的 helper 是给「普通包」用的，
+/// 这里要的是一个 danger = "caution" 的索引。
+#[cfg(test)]
+mod caution_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use crate::repository::{
+        cache,
+        config::{Repositories, RepositoryConfig},
+        install::Roots,
+        service::Service,
+    };
+
+    fn temp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("toolbox-hub-caution-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// 一个自标为「注意」的包（外加一个普通包作对照）。
+    fn service(base: &std::path::Path) -> Service {
+        let index = r#"{"schema_version": 1, "packages": [
+            {"id": "risky-tools", "name": "会改系统的工具", "version": "1.0.0",
+             "summary": "删缓存", "danger": "caution",
+             "artifact": {"url": "artifacts/r.tar.gz",
+                          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+             "files": [{"path": "scripts/risky", "kind": "bin"}]},
+            {"id": "safe-tool", "name": "安全工具", "version": "1.0.0", "summary": "只读",
+             "artifact": {"url": "artifacts/s.tar.gz",
+                          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+             "files": [{"path": "scripts/safe", "kind": "bin"}]}
+        ]}"#;
+        let meta = cache::IndexMeta {
+            fetched_at: Some(cache::now_secs()),
+            ..cache::IndexMeta::default()
+        };
+        cache::store(&base.join("cache"), "official", index, &meta).expect("store");
+        let repositories = Repositories {
+            repositories: vec![RepositoryConfig {
+                id: String::from("official"),
+                name: String::from("ToolHub Official"),
+                index: base.join("index.json").display().to_string(),
+                enabled: true,
+                priority: 0,
+                trust: Some(String::from("trusted")),
+                note: None,
+            }],
+        };
+        let roots = Roots {
+            bin: base.join("bin"),
+            data: base.join("data"),
+            config: base.join("config"),
+        };
+        Service::with_parts(repositories, roots, base.join("cache"))
+    }
+
+    fn pick(view: &mut RepositoryView, id: &str) {
+        let index = view
+            .hits
+            .iter()
+            .position(|hit| hit.id == id)
+            .expect("索引里有这个包");
+        view.selected = index;
+    }
+
+    #[test]
+    fn a_caution_package_needs_a_second_enter() {
+        let base = temp("second");
+        let mut view = RepositoryView::open(service(&base)).expect("open");
+
+        pick(&mut view, "risky-tools");
+        view.ask_install();
+        let confirm = view.confirm.as_ref().expect("应当出现确认面板");
+        assert!(confirm.plan.needs_caution_ack(), "caution 包要认出来");
+        assert!(!confirm.acknowledged, "第一次 Enter 还不算确认");
+        let reason = confirm.pending_reason().expect("要给理由");
+        assert!(reason.contains("会改动系统"), "{reason}");
+        assert!(reason.contains("注意"), "{reason}");
+
+        view.confirm_accept();
+        assert!(view.confirm.is_some(), "第一步之后面板还在");
+        assert!(view.confirm.as_ref().expect("还在").acknowledged);
+        assert!(view.busy.is_none(), "确认之前不许开始装");
+        assert!(
+            view.confirm
+                .as_ref()
+                .expect("还在")
+                .pending_reason()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    /// 普通的 safe 包不该多要一次 —— 否则「多按一次」会变成噪音，谁也不看。
+    #[test]
+    fn a_safe_package_is_confirmed_once() {
+        let base = temp("safe");
+        let mut view = RepositoryView::open(service(&base)).expect("open");
+        pick(&mut view, "safe-tool");
+        view.ask_install();
+        let confirm = view.confirm.as_ref().expect("应当出现确认面板");
+        assert!(!confirm.plan.needs_caution_ack());
+        assert!(confirm.acknowledged, "safe 包一次确认就够");
+        assert!(confirm.pending_reason().is_none());
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    /// 升级走同一条确认路径 —— 升级同样是下载并执行别人新写的代码。
+    #[test]
+    fn upgrading_a_caution_package_also_asks_twice() {
+        use crate::repository::installed::{self, SCHEMA_VERSION};
+
+        let base = temp("upgrade");
+        // 先让它「已安装」—— 没装过就谈不上升级（那条路径会提前返回）。
+        let package = installed::InstalledPackage {
+            schema_version: SCHEMA_VERSION,
+            id: String::from("risky-tools"),
+            name: String::from("会改系统的工具"),
+            version: String::from("0.9.0"),
+            repository: String::from("official"),
+            repository_name: String::from("ToolHub Official"),
+            trust: String::from("trusted"),
+            installed_at: 0,
+            source: None,
+            license: None,
+            requires_root: false,
+            danger: String::from("caution"),
+            artifact_sha256: None,
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            allow_unverified: false,
+        };
+        installed::save(&base.join("data"), &package).expect("save");
+
+        let mut view = RepositoryView::open(service(&base)).expect("open");
+        pick(&mut view, "risky-tools");
+        view.upgrade_selected();
+
+        // 升级照样要过确认面板，而不是直接开跑。
+        let confirm = view.confirm.as_ref().expect("应当摆出确认面板");
+        assert!(!confirm.acknowledged, "第一次 Enter 还不算确认");
+        assert!(view.busy.is_none(), "确认之前不许开始升级");
+        assert!(confirm.upgrading, "走的是升级语义");
+
+        view.confirm_accept();
+        assert!(view.confirm.as_ref().expect("还在").acknowledged);
         std::fs::remove_dir_all(&base).expect("cleanup");
     }
 }

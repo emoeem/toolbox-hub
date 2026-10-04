@@ -508,12 +508,14 @@ Toolbox Hub —— Linux CLI 工具箱（TUI + 命令行两用）
       --scope <范围>         all / available / installed / upgradable
   info <名字>                看详情（仓库里的包会给完整安装计划；本地工具给参数表）
   install <包...>            安装（会先打印来源 / 依赖 / 文件 / 哈希再动手）
+      --allow-caution        允许装自标为「注意」的包（它的动作会改动系统）
       --allow-unverified     来源没提供 SHA-256 时才需要，表示你接受这一点
   uninstall <包...>          卸载；你改过的文件不会被删
       --purge                连你改过的那些也一起删
   list                       列已安装的工具包
   update                     把已安装的工具包升到最新（会先列出来）
       --check                只检查不升级；有更新时退出码 10（给脚本 / 定时任务用）
+      --allow-caution        允许升级自标为「注意」的包
   run <工具> [--字段 值]…    填好参数直接跑；--dry-run 只看命令
                              例：toolbox-hub run ffmpeg-compress --input a.mkv --crf 20
 

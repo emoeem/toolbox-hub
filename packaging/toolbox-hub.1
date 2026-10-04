@@ -172,6 +172,12 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 看详情。仓库里的包会打印完整的安装计划（来源 / 信任 / 依赖 / 文件 / 哈希）。
 .TP
 .B install \fI包...\fR [\-\-allow\-unverified]
+.TP
+.B \-\-allow\-caution
+允许安装自标为「注意」的包（\fBdanger = "caution"\fR）：它们的动作会改动
+系统，所以默认拒绝并在错误里说明原因。TUI 的确认面板不需要这个开关 ——
+它靠第二次 Enter 表示确认。
+
 安装。装之前核对 SHA\-256，不一致直接拒绝；你改过的文件不会被覆盖。
 .TP
 .B uninstall \fI包...\fR [\-\-purge]

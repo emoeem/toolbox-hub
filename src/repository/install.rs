@@ -216,6 +216,15 @@ impl InstallPlan {
         !self.conflicts().is_empty()
     }
 
+    /// 这个包自标为「会改动系统」，安装前要用户再确认一次。
+    ///
+    /// 注意这**不是**「安装动作危险」——装它只写用户自己的目录；危险的是它的动作
+    /// 会动系统。多问一次的理由是：用户按下安装时，心里想的往往是「拿个工具」，
+    /// 而不是「我知道这东西会删缓存 / 改服务」。让它成为一次有意识的选择。
+    pub fn needs_caution_ack(&self) -> bool {
+        self.danger.needs_confirm()
+    }
+
     /// 包含可执行脚本（界面上那句警告）。
     pub fn has_executables(&self) -> bool {
         self.files.iter().any(|file| file.kind == FileKind::Bin)

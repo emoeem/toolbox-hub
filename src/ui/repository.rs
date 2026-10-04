@@ -508,18 +508,16 @@ fn draw_confirm(frame: &mut ratatui::Frame, view: &RepositoryView, confirm: &Con
         )));
     }
 
-    lines.push(Line::from(Span::styled(
-        if confirm.allow_unverified && !confirm.acknowledged {
-            "  ⚠ 没有哈希可核对 —— 再按一次 Enter 表示你接受这一点"
-        } else {
-            "  Enter 确认   Esc 取消"
-        },
-        Style::default().fg(if confirm.allow_unverified && !confirm.acknowledged {
-            theme::RED
-        } else {
-            theme::FAINT
-        }),
-    )));
+    match confirm.pending_reason() {
+        Some(reason) => lines.push(Line::from(Span::styled(
+            format!("  ⚠ {reason} —— 再按一次 Enter 表示你接受"),
+            Style::default().fg(theme::RED),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "  Enter 确认   Esc 取消",
+            Style::default().fg(theme::FAINT),
+        ))),
+    }
 
     if let Some(busy) = view.busy.as_deref() {
         lines.push(Line::from(Span::styled(

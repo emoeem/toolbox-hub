@@ -113,6 +113,8 @@ pub enum ToolCommand {
     Install {
         names: Vec<String>,
         allow_unverified: bool,
+        /// 包自标为「注意」时需要它（它的动作会改动系统）。
+        allow_caution: bool,
     },
     Uninstall {
         names: Vec<String>,
@@ -124,6 +126,8 @@ pub enum ToolCommand {
         ///
         /// 有更新时退出码 10，没有更新是 0（和 checkupdates 一路）。
         check: bool,
+        /// 升级自标为「注意」的包时需要它。
+        allow_caution: bool,
     },
     List,
     Run {
@@ -144,13 +148,14 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
         }
         "info" => Ok(Command::Tool(ToolCommand::Info(one_name(rest, "info")?))),
         "install" => {
-            let (names, flags) = split_names(rest, &["--allow-unverified"])?;
+            let (names, flags) = split_names(rest, &["--allow-unverified", "--allow-caution"])?;
             if names.is_empty() {
                 return Err(String::from("install 后面要跟至少一个包名"));
             }
             Ok(Command::Tool(ToolCommand::Install {
                 names,
                 allow_unverified: is_flagged(&flags, "--allow-unverified"),
+                allow_caution: is_flagged(&flags, "--allow-caution"),
             }))
         }
         "uninstall" => {
@@ -165,10 +170,12 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
         }
         "update" => {
             let mut allow_unverified = false;
+            let mut allow_caution = false;
             let mut check = false;
             for arg in rest {
                 match arg.as_str() {
                     "--allow-unverified" => allow_unverified = true,
+                    "--allow-caution" => allow_caution = true,
                     "--check" => check = true,
                     other => return Err(format!("update 不认识的选项：{other}")),
                 }
@@ -176,6 +183,7 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Command, String> {
             Ok(Command::Tool(ToolCommand::Update {
                 allow_unverified,
                 check,
+                allow_caution,
             }))
         }
         "list" => {
@@ -889,9 +897,10 @@ fn run_tool(
         ToolCommand::Install {
             names,
             allow_unverified,
+            allow_caution,
         } => {
             for name in names {
-                tool_install(name, service, *allow_unverified, dry_run)?;
+                tool_install(name, service, *allow_unverified, *allow_caution, dry_run)?;
             }
             Ok(())
         }
@@ -918,7 +927,8 @@ fn run_tool(
         ToolCommand::Update {
             allow_unverified,
             check,
-        } => tool_update(service, *allow_unverified, *check, dry_run),
+            allow_caution,
+        } => tool_update(service, *allow_unverified, *check, *allow_caution, dry_run),
         ToolCommand::Run { id, values } => tool_run(id, values, bin_dir, dry_run),
     }
 }
@@ -1240,6 +1250,7 @@ fn tool_install(
     id: &str,
     service: &Service,
     allow_unverified: bool,
+    allow_caution: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     let plan = service.plan(id)?;
@@ -1248,8 +1259,16 @@ fn tool_install(
         .map(|(_, _, state)| state)
         .unwrap_or(CacheState::Fresh);
     print_plan(&plan, state);
-
     plan.check(&service.roots, allow_unverified)?;
+
+    // 包自标为「注意」：装它本身只写你自己的目录，但它的动作会改动系统。
+    // 多要一个显式开关，是因为按下 install 时人心里想的是「拿个工具」。
+    if plan.needs_caution_ack() && !allow_caution {
+        return Err(format!(
+            "「{}」被作者标为「注意」：它的动作会改动系统。确认要装的话加 --allow-caution（TUI 里会让你再确认一次）",
+            plan.id
+        ));
+    }
     if dry_run {
         println!("\n（演练，没有安装）");
         return Ok(());
@@ -1278,6 +1297,7 @@ fn tool_update(
     service: &Service,
     allow_unverified: bool,
     check: bool,
+    allow_caution: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     let (candidates, warnings) = service.update_candidates();
@@ -1291,6 +1311,20 @@ fn tool_update(
             println!("已安装的包都是最新的");
         }
         return Ok(());
+    }
+
+    if !allow_caution {
+        let cautious: Vec<&str> = candidates
+            .iter()
+            .filter(|candidate| candidate.plan.needs_caution_ack())
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        if !cautious.is_empty() {
+            return Err(format!(
+                "这些包自标为「注意」，升级等于把它们的新代码再装一遍：{}\n确认要升级就加 --allow-caution",
+                cautious.join("、")
+            ));
+        }
     }
 
     println!("{} 个包可升级：\n", candidates.len());
@@ -1593,14 +1627,16 @@ mod tests {
             parse("install", &args(&["a", "b"])),
             Ok(Command::Tool(ToolCommand::Install {
                 names: args(&["a", "b"]),
-                allow_unverified: false
+                allow_unverified: false,
+                allow_caution: false
             }))
         );
         assert_eq!(
             parse("install", &args(&["a", "--allow-unverified"])),
             Ok(Command::Tool(ToolCommand::Install {
                 names: args(&["a"]),
-                allow_unverified: true
+                allow_unverified: true,
+                allow_caution: false
             }))
         );
         assert!(parse("install", &[]).unwrap_err().contains("包名"));
@@ -1664,7 +1700,8 @@ mod tests {
             parse("update", &[]),
             Ok(Command::Tool(ToolCommand::Update {
                 allow_unverified: false,
-                check: false
+                check: false,
+                allow_caution: false
             }))
         );
         assert!(parse("update", &args(&["--nope"])).is_err());

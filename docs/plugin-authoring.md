@@ -70,6 +70,10 @@ source = "https://github.com/you/my-tool"   # 可选
 homepage = "https://…"      # 可选
 requires_root = false       # 可选，默认 false；见「不要 root」
 danger = "safe"             # 可选：safe | caution，默认 safe
+> `danger` 要老实标。`caution` 的代价仅仅是用户装的时候多按一次 Enter —— 但如果你的
+> 动作会清缓存、删文件、改服务却不标，那一次「多按」就永远省不掉了：用户不知道自己
+> 刚刚允许了什么。判据很简单：**这条动作跑完之后，除了它自己写的输出，机器上还有别的
+> 东西变了吗？** 变了就写 `caution`。
 install = "sudo pacman -S coreutils"        # 可选：依赖缺失时给用户的提示
 ```
 

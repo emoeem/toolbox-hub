@@ -48,6 +48,12 @@ jobs:
       - name: 测试
         run: cargo test
 
+      # cargo test 里已经有一条「官方 registry 必须自洽」的测试，这里再显式跑一次
+      # check：报错信息更具体（哪个包、哪个文件、怎么修），而且和 Registry 工作流
+      # 用同一条命令 —— 改了 registry/ 却在别的 workflow 上，也能被拦住。
+      - name: 工具仓库自洽（索引 ↔ 产物 ↔ 源码）
+        run: cargo run --quiet -- check registry/
+
   # README 里那句「行为用测试钉住，工具链用冒烟钉住」的后半句。
   # 这批 `--ignored` 测试抓的都是只有真跑才看得见的问题（7z 只认 -mx9、
   # ImageMagick 要求输入在前、ffmpeg 漏 -i 会把输入当输出…），所以别删。

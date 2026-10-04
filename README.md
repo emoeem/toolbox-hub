@@ -405,6 +405,17 @@ pacman/AUR 那套**没有任何关系**，卸掉一个工具包只会删掉几�
 哈希对不上直接拒绝安装。装来的脚本落在 `~/.local/bin`，其余文件落在数据目录，
 **一次也不 sudo**。
 
+`danger` 那一行是作者和你在同一句话上的约定：作者标 `caution`（界面显示「注意」）表示
+**它的动作会改动系统**（清缓存、删分支、动服务）。这类包光是「装」不危险 —— 只写你自己的
+目录 —— 但为了防止你按 install 时心里想的只是「拿个工具」，它会多问一次：
+
+    toolbox-hub install system-cleanup                 # ✕ 被拦住，并说明原因
+    toolbox-hub install system-cleanup --allow-caution # ✓ 你明确知道它会改系统
+    toolbox-hub update --allow-caution                 # 升级同类包也一样
+
+TUI 里不用记这个开关：发现面板按 Enter 摆出计划，第二次 Enter 才算确认。
+标 `safe` 的包不受影响，一次确认就装。
+
 装完就能用：`toolbox-hub run disk-report-dirs --path ~/Downloads --depth 2`，
 或者在 TUI 里找它（数字键 9 进「发现」域，或它自己声明的域）。
 
