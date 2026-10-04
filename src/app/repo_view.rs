@@ -257,6 +257,10 @@ impl RepositoryView {
             changed = true;
             match response {
                 Response::Progress(text) => self.busy = Some(text),
+                Response::ThreadGone => {
+                    self.busy = None;
+                    self.message = String::from("后台线程退出了 —— 请重启程序");
+                }
                 Response::Refreshed(fetch) => {
                     self.busy = None;
                     let when = fetch
@@ -279,6 +283,24 @@ impl RepositoryView {
                         .iter()
                         .flat_map(|result| result.warnings.clone())
                         .collect();
+                }
+                Response::Planned {
+                    id,
+                    upgrading,
+                    outcome,
+                } => {
+                    self.busy = None;
+                    // 算计划要读盘、可能还要哈希本机文件，这期间用户完全可能换了目标。
+                    // 这时摆出上一个包的确认面板会让人以为自己按错了 —— 对不上就只说一句。
+                    let still_current = self.selected_hit().is_some_and(|hit| hit.id == id);
+                    match outcome {
+                        Ok(plan) if still_current => self.offer(*plan, upgrading),
+                        Ok(_) => {
+                            self.message =
+                                format!("「{id}」的安装计划算好了，但它已经不是当前选中的包");
+                        }
+                        Err(problem) => self.message = problem,
+                    }
                 }
                 Response::Installed { id, outcome } => {
                     self.busy = None;
@@ -336,7 +358,7 @@ impl RepositoryView {
 
     // ── 动作 ────────────────────────────────────────────────────────────────
 
-    /// 准备安装 / 升级选中的包：先算计划，再摆给用户看。
+    /// 准备安装 / 升级选中的包：让后台算计划，算好摆出来给用户看。
     pub fn ask_install(&mut self) {
         if self.mode == RepoMode::Installed {
             self.show_installed_detail();
@@ -347,15 +369,15 @@ impl RepositoryView {
         };
         let id = hit.id.clone();
         let upgrading = hit.is_installed();
-        let plan = match self.service.plan(&id) {
-            Ok(plan) => plan,
-            Err(problem) => {
-                self.message = problem;
-                return;
-            }
-        };
+        self.request_plan(&id, upgrading);
+    }
 
-        self.offer(plan, upgrading);
+    /// 让后台线程算计划（可能要哈希本机文件，不许在按键线程上做）。
+    fn request_plan(&mut self, id: &str, upgrading: bool) {
+        match self.worker.plan(id.to_string(), upgrading) {
+            Ok(()) => self.busy = Some(format!("正在算 {id} 的安装计划…")),
+            Err(problem) => self.message = problem,
+        }
     }
 
     /// 把一个安装计划摆成确认面板。
@@ -476,10 +498,7 @@ impl RepositoryView {
             return;
         };
         // 升级同样是下载并执行别人新写的代码，所以走和安装同一条确认路径。
-        match self.service.plan(&id) {
-            Ok(plan) => self.offer(plan, true),
-            Err(problem) => self.message = problem,
-        }
+        self.request_plan(&id, true);
     }
 
     /// 在「仓库」面板里切换启用 / 停用。
@@ -527,6 +546,9 @@ impl RepositoryView {
             self.service.roots.clone(),
             self.service.cache_root.clone(),
         );
+        // 后台线程手里那份是启动时的：不同步的话，它还在刷已经删掉的仓库、
+        // 漏掉新加的。
+        let _ = self.worker.set_service(self.service.clone());
         self.reload();
         Ok(())
     }
@@ -803,6 +825,18 @@ mod tests {
         RepositoryView::open(service(base, INDEX)).expect("open")
     }
 
+    /// 计划在后台线程算：等到确认面板出现（或超时）。
+    fn wait_for_confirm(view: &mut RepositoryView) {
+        for _ in 0..300 {
+            view.poll();
+            if view.confirm.is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("确认面板没出现");
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -887,6 +921,7 @@ mod tests {
         let base = temp("plan");
         let mut view = view(&base);
         view.ask_install();
+        wait_for_confirm(&mut view);
         let confirm = view.confirm.as_ref().expect("应当出现确认面板");
         assert_eq!(confirm.plan.id, "hello-tool");
         assert!(!confirm.upgrading);
@@ -907,6 +942,7 @@ mod tests {
         ]}"#;
         let mut view = RepositoryView::open(service(&base, index)).expect("open");
         view.ask_install();
+        wait_for_confirm(&mut view);
         let confirm = view.confirm.as_ref().expect("应当出现确认面板");
         assert!(confirm.allow_unverified, "没哈希就要标出来");
         assert!(!confirm.acknowledged, "第一次 Enter 还不算确认");
@@ -923,6 +959,7 @@ mod tests {
         let base = temp("cancel");
         let mut view = view(&base);
         view.ask_install();
+        wait_for_confirm(&mut view);
         assert!(view.confirm.is_some());
         view.confirm_cancel();
         assert!(view.confirm.is_none());
@@ -937,6 +974,7 @@ mod tests {
         let base = temp("swallow");
         let mut view = view(&base);
         view.ask_install();
+        wait_for_confirm(&mut view);
         assert!(view.handle_key(key(KeyCode::Char('q'))).expect("key"));
         assert!(view.confirm.is_none());
         std::fs::remove_dir_all(&base).expect("cleanup");
@@ -1160,6 +1198,18 @@ mod caution_tests {
         view.selected = index;
     }
 
+    /// 计划在后台线程算：等到确认面板出现（或超时）。
+    fn wait_for_confirm(view: &mut RepositoryView) {
+        for _ in 0..300 {
+            view.poll();
+            if view.confirm.is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("确认面板没出现");
+    }
+
     #[test]
     fn a_caution_package_needs_a_second_enter() {
         let base = temp("second");
@@ -1167,6 +1217,7 @@ mod caution_tests {
 
         pick(&mut view, "risky-tools");
         view.ask_install();
+        wait_for_confirm(&mut view);
         let confirm = view.confirm.as_ref().expect("应当出现确认面板");
         assert!(confirm.plan.needs_caution_ack(), "caution 包要认出来");
         assert!(!confirm.acknowledged, "第一次 Enter 还不算确认");
@@ -1195,6 +1246,7 @@ mod caution_tests {
         let mut view = RepositoryView::open(service(&base)).expect("open");
         pick(&mut view, "safe-tool");
         view.ask_install();
+        wait_for_confirm(&mut view);
         let confirm = view.confirm.as_ref().expect("应当出现确认面板");
         assert!(!confirm.plan.needs_caution_ack());
         assert!(confirm.acknowledged, "safe 包一次确认就够");
@@ -1232,7 +1284,7 @@ mod caution_tests {
         let mut view = RepositoryView::open(service(&base)).expect("open");
         pick(&mut view, "risky-tools");
         view.upgrade_selected();
-
+        wait_for_confirm(&mut view);
         // 升级照样要过确认面板，而不是直接开跑。
         let confirm = view.confirm.as_ref().expect("应当摆出确认面板");
         assert!(!confirm.acknowledged, "第一次 Enter 还不算确认");

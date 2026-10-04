@@ -32,6 +32,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::repository::atomic;
 use crate::{config::Loaded, repository::paths};
 
 /// 覆盖仓库配置文件位置的环境变量（测试与换机用）。
@@ -324,12 +325,9 @@ pub(crate) fn load_from(file: &Path) -> Loaded<Repositories> {
 }
 
 pub(crate) fn save_to(file: &Path, repositories: &Repositories) -> Result<(), String> {
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("建不了 {}：{error}", parent.display()))?;
-    }
     let text = toml::to_string(repositories).map_err(|error| format!("写不了 TOML：{error}"))?;
-    fs::write(file, text).map_err(|error| format!("写不了 {}：{error}", file.display()))
+    atomic::write(file, text.as_bytes())
+        .map_err(|error| format!("写不了 {}：{error}", file.display()))
 }
 
 /// 第一次跑时写一份带注释的模板出来。已经存在就一个字节都不动。

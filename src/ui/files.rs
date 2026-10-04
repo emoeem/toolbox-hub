@@ -17,7 +17,7 @@ use crate::{
     app::App,
     media::human_size,
     preview::Preview,
-    ui::{short_path, theme},
+    ui::{short_path, theme, window},
 };
 
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -100,7 +100,9 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let rows = (0..view.len())
+    // 只构造看得见的那些行（见 ui::window）：目录里上万条时每帧重造一遍会把滚动拖涩。
+    let (start, end) = window(view.len(), view.selected, list.height);
+    let rows = (start..end)
         .filter_map(|index| view.entry(index))
         .map(|file| {
             Row::new(vec![
@@ -122,7 +124,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
     .highlight_symbol("➤ ");
 
-    let mut state = TableState::default().with_selected(Some(view.selected));
+    let mut state = TableState::default().with_selected(Some(view.selected.saturating_sub(start)));
     frame.render_stateful_widget(table, list, &mut state);
 
     if let Some(area) = preview_area {

@@ -130,7 +130,14 @@ pub fn handle_mouse(
 
             if areas.list.contains(point)
                 && let Some(row) = main_tool_row(areas.list, point)
-                && row < app.filtered.len()
+                // 渲染只画窗口里那一段（ui::table 用的是同一个 window），所以命中也要
+                // 加上窗口起点 —— 否则列表滚起来之后，点到的行和看到的行差一屏。
+                && let Some(row) = crate::ui::windowed_index(
+                    app.filtered.len(),
+                    app.selected,
+                    crate::ui::main_rows_room(areas.list),
+                    row,
+                )
             {
                 app.selected = row;
                 app.table.select(Some(row));
@@ -343,6 +350,15 @@ fn handle_packages_mouse(
         if let Some(row) = package_queue_row(areas.results, point)
             && let Some(view) = app.packages.as_mut()
         {
+            // 队列也是窗口化渲染的：屏幕行 + 窗口起点才是队列下标。
+            let Some(row) = crate::ui::windowed_index(
+                view.rows_len(),
+                view.rows_selected(),
+                areas.results.height,
+                row,
+            ) else {
+                return Ok(());
+            };
             if row < view.queue.len() {
                 view.queue_selected = row;
                 if double {
@@ -362,6 +378,15 @@ fn handle_packages_mouse(
     // 搜索、已安装、新闻、维护列表都没有表头；区域第一行就是第一个结果。
     if let Some(view) = app.packages.as_mut() {
         view.pane = Pane::Rows;
+        // 窗口化渲染：屏幕行要换算回真实下标，否则滚动之后点错行。
+        let Some(row) = crate::ui::windowed_index(
+            view.rows_len(),
+            view.rows_selected(),
+            areas.results.height,
+            row,
+        ) else {
+            return Ok(());
+        };
         if row < view.rows_len() {
             let delta = row as isize - view.rows_selected() as isize;
             view.move_row(delta);
@@ -1546,6 +1571,39 @@ mod mouse_row_tests {
         );
         assert_eq!(main_tool_row(list, Position::new(3, 12)), Some(0));
         assert_eq!(main_tool_row(list, Position::new(3, 13)), Some(1));
+    }
+
+    /// 复现一次报障：列表滚起来之后，点在表格第一行会选到**别的**条目。
+    ///
+    /// 渲染只画窗口里那一段，命中却拿屏幕行当下标 —— 差的就是窗口起点。
+    /// 这条把「渲染的 room」「命中的 room」「窗口映射」三者的约定钉在一起。
+    #[test]
+    fn clicking_the_first_visible_row_after_scrolling_picks_what_you_see() {
+        let list = Rect::new(0, 0, 60, 20);
+        // 表格第一行在边框（1）+ 表头（1）之后
+        let first_row = Position::new(1, 2);
+        let visual = main_tool_row(list, first_row).expect("第一行要能命中");
+        assert_eq!(visual, 0, "屏幕第一行就是窗口里的第 0 行");
+
+        let room = crate::ui::main_rows_room(list);
+        // 没滚的时候，视觉行就是下标
+        assert_eq!(crate::ui::windowed_index(100, 0, room, visual), Some(0));
+
+        // 滚到第 50 项：点第一行应当选到窗口起点，而不是第 0 项
+        let (start, _) = crate::ui::window(100, 50, room);
+        assert_ne!(start, 0, "这个用例必须真的处于滚动状态");
+        assert_eq!(
+            crate::ui::windowed_index(100, 50, room, visual),
+            Some(start)
+        );
+
+        // 屏幕最后一行对应窗口最后一项（滚到底也点得着）
+        let last_row = Position::new(1, 2 + (room - 1));
+        let visual = main_tool_row(list, last_row).expect("最后一行要能命中");
+        assert_eq!(
+            crate::ui::windowed_index(100, 50, room, visual),
+            Some(start + room as usize - 1)
+        );
     }
 
     #[test]

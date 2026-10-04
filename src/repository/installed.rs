@@ -25,7 +25,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::repository::{index::FileKind, version::Version};
+use crate::repository::{atomic, index::FileKind, version::Version};
 
 /// 账本格式版本。
 pub const SCHEMA_VERSION: u32 = 1;
@@ -217,13 +217,12 @@ pub fn load_all(data_dir: &Path) -> (Vec<InstalledPackage>, Vec<String>) {
     (packages, warnings)
 }
 
-/// 写账本（会自动建目录）。
+/// 写账本（会自动建目录）。走原子写：写一半断电，账本坏了包就成了孤儿。
 pub fn save(data_dir: &Path, package: &InstalledPackage) -> Result<(), String> {
-    let dir = package_dir(data_dir, &package.id);
-    fs::create_dir_all(&dir).map_err(|error| format!("建不了 {}：{error}", dir.display()))?;
     let text = toml::to_string_pretty(package).map_err(|error| format!("写不了 TOML：{error}"))?;
     let path = ledger_path(data_dir, &package.id);
-    fs::write(&path, text).map_err(|error| format!("写不了 {}：{error}", path.display()))
+    atomic::write(&path, text.as_bytes())
+        .map_err(|error| format!("写不了 {}：{error}", path.display()))
 }
 
 /// 删掉一个包的整个目录（账本 + 载荷）。**不**碰任何 \`files\` 里记的绝对路径 ——
@@ -249,6 +248,9 @@ pub fn installed_versions(data_dir: &Path) -> BTreeMap<String, String> {
 ///
 /// 返回 \`(包 id, 该文件当时的 sha256)\` —— 调用方据此决定：同一个包自己重装
 /// 可以覆盖；别人的文件就是**冲突**。
+/// 只在测试里用：[`Ownership`] 是生产路径（建表一次、二分查找），
+/// 这个逐文件重读账本的版本留着当**独立参照** —— 两边对不上就是有一边写错了。
+#[cfg(test)]
 pub fn owner_of(data_dir: &Path, path: &Path) -> Option<(String, String)> {
     let (packages, _) = load_all(data_dir);
     for package in packages {
@@ -259,6 +261,43 @@ pub fn owner_of(data_dir: &Path, path: &Path) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// 一次建好的「文件 → 属主」表（给批量算计划用）。
+///
+/// [`owner_of`] 每问一个文件就重读一遍全部账本；一个计划有 N 个文件、
+/// 一批计划有 M 个包，那就是平方级的磁盘读。批量场景先 `build` 一份再逐个查。
+pub struct Ownership {
+    /// (路径, 包 id, 安装时的 sha256)，按路径有序，二分查找。
+    files: Vec<(PathBuf, String, String)>,
+}
+
+impl Ownership {
+    pub fn build(data_dir: &Path) -> Self {
+        let (packages, _) = load_all(data_dir);
+        let mut files = Vec::new();
+        for package in packages {
+            for file in package.files {
+                files.push((file.path, package.id.clone(), file.sha256));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        Self { files }
+    }
+
+    /// 文件归谁所有：\`(包 id, 安装时的 sha256)\`。与 [`owner_of`] 同语义。
+    pub fn owner_of(&self, path: &Path) -> Option<(&str, &str)> {
+        let mut index = self
+            .files
+            .binary_search_by(|entry| entry.0.as_path().cmp(path))
+            .ok()?;
+        // 二分命中的一串同路径条目里，取最先记的那个（与 owner_of 一致）。
+        while index > 0 && self.files[index - 1].0 == self.files[index].0 {
+            index -= 1;
+        }
+        let entry = &self.files[index];
+        Some((entry.1.as_str(), entry.2.as_str()))
+    }
 }
 
 #[cfg(test)]

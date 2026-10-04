@@ -6,12 +6,12 @@
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
-    widgets::{Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::{
     app::{App, Scope},
-    ui::theme,
+    ui::{theme, window},
 };
 
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -29,7 +29,12 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let header =
         Row::new(headers).style(Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
 
-    let rows = app.filtered.iter().map(|&index| {
+    // 只构造看得见的那些行（见 ui::window 的说明）。选中是全局下标，
+    // 高亮行用窗口内的相对下标。
+    let rows_room = crate::ui::main_rows_room(area);
+    let selected = app.selected.min(app.filtered.len() - 1);
+    let (start, end) = window(app.filtered.len(), selected, rows_room);
+    let rows = app.filtered[start..end].iter().map(|&index| {
         let tool = &app.registry.tools()[index];
         let mark = if app.marked[index] { "● " } else { "  " };
         // 星标固定占两格，收藏与否都不会让工具名错位。
@@ -91,7 +96,8 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
         .highlight_symbol("▸ ");
 
-    frame.render_stateful_widget(table, area, &mut app.table);
+    let mut state = TableState::default().with_selected(Some(selected - start));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 /// 空视图不是错误：可能是域没接 Provider、分类下没工具，或者搜索没命中。

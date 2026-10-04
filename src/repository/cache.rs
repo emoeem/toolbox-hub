@@ -27,6 +27,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::repository::{
+    atomic,
     config::{RepositoryConfig, Trust},
     index::{Index, ParsedIndex},
 };
@@ -188,11 +189,12 @@ pub fn store(root: &Path, id: &str, text: &str, meta: &IndexMeta) -> Result<(), 
     let dir = repository_dir(root, id);
     fs::create_dir_all(&dir)
         .map_err(|error| format!("建不了缓存目录 {}：{error}", dir.display()))?;
-    fs::write(index_path(root, id), text).map_err(|error| format!("写不了索引缓存：{error}"))?;
+    atomic::write(&index_path(root, id), text.as_bytes())
+        .map_err(|error| format!("写不了索引缓存：{error}"))?;
     let encoded =
         serde_json::to_string_pretty(meta).map_err(|error| format!("序列化失败：{error}"))?;
-    fs::write(meta_path(root, id), encoded).map_err(|error| format!("写不了缓存信息：{error}"))?;
-    Ok(())
+    atomic::write(&meta_path(root, id), encoded.as_bytes())
+        .map_err(|error| format!("写不了缓存信息：{error}"))
 }
 
 /// 只更新 meta（304 用：内容没变，但「刚刚确认过」）。
@@ -201,7 +203,8 @@ fn touch_meta(root: &Path, id: &str, meta: &IndexMeta) -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|error| format!("建不了缓存目录：{error}"))?;
     let encoded =
         serde_json::to_string_pretty(meta).map_err(|error| format!("序列化失败：{error}"))?;
-    fs::write(meta_path(root, id), encoded).map_err(|error| format!("写不了缓存信息：{error}"))
+    atomic::write(&meta_path(root, id), encoded.as_bytes())
+        .map_err(|error| format!("写不了缓存信息：{error}"))
 }
 
 /// 一次抓取的结果。

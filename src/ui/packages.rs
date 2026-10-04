@@ -12,7 +12,7 @@ use crate::{
         App,
         package_view::{Confirm, PackageMode, PackageView, Pane},
     },
-    ui::{display_width, theme},
+    ui::{display_width, theme, window},
 };
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
@@ -357,25 +357,6 @@ fn row_style(view: &PackageView) -> Style {
     } else {
         Style::default().fg(theme::TEXT)
     }
-}
-
-/// 只画看得见的那几十行，返回窗口边界。
-///
-/// `Table::new` 会把传进去的行**全部** collect 成 Vec（ratatui 内部就是这么做的），
-/// 所以每次重画都得把所有行构造一遍。已安装列表在这台机器上是 2271 行 ——
-/// 按一次 ↓ 就重新分配上万次对象，滚动会发涩（空闲时更明显，实测空转 3~4% CPU，
-/// 脏标记已经把那部分解决了，剩下这个是给滚动提速的）。
-///
-/// 窗口跟着选区走：选区永远落在窗口里，所以 `TableState` 的 `offset` 保持 0，
-/// 高亮行就是窗口内的相对下标。
-fn window(total: usize, selected: usize, height: u16) -> (usize, usize) {
-    let room = height.max(1) as usize;
-    if total <= room {
-        return (0, total);
-    }
-    let half = room / 2;
-    let start = selected.saturating_sub(half).min(total - room);
-    (start, start + room)
 }
 
 fn empty_hint(frame: &mut ratatui::Frame, text: &str, area: Rect) {

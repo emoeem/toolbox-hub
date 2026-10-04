@@ -14,8 +14,10 @@
 //! | worker | 把慢活搬到后台线程（UI 线程绝不联网、绝不哈希） |
 //! | author | **作者工具**：脚手架 / 校验 / 可复现打包（给写插件的人） |
 //! | paths | 安装路径安全（目录穿越、绝对路径…） |
+//! | atomic | 原子写盘（临时文件 + rename，账本/配置/缓存一律走它） |
 //! | version | 版本比较（判断有没有新版） |
 
+pub mod atomic;
 pub mod author;
 pub mod cache;
 pub mod cli;

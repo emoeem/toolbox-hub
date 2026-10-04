@@ -38,9 +38,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     model::Danger,
     repository::{
-        cache,
+        atomic, cache,
         config::{RepositoryConfig, Trust},
-        index::{Artifact, ArtifactKind, FileKind, PackageMeta},
+        index::{Artifact, ArtifactKind, FileKind, Index, PackageMeta},
         installed::{self, FileState, InstalledFile, InstalledPackage, SCHEMA_VERSION},
         paths, version,
     },
@@ -287,6 +287,18 @@ pub fn plan(
     repository: &RepositoryConfig,
     roots: &Roots,
 ) -> Result<InstallPlan, String> {
+    // 属主表整个计划只建一次：逐文件重读全部账本是平方级的磁盘读。
+    let ownership = installed::Ownership::build(&roots.data);
+    plan_with(meta, repository, roots, &ownership)
+}
+
+/// 同 [`plan`]，但属主表由调用方提供（批量算计划时复用一份）。
+fn plan_with(
+    meta: &PackageMeta,
+    repository: &RepositoryConfig,
+    roots: &Roots,
+    ownership: &installed::Ownership,
+) -> Result<InstallPlan, String> {
     meta.validate()?;
     let id = meta.id.clone();
     let installed_version = installed::load(&roots.data, &id).map(|package| package.version);
@@ -310,8 +322,8 @@ pub fn plan(
         let relative = paths::safe_relative(&entry.path)?;
         let kind = entry.kind();
         let target = target_for(roots, &id, &relative, kind)?;
-        let conflict = conflict_for(roots, &id, &target, entry.sha256().as_deref())?;
-        let modified = modified_reason(roots, &id, &target)?;
+        let conflict = conflict_for(ownership, &id, &target, entry.sha256().as_deref())?;
+        let modified = modified_reason(ownership, &id, &target)?;
         files.push(PlannedFile {
             source: relative.to_string_lossy().to_string(),
             target,
@@ -477,8 +489,12 @@ fn target_for(roots: &Roots, id: &str, relative: &Path, kind: FileKind) -> Resul
 ///
 /// 为什么要单独判：卸载时这类文件是**保留**的（界面上写着「你改过的文件不会被删」），
 /// 而升级原来会**静默覆盖**它们 —— 同一件事两种待遇，用户会丢改动。
-fn modified_reason(roots: &Roots, id: &str, target: &Path) -> Result<Option<String>, String> {
-    let Some((owner, recorded)) = installed::owner_of(&roots.data, target) else {
+fn modified_reason(
+    ownership: &installed::Ownership,
+    id: &str,
+    target: &Path,
+) -> Result<Option<String>, String> {
+    let Some((owner, recorded)) = ownership.owner_of(target) else {
         return Ok(None);
     };
     if owner != id {
@@ -496,7 +512,7 @@ fn modified_reason(roots: &Roots, id: &str, target: &Path) -> Result<Option<Stri
 
 /// 目标已经存在时算什么。
 fn conflict_for(
-    roots: &Roots,
+    ownership: &installed::Ownership,
     id: &str,
     target: &Path,
     expected: Option<&str>,
@@ -511,7 +527,7 @@ fn conflict_for(
         )));
     }
 
-    match installed::owner_of(&roots.data, target) {
+    match ownership.owner_of(target) {
         // 自己装的（重装 / 升级）：放行。
         Some((owner, _)) if owner == id => Ok(None),
         Some((owner, _)) => Ok(Some(format!(
@@ -639,6 +655,10 @@ fn install_inner(
         .map_err(|error| format!("建不了 {}：{error}", files_root.display()))?;
 
     let mut recorded: Vec<InstalledFile> = Vec::new();
+    // 覆盖升级时旧文件会被 rename 直接顶掉：先把它们备份进暂存目录，回滚
+    // 才有东西可还。没有这份备份，升级中途失败 = 用户手里新旧两空。
+    let backup_dir = staging.join("old");
+    let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
     for file in &plan.files {
         let source = resolve_payload(&payload, &file.source);
         let outcome = (|| -> Result<InstalledFile, String> {
@@ -656,7 +676,28 @@ fn install_inner(
                     file.source
                 ));
             }
-            write_atomically(&file.target, &bytes, file.kind == FileKind::Bin)?;
+            if file.target.exists() && !backups.iter().any(|(target, _)| target == &file.target) {
+                fs::create_dir_all(&backup_dir)
+                    .map_err(|error| format!("建不了备份目录：{error}"))?;
+                let name = format!(
+                    "{:04}-{}",
+                    backups.len(),
+                    file.target
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| String::from("file"))
+                );
+                let backup = backup_dir.join(name);
+                fs::copy(&file.target, &backup).map_err(|error| {
+                    format!("备份不了旧文件 {}：{error}", file.target.display())
+                })?;
+                backups.push((file.target.clone(), backup));
+            }
+            if file.kind == FileKind::Bin {
+                atomic::write_executable(&file.target, &bytes)?
+            } else {
+                atomic::write(&file.target, &bytes)?
+            };
             Ok(InstalledFile {
                 path: file.target.clone(),
                 sha256: digest,
@@ -669,9 +710,15 @@ fn install_inner(
             Ok(entry) => recorded.push(entry),
             Err(problem) => {
                 // 装到一半失败必须回滚：账本还没写，留着这些文件就成了
-                // 谁也不知道、谁也删不掉的孤儿。
+                // 谁也不知道、谁也删不掉的孤儿。顺序不能反：先还原被覆盖的
+                // 旧文件，再删这次全新写的。
+                for (target, backup) in backups.iter().rev() {
+                    let _ = fs::copy(backup, target);
+                }
                 for written in &recorded {
-                    let _ = fs::remove_file(&written.path);
+                    if !backups.iter().any(|(target, _)| target == &written.path) {
+                        let _ = fs::remove_file(&written.path);
+                    }
                 }
                 return Err(problem);
             }
@@ -772,45 +819,6 @@ fn danger_id(danger: Danger) -> &'static str {
         Danger::Safe => "safe",
         Danger::Caution => "caution",
     }
-}
-
-/// 写文件：先写同目录的临时文件再 rename（同文件系统内是原子的），
-/// 这样半截文件不会留在目标位置上。
-fn write_atomically(target: &Path, bytes: &[u8], executable: bool) -> Result<(), String> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("{} 没有父目录", target.display()))?;
-    fs::create_dir_all(parent).map_err(|error| format!("建不了 {}：{error}", parent.display()))?;
-    let name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| String::from("file"));
-    let temp = parent.join(format!(".{name}.toolbox-tmp-{}", std::process::id()));
-
-    {
-        let mut handle = fs::File::create(&temp)
-            .map_err(|error| format!("写不了 {}：{error}", temp.display()))?;
-        handle
-            .write_all(bytes)
-            .map_err(|error| format!("写不了 {}：{error}", temp.display()))?;
-        handle
-            .flush()
-            .map_err(|error| format!("写不了 {}：{error}", temp.display()))?;
-    }
-
-    if executable {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("设不了可执行位 {}：{error}", temp.display()))?;
-        }
-    }
-
-    fs::rename(&temp, target).map_err(|error| {
-        let _ = fs::remove_file(&temp);
-        format!("装不了 {}：{error}", target.display())
-    })
 }
 
 /// 暂存目录（放在数据目录下，保证和最终目标在同一个文件系统上）。
@@ -1134,30 +1142,17 @@ pub struct UpdateCandidate {
 pub fn update_candidates(
     data_dir: &Path,
     roots: &Roots,
-    indexes: &[(RepositoryConfig, crate::repository::index::Index)],
+    indexes: &[(RepositoryConfig, Index)],
 ) -> (Vec<UpdateCandidate>, Vec<String>) {
     let (packages, mut warnings) = installed::load_all(data_dir);
+    let ownership = installed::Ownership::build(data_dir);
     let mut candidates = Vec::new();
 
     for package in packages {
-        let mut best: Option<(&RepositoryConfig, &PackageMeta)> = None;
-        for (repository, index) in indexes {
-            let Some(meta) = index.find(&package.id) else {
-                continue;
-            };
-            if !version::is_upgrade(&meta.version, &package.version) {
-                continue;
-            }
-            let better = best
-                .is_none_or(|(_, current)| version::is_upgrade(&meta.version, &current.version));
-            if better {
-                best = Some((repository, meta));
-            }
-        }
-        let Some((repository, meta)) = best else {
+        let Some((repository, meta)) = best_upgrade_for(&package, indexes) else {
             continue;
         };
-        match plan(meta, repository, roots) {
+        match plan_with(meta, repository, roots, &ownership) {
             Ok(plan) => candidates.push(UpdateCandidate {
                 id: package.id.clone(),
                 name: package.name.clone(),
@@ -1172,6 +1167,43 @@ pub fn update_candidates(
     }
     candidates.sort_by(|a, b| a.id.cmp(&b.id));
     (candidates, warnings)
+}
+
+/// 在所有索引里给一个已装包挑出版本最高的升级（没有就 None）。
+fn best_upgrade_for<'a>(
+    package: &InstalledPackage,
+    indexes: &'a [(RepositoryConfig, Index)],
+) -> Option<(&'a RepositoryConfig, &'a PackageMeta)> {
+    let mut best: Option<(&RepositoryConfig, &PackageMeta)> = None;
+    for (repository, index) in indexes {
+        let Some(meta) = index.find(&package.id) else {
+            continue;
+        };
+        if !version::is_upgrade(&meta.version, &package.version) {
+            continue;
+        }
+        let better =
+            best.is_none_or(|(_, current)| version::is_upgrade(&meta.version, &current.version));
+        if better {
+            best = Some((repository, meta));
+        }
+    }
+    best
+}
+
+/// 只数「有几个包有新版」。不造计划、不哈希文件：启动时的可升级徽标
+/// 只需要一个数，把所有可升级包的全部文件过一遍 SHA-256 是浪费。
+pub fn update_count(data_dir: &Path, indexes: &[&Index]) -> usize {
+    let (packages, _) = installed::load_all(data_dir);
+    packages
+        .iter()
+        .filter(|package| {
+            indexes
+                .iter()
+                .filter_map(|index| index.find(&package.id))
+                .any(|meta| version::is_upgrade(&meta.version, &package.version))
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -1412,6 +1444,61 @@ mod tests {
         let problem = install(&plan, &roots, &agent(), false).unwrap_err();
         assert!(problem.contains("不一致"), "{problem}");
         assert!(!roots.bin.join("demo-run").exists());
+        fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn a_failed_upgrade_restores_the_old_files() {
+        let base = root("rollback");
+        let roots = roots_at(&base);
+        // 先真装一版，让目标文件有「旧内容」可丢。
+        let first = package_with_artifact(
+            &base,
+            "demo",
+            "1.0.0",
+            &[
+                ("scripts/demo-run", "#!/bin/sh\necho old\n", "bin"),
+                (
+                    "manifests/demo.toml",
+                    "[[action]]\nname=\"old\"\n",
+                    "manifest",
+                ),
+            ],
+        );
+        let first_plan = plan(&first, &repository(), &roots).expect("plan");
+        install(&first_plan, &roots, &agent(), false).expect("install");
+
+        // 升级版：第一个文件正常覆盖，第二个文件哈希对不上，装到一半失败。
+        let mut second = package_with_artifact(
+            &base,
+            "demo",
+            "2.0.0",
+            &[
+                ("scripts/demo-run", "#!/bin/sh\necho new\n", "bin"),
+                (
+                    "manifests/demo.toml",
+                    "[[action]]\nname=\"new\"\n",
+                    "manifest",
+                ),
+            ],
+        );
+        second.files[1].sha256 = Some("b".repeat(64));
+        let second_plan = plan(&second, &repository(), &roots).expect("plan");
+
+        let problem = install(&second_plan, &roots, &agent(), false).unwrap_err();
+        assert!(problem.contains("不一致"), "{problem}");
+        assert_eq!(
+            fs::read_to_string(roots.bin.join("demo-run")).expect("read"),
+            "#!/bin/sh\necho old\n",
+            "升级失败必须把被覆盖的旧文件原样留下"
+        );
+        assert_eq!(
+            installed::load(&roots.data, "demo")
+                .expect("ledger")
+                .version,
+            "1.0.0",
+            "账本不该被半截升级动过"
+        );
         fs::remove_dir_all(&base).expect("cleanup");
     }
 
@@ -1782,7 +1869,7 @@ mod tests {
     fn writing_is_atomic_and_leaves_no_temp_files() {
         let base = root("atomic");
         let target = base.join("sub/dir/file");
-        write_atomically(&target, b"hello", false).expect("write");
+        atomic::write(&target, b"hello").expect("write");
         assert_eq!(fs::read(&target).expect("read"), b"hello");
         let leftovers: Vec<_> = fs::read_dir(target.parent().expect("parent"))
             .expect("read_dir")

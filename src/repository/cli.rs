@@ -961,7 +961,7 @@ fn run_tool(
 }
 
 fn hint_if_no_index(service: &Service) {
-    if service.indexes().is_empty() {
+    if service.has_indexes() {
         println!("\n还没有可用的仓库索引 —— 先跑一次 toolbox-hub repo update");
     }
 }
@@ -1365,7 +1365,7 @@ fn tool_update(
         eprintln!("警告：{warning}");
     }
     if candidates.is_empty() {
-        if service.indexes().is_empty() {
+        if service.has_indexes() {
             println!("还没有可用的仓库索引 —— 先跑一次 toolbox-hub repo update");
         } else {
             println!("已安装的包都是最新的");

@@ -9,7 +9,10 @@ use ratatui::{
     widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::{app::Picker, ui::theme};
+use crate::{
+    app::Picker,
+    ui::{theme, window},
+};
 
 /// 画文件选择器。
 ///
@@ -79,7 +82,9 @@ pub fn draw(frame: &mut ratatui::Frame, picker: &Picker, area: Rect) {
         return;
     }
 
-    let rows = (0..picker.len())
+    // 窗口化：每帧只 stat 看得见的那 ~30 行，而不是整个目录。
+    let (start, end) = window(picker.len(), picker.selected, list.height);
+    let rows = (start..end)
         .filter_map(|index| picker.entry(index))
         .map(|entry| {
             // 目录加个斜杠、用另一种颜色，一眼能和文件分开。
@@ -111,6 +116,7 @@ pub fn draw(frame: &mut ratatui::Frame, picker: &Picker, area: Rect) {
         .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
         .highlight_symbol("➤ ");
 
-    let mut state = TableState::default().with_selected(Some(picker.selected));
+    let mut state =
+        TableState::default().with_selected(Some(picker.selected.saturating_sub(start)));
     frame.render_stateful_widget(table, list, &mut state);
 }

@@ -26,9 +26,21 @@ cargo run                    # 开发版
 cargo build --release && ./target/release/toolbox-hub    # 更快
 ```
 
-**构建前提**：`pacman`（提供 `libalpm.so` 与 `libalpm.pc`，Arch 上本来就有）+ `pkgconf`。
-二进制**动态链接 libalpm** —— 包数据层是直连 pacman 的库，不是解析它的输出（见下）。
-非 Arch 系统上编译过不去，这也是有意的：这个工具箱里一半的动作本来就是 pacman / paru。
+**构建前提**（Arch 上一条命令装齐）：
+
+```bash
+sudo pacman -S --needed base-devel git rust pkgconf chafa
+```
+
+- `pacman`：提供 `libalpm.so` 与 `libalpm.pc`（Arch 上本来就有）。二进制**动态链接 libalpm** ——
+  包数据层是直连 pacman 的库，不是解析它的输出（见下）。非 Arch 系统上编译过不去，这也是有意的：
+  这个工具箱里一半的动作本来就是 pacman / paru。
+- `pkgconf` + **`chafa >= 1.8.0`**（pkg-config 名就叫 `chafa`）：`ratatui-image` 的 `build.rs`
+  用 pkg-config 探测它，缺了会直接报 `Failed to find chafa via pkg-config ... Needs version >= 1.8.0`。
+  本仓库在 `Cargo.toml` 里关了 `ratatui-image` 的默认 feature、只留 `crossterm`，所以这个探测目前
+  被 `#[cfg(feature = "chafa-dyn")]` 挡掉、二进制也不链接 `libchafa`（`ldd` 里没有它）；CI 与打包
+  仍然装上/声明它 —— 上游一旦改默认 feature、或 feature 被别的依赖合并进来，探测立刻变成构建硬失败。
+- `rust`、`base-devel`、`git`：编译工具链、链接器与拉源码。
 
 可选：`toolbox-hub [脚本目录]`（默认 `$FZF_FFTOOLS_BIN_DIR`，再默认 `~/.local/bin`）。
 

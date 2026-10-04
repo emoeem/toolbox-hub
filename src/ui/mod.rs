@@ -73,6 +73,52 @@ pub(crate) fn fit_hints(hints: &str, width: usize) -> String {
     fitted
 }
 
+/// 只画看得见的那几十行，返回窗口边界。
+///
+/// `Table::new` 会把传进去的行**全部** collect 成 Vec（ratatui 内部就是这么做的），
+/// 所以每次重画都得把所有行构造一遍。已安装列表在这台机器上是 2271 行 ——
+/// 按一次 ↓ 就重新分配上万次对象，滚动会发涩（空闲时更明显，实测空转 3~4% CPU，
+/// 脏标记已经把那部分解决了，剩下这个是给滚动提速的）。
+///
+/// 窗口跟着选区走：选区永远落在窗口里，所以渲染时用每帧现造的
+/// `TableState::with_selected(Some(selected - start))`，offset 保持 0。
+/// **渲染和鼠标命中必须用同一个函数**，否则「看到的行」和「点到的行」会差一屏。
+pub fn window(total: usize, selected: usize, height: u16) -> (usize, usize) {
+    let room = height.max(1) as usize;
+    if total <= room {
+        return (0, total);
+    }
+    let half = room / 2;
+    let start = selected.saturating_sub(half).min(total - room);
+    (start, start + room)
+}
+
+/// 主工具列表的表体能显示多少行（去掉上下边框与表头那一行）。
+///
+/// 渲染（ui::table）和鼠标命中（app::input）都用它 —— 两边各写一份的话，
+/// 改了一处就会「看到的行」和「点到的行」错位。
+pub fn main_rows_room(list: Rect) -> u16 {
+    list.height.saturating_sub(3)
+}
+
+/// 把「屏幕上第几行」换算成「列表里第几项」。
+///
+/// 渲染用 `window` 只画看得见的那一段，所以**命中必须加上窗口起点** ——
+/// 否则列表滚起来之后，点到的行和看到的行会差一屏。
+///
+/// 放在这里是为了让「画」和「点」用同一个函数：只要窗口化视野的 room 两边一致，
+/// 它们就不可能再漂移。
+pub fn windowed_index(
+    total: usize,
+    selected: usize,
+    room: u16,
+    visual_row: usize,
+) -> Option<usize> {
+    let (start, end) = window(total, selected, room);
+    let index = start + visual_row;
+    (index < end).then_some(index)
+}
+
 /// 把 `$HOME` 缩写成 `~`，让长路径在状态行与预览里放得下。
 pub(crate) fn short_path(path: &Path) -> String {
     let text = path.display().to_string();
@@ -1503,6 +1549,14 @@ mod repo_view_render_tests {
         let fixture = fixture();
         let mut app = app_with(RepositoryView::open(fixture.service.clone()).expect("open"));
         app.repository.as_mut().expect("view").ask_install();
+        // 计划在后台线程算：等确认面板出现。
+        for _ in 0..300 {
+            app.repository.as_mut().expect("view").poll();
+            if app.repository.as_ref().expect("view").confirm.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
             app.repository.as_ref().expect("view").confirm.is_some(),
             "应当出现确认面板"
@@ -1542,6 +1596,62 @@ mod repo_view_render_tests {
         assert!(
             text.contains("离线"),
             "要说明离线时本地工具照常可用：{text}"
+        );
+    }
+}
+
+/// 渲染窗口与鼠标命中的一致性。
+///
+/// 这一组钉住的是「滚动之后点错行」那类只有真跑起来才发现的 bug：
+/// 画的是 `window()` 那一段，点的也必须换算回同一段。
+#[cfg(test)]
+mod windowed_index_tests {
+    use super::{window, windowed_index};
+
+    #[test]
+    fn without_scrolling_the_screen_row_is_the_index() {
+        assert_eq!(windowed_index(100, 0, 10, 0), Some(0));
+        assert_eq!(windowed_index(100, 0, 10, 3), Some(3));
+        assert_eq!(windowed_index(3, 0, 10, 2), Some(2));
+    }
+
+    #[test]
+    fn a_short_list_needs_no_offset() {
+        assert_eq!(window(3, 2, 10), (0, 3));
+        assert_eq!(windowed_index(3, 2, 10, 0), Some(0));
+    }
+
+    #[test]
+    fn a_scrolled_list_maps_the_first_screen_row_to_the_window_start() {
+        let (start, end) = window(100, 50, 10);
+        assert_eq!((start, end), (45, 55));
+        assert_eq!(windowed_index(100, 50, 10, 0), Some(start));
+        assert_eq!(windowed_index(100, 50, 10, 9), Some(end - 1));
+        // 这正是旧代码会算错的地方：它把屏幕第 0 行当成第 0 项。
+        assert_ne!(windowed_index(100, 50, 10, 0), Some(0));
+    }
+
+    #[test]
+    fn a_row_outside_the_window_is_not_a_hit() {
+        assert_eq!(windowed_index(100, 50, 10, 10), None);
+        assert_eq!(windowed_index(3, 0, 10, 3), None);
+    }
+
+    #[test]
+    fn an_empty_list_has_no_hits() {
+        assert_eq!(windowed_index(0, 0, 10, 0), None);
+        assert_eq!(windowed_index(0, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn the_last_item_is_always_reachable() {
+        let total = 2271;
+        let room = 20;
+        let selected = total - 1;
+        let (start, _) = window(total, selected, room);
+        assert_eq!(
+            windowed_index(total, selected, room, selected - start),
+            Some(selected)
         );
     }
 }

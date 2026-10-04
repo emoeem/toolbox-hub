@@ -20,7 +20,7 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 运行边界
 
-这是一个 Arch Linux 优先的工具。Rust 二进制动态链接 `libalpm`，因此构建需要 `pacman` 提供的 `libalpm.so` 和 `libalpm.pc`，以及 `pkgconf`。包管理相关能力也依赖 pacman 数据库。
+这是一个 Arch Linux 优先的工具。Rust 二进制动态链接 `libalpm`，因此构建需要 `pacman` 提供的 `libalpm.so` 和 `libalpm.pc`，以及 `pkgconf`。`ratatui-image` 的 `build.rs` 还会用 pkg-config 探测 `chafa >= 1.8.0`（pkg-config 名就叫 `chafa`）：本仓库关了它的默认 feature（只留 `crossterm`），这个探测目前不生效，但 Arch 上仍按 `sudo pacman -S --needed base-devel git rust pkgconf chafa` 装齐（见 README 的「构建前提」）。包管理相关能力也依赖 pacman 数据库。
 
 系统中的外部命令是可选能力：缺少依赖时动作仍可以被发现，但会显示缺失状态和安装提示。只有实际执行对应动作时才需要安装它们。
 

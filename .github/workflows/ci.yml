@@ -15,11 +15,21 @@ on:
     - cron: "0 4 * * 1"
   workflow_dispatch:
 
+# 同一个分支连续 push 时，旧的那次直接取消：CI 只关心最新一次的结果。
+# 放在 workflow 级而不是每个 job —— 两个 job 用同一个 group 会互相取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   check:
+    # GITHUB_TOKEN 收窄到只读：不显式声明的话默认权限比这宽。
+    permissions:
+      contents: read
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
@@ -59,6 +69,9 @@ jobs:
   # ImageMagick 要求输入在前、ffmpeg 漏 -i 会把输入当输出…），所以别删。
   smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:

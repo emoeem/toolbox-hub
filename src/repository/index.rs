@@ -42,7 +42,10 @@
 //! 2. \`schema_version\` 不认识时**明确报错**，不 panic、不猜、不半读半不读。
 //!    用户会看到「这个仓库的 schema v2，本版本只认 v1」。
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -433,7 +436,7 @@ impl Index {
         }
 
         let mut kept = Vec::with_capacity(index.packages.len());
-        let mut claimed: Vec<String> = Vec::new();
+        let mut claimed: HashSet<String> = HashSet::new();
         for package in index.packages {
             if !package.extra.is_empty() {
                 let keys: Vec<&str> = package.extra.keys().map(String::as_str).collect();
@@ -461,7 +464,7 @@ impl Index {
                         warnings.push(format!("包 id 重复「{}」，只保留第一个", package.id));
                         continue;
                     }
-                    claimed.push(package.id.clone());
+                    claimed.insert(package.id.clone());
                     kept.push(package);
                 }
                 Err(problem) => warnings.push(format!("丢弃一个包：{problem}")),

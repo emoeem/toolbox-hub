@@ -104,7 +104,8 @@ impl UpdateCheck {
 
     /// 重新算一遍可升级数（只读本地账本与索引缓存，不联网）。
     fn recount(&mut self) {
-        self.upgradable = Some(self.service.update_candidates().0.len());
+        // 只数个数：造计划要逐文件哈希，启动路径上做不起。
+        self.upgradable = Some(self.service.update_count());
     }
 }
 

@@ -9,7 +9,9 @@
 //!
 //! [crate::repository::worker]: crate::repository::worker
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::repository::{
     cache::{self, CacheState, FetchResult},
@@ -103,6 +105,8 @@ pub struct RepositoryStatus {
 /// 服务：配置好了目录与仓库清单，之后每个操作都是自包含的。
 ///
 /// Clone 很便宜：只有配置与一个 ureq agent（内部是 Arc）—— 后台线程拿的是副本。
+/// 解析缓存（[`ServiceCache`]）也在 Arc 里：副本们共享同一份，谁刷新了磁盘，
+/// 谁的文件指纹就变了，另一边下次用的时候自动重解析。
 #[derive(Clone)]
 pub struct Service {
     pub repositories: Repositories,
@@ -111,6 +115,46 @@ pub struct Service {
     /// 读配置时踩到的问题（界面/CLI 决定要不要说一句）。
     pub config_problem: Option<String>,
     agent: ureq::Agent,
+    cache: Arc<ServiceCache>,
+}
+
+/// 一个仓库在缓存里的样子（[`ServiceCache`] 的条目）。
+struct IndexEntry {
+    config: RepositoryConfig,
+    index: Index,
+    state: CacheState,
+}
+
+#[derive(Default)]
+struct IndexesCache {
+    fingerprint: Vec<RepoFingerprint>,
+    entries: Vec<IndexEntry>,
+}
+
+/// 单个仓库缓存文件的指纹。带 inode：mtime 粒度粗（或被刻意回拨）时，
+/// 重写的文件也能被认出来。
+#[derive(PartialEq)]
+struct RepoFingerprint {
+    id: String,
+    index_file: Option<FileStamp>,
+    meta_file: Option<FileStamp>,
+}
+
+type FileStamp = (u128, u64, u64);
+
+#[derive(Default)]
+struct VersionsCache {
+    fingerprint: Vec<(String, Option<FileStamp>)>,
+    versions: HashMap<String, String>,
+}
+
+/// 服务内部的解析缓存：索引与账本的**解析结果**留在内存里，按键搜索只做
+/// 内存过滤。自校验：每次先用文件指纹（stat，微秒级）确认底层没变过，
+/// 变过就重解析 —— 所以刷新 / 安装 / 手工改文件都不需要谁记得来失效。
+#[derive(Default)]
+struct ServiceCache {
+    indexes: Mutex<Option<IndexesCache>>,
+    versions: Mutex<Option<VersionsCache>>,
 }
 
 /// 仓库 id 不认识时的那句话（带上「你是不是想找 X」）。
@@ -162,6 +206,7 @@ impl Service {
             cache_root: cache_dir.join("repositories"),
             config_problem: loaded.problem,
             agent: cache::agent(),
+            cache: Arc::new(ServiceCache::default()),
         }
     }
 
@@ -173,11 +218,111 @@ impl Service {
             cache_root,
             config_problem: None,
             agent: cache::agent(),
+            cache: Arc::new(ServiceCache::default()),
         }
     }
 
     fn data_dir(&self) -> &Path {
         &self.roots.data
+    }
+
+    // ── 解析缓存 ────────────────────────────────────────────────────────────
+    //
+    // 索引全文解析与账本 TOML 解析都是毫秒级起步的活，绝不能落在按键路径上。
+    // 缓存按「底层文件指纹」自校验：每次先用 stat（微秒级）确认文件没变过，
+    // 变过才重解析。所以刷新 / 安装 / 手工改文件都不需要谁记得来失效。
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        // 缓存只是优化：哪次 panic 把 Mutex 毒死了，也不该把整个界面卡死。
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 单个文件的指纹：(mtime 纳秒, 字节数, inode)。带 inode 是因为
+    /// 原子写是 rename 换文件，新文件的 mtime/size 都可能恰好和旧的相同。
+    fn file_stamp(path: &Path) -> Option<FileStamp> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        let nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        Some((nanos, metadata.len(), metadata.ino()))
+    }
+
+    fn indexes_fingerprint(&self) -> Vec<RepoFingerprint> {
+        self.repositories
+            .enabled()
+            .into_iter()
+            .map(|config| RepoFingerprint {
+                id: config.id.clone(),
+                index_file: Self::file_stamp(&cache::index_path(&self.cache_root, &config.id)),
+                meta_file: Self::file_stamp(&cache::meta_path(&self.cache_root, &config.id)),
+            })
+            .collect()
+    }
+
+    fn versions_fingerprint(&self) -> Vec<(String, Option<FileStamp>)> {
+        let Ok(read_dir) = std::fs::read_dir(installed::packages_dir(self.data_dir())) else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = read_dir
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let stamp = Self::file_stamp(&entry.path().join("installed.toml"));
+                (name, stamp)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// 拿到（必要时重建）已启用仓库的解析索引。守卫在返回的切片后面，
+    /// 用完即还，别存起来。
+    fn fresh_indexes<'a>(&self, cache: &'a mut Option<IndexesCache>) -> &'a [IndexEntry] {
+        let cache = cache.get_or_insert_with(IndexesCache::default);
+        let fingerprint = self.indexes_fingerprint();
+        if cache.fingerprint != fingerprint {
+            cache.fingerprint = fingerprint;
+            cache.entries = self.load_indexes();
+        }
+        &cache.entries
+    }
+
+    fn load_indexes(&self) -> Vec<IndexEntry> {
+        self.repositories
+            .enabled()
+            .into_iter()
+            .filter_map(|config| {
+                let cached = cache::load(&self.cache_root, &config.id)?;
+                if !cached.state.usable() {
+                    return None;
+                }
+                Some(IndexEntry {
+                    config: config.clone(),
+                    index: cached.index,
+                    state: cached.state,
+                })
+            })
+            .collect()
+    }
+
+    /// 拿到（必要时重建）已装包的版本表。同上，守卫别存。
+    fn fresh_versions<'a>(
+        &self,
+        cache: &'a mut Option<VersionsCache>,
+    ) -> &'a HashMap<String, String> {
+        let cache = cache.get_or_insert_with(VersionsCache::default);
+        let fingerprint = self.versions_fingerprint();
+        if cache.fingerprint != fingerprint {
+            cache.fingerprint = fingerprint;
+            cache.versions = installed::installed_versions(self.data_dir())
+                .into_iter()
+                .collect();
+        }
+        &cache.versions
     }
 
     // ── 仓库 ────────────────────────────────────────────────────────────────
@@ -225,25 +370,32 @@ impl Service {
     }
 
     /// 已启用仓库里能用的索引（含缓存）。
+    ///
+    /// 返回的是**克隆**：只读遍历请用搜索 / find 走的缓存路径，别为看一眼
+    /// 把整个索引复制一遍。
+    /// 只在测试里用：生产路径走 [`Self::find`] / [`Self::fresh_indexes()`]
+    /// （那两处不会把整份索引 clone 出来）。
+    #[cfg(test)]
     pub fn indexes(&self) -> Vec<(RepositoryConfig, Index, CacheState)> {
-        self.repositories
-            .enabled()
-            .into_iter()
-            .filter_map(|config| {
-                let cached = cache::load(&self.cache_root, &config.id)?;
-                if !cached.state.usable() {
-                    return None;
-                }
-                Some((config.clone(), cached.index, cached.state))
-            })
+        let mut guard = Self::lock(&self.cache.indexes);
+        self.fresh_indexes(&mut guard)
+            .iter()
+            .map(|entry| (entry.config.clone(), entry.index.clone(), entry.state))
             .collect()
+    }
+
+    /// 有没有任何一个已启用仓库带着可用的索引（比 `indexes().is_empty()` 便宜）。
+    pub fn has_indexes(&self) -> bool {
+        let mut guard = Self::lock(&self.cache.indexes);
+        !self.fresh_indexes(&mut guard).is_empty()
     }
 
     /// 找一个包：按仓库优先级取第一个命中的（和安装顺序一致）。
     pub fn find(&self, id: &str) -> Option<(RepositoryConfig, PackageMeta, CacheState)> {
-        for (config, index, state) in self.indexes() {
-            if let Some(meta) = index.find(id) {
-                return Some((config, meta.clone(), state));
+        let mut guard = Self::lock(&self.cache.indexes);
+        for entry in self.fresh_indexes(&mut guard) {
+            if let Some(meta) = entry.index.find(id) {
+                return Some((entry.config.clone(), meta.clone(), entry.state));
             }
         }
         None
@@ -254,19 +406,25 @@ impl Service {
     /// 在已启用仓库的索引里搜索。
     ///
     /// 索引来自**本地缓存**：输入一个字母就联网是绝对不能接受的。
+    /// 解析结果留在内存里（见 [`ServiceCache`]），这里只做内存过滤。
     pub fn search(&self, query: &str, scope: SearchScope) -> Vec<PackageHit> {
         let needle = query.trim().to_lowercase();
-        let installed = installed::installed_versions(self.data_dir());
+        let mut indexes_guard = Self::lock(&self.cache.indexes);
+        let entries = self.fresh_indexes(&mut indexes_guard);
+        let mut versions_guard = Self::lock(&self.cache.versions);
+        let installed = self.fresh_versions(&mut versions_guard);
         let mut hits: Vec<PackageHit> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
 
-        for (config, index, state) in self.indexes() {
+        for entry in entries {
+            let (config, index, state) = (&entry.config, &entry.index, entry.state);
             for meta in &index.packages {
                 if !meta.matches(&needle) {
                     continue;
                 }
                 // 同一个包在多个仓库里出现时，优先级高的仓库先被看到 ——
                 // 后来的同名包直接跳过，避免列表里出现两条一样的。
-                if hits.iter().any(|hit| hit.id == meta.id) {
+                if !seen.insert(meta.id.as_str()) {
                     continue;
                 }
                 let installed_version = installed.get(&meta.id).cloned();
@@ -318,22 +476,24 @@ impl Service {
 
     /// 为一个包造安装计划。
     pub fn plan(&self, id: &str) -> Result<InstallPlan, String> {
-        let Some((config, meta, _)) = self.find(id) else {
-            let hint = crate::repository::suggest::did_you_mean(
-                id,
-                self.indexes()
-                    .iter()
-                    .flat_map(|(_, index, _)| index.packages.iter())
-                    .map(|package| package.id.as_str()),
-            );
-            return Err(match hint {
-                Some(hint) => {
-                    format!("在已启用的仓库里找不到「{id}」—— {hint}（没取过索引先 repo update）")
-                }
-                None => format!("在已启用的仓库里找不到「{id}」（先 repo update）"),
-            });
-        };
-        install::plan(&meta, &config, &self.roots)
+        if let Some((config, meta, _)) = self.find(id) {
+            return install::plan(&meta, &config, &self.roots);
+        }
+        let mut guard = Self::lock(&self.cache.indexes);
+        let hint = crate::repository::suggest::did_you_mean(
+            id,
+            self.fresh_indexes(&mut guard)
+                .iter()
+                .flat_map(|entry| entry.index.packages.iter())
+                .map(|package| package.id.as_str()),
+        );
+        drop(guard);
+        Err(match hint {
+            Some(hint) => {
+                format!("在已启用的仓库里找不到「{id}」—— {hint}（没取过索引先 repo update）")
+            }
+            None => format!("在已启用的仓库里找不到「{id}」（先 repo update）"),
+        })
     }
 
     /// 执行一个已经确认过的计划。
@@ -352,12 +512,26 @@ impl Service {
 
     /// 算可升级的包。
     pub fn update_candidates(&self) -> (Vec<UpdateCandidate>, Vec<String>) {
+        let mut guard = Self::lock(&self.cache.indexes);
         let indexes: Vec<(RepositoryConfig, Index)> = self
-            .indexes()
-            .into_iter()
-            .map(|(config, index, _)| (config, index))
+            .fresh_indexes(&mut guard)
+            .iter()
+            .map(|entry| (entry.config.clone(), entry.index.clone()))
             .collect();
+        drop(guard);
         install::update_candidates(self.data_dir(), &self.roots, &indexes)
+    }
+
+    /// 数「有几个包有新版」。不造计划、不哈希文件 —— 给启动时的可升级徽标用。
+    pub fn update_count(&self) -> usize {
+        let mut guard = Self::lock(&self.cache.indexes);
+        let indexes: Vec<&Index> = self
+            .fresh_indexes(&mut guard)
+            .iter()
+            .map(|entry| &entry.index)
+            .collect();
+        // 借用着缓存里的索引，守卫得活到调用结束。
+        install::update_count(self.data_dir(), &indexes)
     }
 
     /// 装一个包（CLI 的一步到位路径：计划 → 检查 → 安装）。

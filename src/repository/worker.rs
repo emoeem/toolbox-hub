@@ -25,6 +25,8 @@ pub enum Request {
     Refresh(String),
     /// 刷新全部已启用的仓库。
     RefreshAll,
+    /// 算一个安装计划（摆确认面板用）。
+    Plan { id: String, upgrading: bool },
     /// 执行一个已经确认过的安装计划。
     Install {
         plan: Box<InstallPlan>,
@@ -34,12 +36,24 @@ pub enum Request {
     Uninstall { id: String, purge_modified: bool },
     /// 升级：重新取计划再装（不要拿界面里那份可能已经过期的计划）。
     Upgrade { id: String, allow_unverified: bool },
+    /// 服务换新了（改过仓库配置）：后台线程别再用启动时那份旧的。
+    SetService(Service),
 }
 
 /// 后台线程的回应。
 pub enum Response {
     Refreshed(FetchResult),
     RefreshFinished(Vec<FetchResult>),
+    /// 计划算好了（要不要按「升级」摆面板，跟着请求带回来）。
+    Planned {
+        id: String,
+        upgrading: bool,
+        /// 计划算好了（要不要按「升级」摆面板，跟着请求带回来）。
+        ///
+        /// 装箱是因为它比别的变体大一个数量级（约 529B 对 8B）：不装的话每个
+        /// Response 都要按最大变体算大小，队列里排几百条就是白占几百 KB。
+        outcome: Result<Box<InstallPlan>, String>,
+    },
     Installed {
         id: String,
         outcome: Result<InstallReport, String>,
@@ -55,6 +69,8 @@ pub enum Response {
     },
     /// 正在做什么（长任务先报一句，界面立刻有反馈）。
     Progress(String),
+    /// 后台线程没了（崩了或者提前退出）。只报一次。
+    ThreadGone,
 }
 
 /// 常驻的后台线程。
@@ -62,6 +78,8 @@ pub struct RepositoryWorker {
     requests: Sender<Request>,
     responses: Receiver<Response>,
     handle: Option<JoinHandle<()>>,
+    /// 线程死亡报过没有（ThreadGone 只发一次）。
+    reported_gone: std::cell::Cell<bool>,
 }
 
 impl RepositoryWorker {
@@ -79,6 +97,7 @@ impl RepositoryWorker {
             requests: request_tx,
             responses: response_rx,
             handle: Some(handle),
+            reported_gone: std::cell::Cell::new(false),
         })
     }
 
@@ -94,6 +113,14 @@ impl RepositoryWorker {
 
     pub fn refresh_all(&self) -> Result<(), String> {
         self.send(Request::RefreshAll)
+    }
+
+    pub fn plan(&self, id: String, upgrading: bool) -> Result<(), String> {
+        self.send(Request::Plan { id, upgrading })
+    }
+
+    pub fn set_service(&self, service: Service) -> Result<(), String> {
+        self.send(Request::SetService(service))
     }
 
     pub fn install(&self, plan: InstallPlan, allow_unverified: bool) -> Result<(), String> {
@@ -118,26 +145,37 @@ impl RepositoryWorker {
     pub fn try_recv(&self) -> Option<Response> {
         match self.responses.try_recv() {
             Ok(response) => Some(response),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => None,
+            // 线程死了不能当成「暂时没消息」：界面会永远停在「进行中」。
+            // 只报一次，别每帧刷屏。
+            Err(TryRecvError::Disconnected) if !self.reported_gone.replace(true) => {
+                Some(Response::ThreadGone)
+            }
+            Err(TryRecvError::Disconnected) => None,
         }
     }
 }
 
 impl Drop for RepositoryWorker {
     fn drop(&mut self) {
-        // 丢掉发送端，线程收到断开就退出；再等它一下 —— 不然它可能正在写文件，
-        // 进程却已经走人了。
+        // 丢掉发送端：线程跑完**手里这一件**活就退出。这里刻意不 join ——
+        // 下载上限 256MB，按 q 退出不该陪它等完；写盘的原子性由
+        // atomic::write 保证，进程走到哪儿都不会留半截文件。
         let (dead, _) = mpsc::channel::<Request>();
         let _ = std::mem::replace(&mut self.requests, dead);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // JoinHandle 就地丢弃（分离）：进程还在的话它会自己收尾，进程退出
+        // 的话所有线程本来就会终止。
+        self.handle = None;
     }
 }
 
-fn run(service: Service, requests: Receiver<Request>, responses: Sender<Response>) {
+fn run(mut service: Service, requests: Receiver<Request>, responses: Sender<Response>) {
     while let Ok(request) = requests.recv() {
         let sent = match request {
+            Request::SetService(updated) => {
+                service = updated;
+                Ok(())
+            }
             Request::Refresh(id) => {
                 let _ = responses.send(Response::Progress(format!("正在刷新仓库 {id}…")));
                 match service.refresh(&id) {
@@ -158,6 +196,15 @@ fn run(service: Service, requests: Receiver<Request>, responses: Sender<Response
             Request::RefreshAll => {
                 let _ = responses.send(Response::Progress(String::from("正在刷新全部仓库…")));
                 responses.send(Response::RefreshFinished(service.refresh_all()))
+            }
+            Request::Plan { id, upgrading } => {
+                // 装箱塞进 Response：见 Response::Planned 上的说明。
+                let outcome = service.plan(&id).map(Box::new);
+                responses.send(Response::Planned {
+                    id,
+                    upgrading,
+                    outcome,
+                })
             }
             Request::Install {
                 plan,
@@ -334,9 +381,9 @@ mod tests {
         std::fs::remove_dir_all(&base).expect("cleanup");
     }
 
-    /// 线程是有主的：丢掉 worker 就该把它收回来。
+    /// 线程是有主的：丢掉 worker，线程跑完手里的活自己退出（不陪它等）。
     #[test]
-    fn dropping_the_worker_joins_its_thread() {
+    fn dropping_the_worker_lets_the_thread_finish_on_its_own() {
         let base = temp("drop");
         let worker = RepositoryWorker::start(service(&base)).expect("start");
         drop(worker);

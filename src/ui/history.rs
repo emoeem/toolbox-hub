@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::{app::App, ui::theme};
+use crate::{app::App, ui::theme, ui::window};
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(view) = app.history.as_ref() else {
@@ -41,7 +41,10 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     ])
     .style(Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
 
-    let rows = view.entries.iter().map(|entry| {
+    let rows_room = inner.height.saturating_sub(1); // 表头占一行
+    let (start, end) = window(view.entries.len(), view.selected, rows_room);
+    let selected = view.selected.min(view.entries.len().saturating_sub(1));
+    let rows = view.entries[start..end].iter().map(|entry| {
         let status_style = if entry.success {
             Style::default().fg(theme::GREEN)
         } else {
@@ -74,6 +77,6 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     .highlight_symbol("▸ ");
 
     // 高亮完全由 `view.selected` 决定，每帧现造一个 TableState 就够了。
-    let mut state = TableState::default().with_selected(Some(view.selected));
+    let mut state = TableState::default().with_selected(Some(selected - start));
     frame.render_stateful_widget(table, inner, &mut state);
 }
