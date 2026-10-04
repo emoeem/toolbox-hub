@@ -614,7 +614,9 @@ fn hit_line(hit: &PackageHit) -> String {
 fn package_op(operation: PackageOperation, names: &[String], dry_run: bool) -> Result<(), String> {
     // 队列里有没有 AUR？CLI 没法从队列里知道，只能问一次「这个名字在同步库里吗」。
     // 宁可多问一次也别默认用 pacman：AUR 包用 pacman 装只会得到一句「找不到目标」。
-    let uses_aur = names.iter().any(|name| is_aur_only(name));
+    // 句柄只开一次：Db::open() 要读 pacman 的本地库，一个名字开一次就是一次冷启动。
+    let db = Db::open().ok();
+    let uses_aur = names.iter().any(|name| is_aur_only(db.as_ref(), name));
     let (program, argv) = packages::escalate(operation.program(uses_aur), &operation.argv(names));
     execute(&program, &argv, dry_run, operation.label())
 }
@@ -624,11 +626,13 @@ fn package_op(operation: PackageOperation, names: &[String], dry_run: bool) -> R
 /// 查的是 libalpm（本地数据库），不起 `pacman -Ss` 进程 —— 这也是「装的时候用
 /// pacman 还是 paru」的判断依据。库打不开就当它不是 AUR 包（宁可让 pacman 报错，
 /// 也不要莫名其妙把活派给 paru）。
-fn is_aur_only(name: &str) -> bool {
-    Db::open()
-        .and_then(|db| db.search(name))
-        .map(|hits| !hits.iter().any(|hit| hit.name == name))
-        .unwrap_or(false)
+fn is_aur_only(db: Option<&Db>, name: &str) -> bool {
+    // 官方源包名表在 Db 里只建一次并缓存（sync_names），所以一条命令问多少个
+    // 名字都只付一次代价 —— 以前是一个名字开一次库（`-i a b c` 实测三次冷启动）。
+    //
+    // 库打不开就当它不是 AUR 包：宁可让 pacman 报一句「找不到目标」，
+    // 也不要莫名其妙把活派给 paru（那会去网上找，代价大得多）。
+    db.is_some_and(|db| !db.sync_names().contains(name))
 }
 
 fn execute(program: &str, argv: &[String], dry_run: bool, what: &str) -> Result<(), String> {

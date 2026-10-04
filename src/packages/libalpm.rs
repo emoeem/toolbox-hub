@@ -462,7 +462,11 @@ impl Db {
     }
 
     /// 同步库里出现过的包名（外来包判定）。要 365ms，所以只算一次。
-    fn sync_names(&self) -> &HashSet<String> {
+    /// 官方源里的包名（只建一次并缓存）。
+    ///
+    /// 公开给 CLI 用：判斷「这个名字只有 AUR 有」时，一次开会话就能问完所有名字，
+    /// 不必一个名字开一次库。
+    pub(crate) fn sync_names(&self) -> &HashSet<String> {
         self.sync_name_set.get_or_init(|| {
             self.handle
                 .syncdbs()

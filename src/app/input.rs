@@ -908,7 +908,10 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
         KeyCode::Right => app.query.right(),
         KeyCode::Home => app.query.home(),
         KeyCode::End => app.query.end(),
-        KeyCode::Char(c) => {
+        // Ctrl 组合键不落进查询框：以前 Ctrl-W / Ctrl-U / Ctrl-C 会把控制字符插进去，
+        // 屏幕上什么都看不出来，过滤却再也匹配不上（本文件别处早有这个守卫，只有这里漏了）。
+        // 想取消搜索按 Esc。
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.query.insert(c);
             app.selected = 0;
             app.apply_filter();
@@ -1622,5 +1625,69 @@ mod mouse_row_tests {
         assert_eq!(package_queue_row(results, Position::new(5, 8)), None);
         assert_eq!(package_queue_row(results, Position::new(6, 9)), Some(0));
         assert_eq!(package_queue_row(results, Position::new(6, 10)), Some(1));
+    }
+}
+
+/// 搜索框里的按键。
+#[cfg(test)]
+mod search_key_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::registry::{Registry, ReloadReport};
+
+    fn app() -> App {
+        let mut app = App::new(
+            Registry::from_tools(Vec::new()),
+            PathBuf::from("/tmp/bin"),
+            ReloadReport::default(),
+        );
+        app.searching = true;
+        app
+    }
+
+    /// Ctrl 组合键不该落进查询框：以前插进去的是控制字符，界面看不出来，
+    /// 但过滤从此再也匹配不上 —— 只有真按过才会发现。
+    #[test]
+    fn a_ctrl_combo_does_not_land_in_the_query() {
+        let mut app = app();
+        for ch in ['w', 'u', 'c', 'a'] {
+            handle_search_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL),
+            );
+        }
+        assert!(
+            app.query.text().is_empty(),
+            "查询框被污染了：{:?}",
+            app.query.text()
+        );
+    }
+
+    /// 普通字符照样能打（守卫别把正常输入也挡了）。
+    #[test]
+    fn a_plain_character_still_types() {
+        let mut app = app();
+        for ch in ['抽', '帧'] {
+            handle_search_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.query.text(), "抽帧");
+    }
+
+    /// Esc 仍然是「取消搜索并清空」。
+    #[test]
+    fn escape_still_clears_the_query() {
+        let mut app = app();
+        handle_search_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.query.text(), "x");
+        handle_search_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.query.text().is_empty());
+        assert!(!app.searching, "Esc 之后应当退出搜索态");
     }
 }

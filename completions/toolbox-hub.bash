@@ -58,11 +58,18 @@ _toolbox_hub_pacman() {
     fi
 }
 
-# 把候选词按前缀筛进 COMPREPLY。
+# 把候选词按前缀筛进 COMPREPLY；顺手去重（同一个 id 可能出现在多个仓库里，
+# -i/-r 的 pacman 包名也会「仓库一个、本地一个」各来一次）。
 _toolbox_hub_values() {
-    local words="$1" cur="$2"
+    local words="$1" cur="$2" w
+    local -A seen=()
     COMPREPLY=()
-    mapfile -t COMPREPLY < <(compgen -W "$words" -- "$cur")
+    while IFS= read -r w; do
+        [ -n "$w" ] || continue
+        [ -n "${seen[$w]:-}" ] && continue
+        seen[$w]=1
+        COMPREPLY+=("$w")
+    done < <(compgen -W "$words" -- "$cur")
 }
 
 # 目录候选（位置参数可以是「脚本目录」，check/build 也要目录）。
@@ -73,11 +80,9 @@ _toolbox_hub_dirs() {
     compopt -o filenames 2>/dev/null || true
 }
 
-# 工具包 id 候选。
+# 工具包 id 候选（同样经过去重）。
 _toolbox_hub_tool_ids() {
-    local cur="$1"
-    COMPREPLY=()
-    mapfile -t COMPREPLY < <(compgen -W "$(_toolbox_hub_ids)" -- "$cur")
+    _toolbox_hub_values "$(_toolbox_hub_ids)" "$1"
 }
 
 _toolbox_hub() {
