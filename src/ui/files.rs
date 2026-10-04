@@ -121,7 +121,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Constraint::Min(20),
         ],
     )
-    .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
+    .row_highlight_style(theme::selected_row())
     .highlight_symbol("➤ ");
 
     let mut state = TableState::default().with_selected(Some(view.selected.saturating_sub(start)));

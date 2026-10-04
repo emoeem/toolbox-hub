@@ -2,6 +2,11 @@
 name = "toolbox-hub"
 version = "0.1.0"
 edition = "2024"
+# MSRV：实际依赖里要得最高的是 ratatui-image → icy_sixel → quantette 0.6 /
+# ordered-float 5.5（1.90）。edition 2024 本身只要 1.85，ratatui 0.30.2 要 1.88，
+# 都低于它。写 1.90 而不是 1.85：edition 2024 的解析器是 MSRV 感知的，rust-version
+# 就是它挑依赖版本的下限，标成 1.85 会在 1.85~1.89 的工具链上解出一个编不过的锁。
+rust-version = "1.90"
 description = "Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管理（直连 libalpm）"
 license = "MIT"
 repository = "https://github.com/emoeem/toolbox-hub"
@@ -14,7 +19,12 @@ alpm = "5"
 # 结果既慢又多一个可能不存在的程序。
 libc = "0.2"
 crossterm = "0.29"
-ratatui = "0.30"
+# 关掉默认 feature：0.30 的默认是 crossterm + all-widgets（→ widget-calendar → time）
+# + layout-cache + macros（→ ratatui-macros）+ underline-color。本项目只用 crossterm
+# 后端，不画日历、不用 ratatui 的 constraint!/layout! 宏、也没设过下划线颜色，
+# 关掉这些能少编译 time / ratatui-macros / indoc 一串。
+# 注意 termwiz/termina 从来就不在默认 feature 里（那是可选后端，默认没开）。
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # AUR / 新闻的 HTTP 客户端：进程内复用连接。

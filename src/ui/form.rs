@@ -129,7 +129,7 @@ pub fn draw_fields(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     )
     .header(header)
     .block(block)
-    .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
+    .row_highlight_style(theme::selected_row())
     .highlight_symbol("▸ ");
 
     // 高亮完全由 `form.field` 决定，所以每帧现造一个 TableState 就够了。

@@ -113,7 +113,7 @@ pub fn draw(frame: &mut ratatui::Frame, picker: &Picker, area: Rect) {
         });
 
     let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(10)])
-        .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
+        .row_highlight_style(theme::selected_row())
         .highlight_symbol("➤ ");
 
     let mut state =

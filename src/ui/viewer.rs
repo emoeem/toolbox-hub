@@ -27,7 +27,7 @@ pub fn draw(frame: &mut ratatui::Frame, viewer: &Viewer, area: Rect) {
         return;
     };
 
-    let total = viewer.body.lines().count();
+    let total = viewer.lines;
     let visible = body.height as usize;
     let max_scroll = total.saturating_sub(visible);
     let scroll = viewer.scroll.min(max_scroll);
@@ -61,8 +61,10 @@ pub fn draw(frame: &mut ratatui::Frame, viewer: &Viewer, area: Rect) {
         head,
     );
 
+    // 借用而不是 clone：正文是整段捕获输出，几百 KB 也不稀奇，每帧克隆一次
+    // 等于每帧白烧一份内存（Paragraph 只需要 Into<Text>，&str 就够）。
     frame.render_widget(
-        Paragraph::new(viewer.body.clone())
+        Paragraph::new(viewer.body.as_str())
             .scroll((scroll as u16, viewer.horizontal_scroll))
             .style(Style::default().fg(theme::TEXT)),
         body,

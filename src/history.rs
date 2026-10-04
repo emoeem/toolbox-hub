@@ -256,18 +256,36 @@ pub(crate) fn append_to(file: &Path, entry: &Entry) -> io::Result<()> {
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
     }
+    let line = entry.line();
 
-    let mut lines: Vec<String> = fs::read_to_string(file)
-        .unwrap_or_default()
+    // 没满就**只追加这一行**。
+    //
+    // 以前是「读全文 → 拼一行 → 重写全文」，每跑一次工具都要重写一遍整个历史
+    // （500 条时约 100KB）。跑工具本来就该是「写一行」这么简单的事。
+    //
+    // 这里读一次只是为了数行数 —— 读比「读 + 截断 + 全量写」便宜，而且能保证
+    // 「最多 MAX_ENTRIES 条」这个语义一点不变。数行数不需要解析。
+    let existing = match fs::read_to_string(file) {
+        Ok(text) => text.lines().count(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    if existing < MAX_ENTRIES {
+        let mut handle = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)?;
+        return writeln!(handle, "{line}");
+    }
+
+    // 满了才重写一次（保留最近 MAX_ENTRIES 条）。
+    let mut lines: Vec<String> = fs::read_to_string(file)?
         .lines()
         .map(str::to_string)
         .collect();
-    lines.push(entry.line());
-
-    if lines.len() > MAX_ENTRIES {
-        let keep_from = lines.len() - MAX_ENTRIES;
-        lines.drain(..keep_from);
-    }
+    lines.push(line);
+    let keep_from = lines.len().saturating_sub(MAX_ENTRIES);
+    lines.drain(..keep_from);
 
     let mut text = lines.join("\n");
     text.push('\n');

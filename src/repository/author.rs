@@ -34,6 +34,7 @@ use crate::{
         install::{self, sha256_file},
         paths,
     },
+    util::path::{command_available, is_executable},
 };
 
 /// 包元数据文件名。
@@ -1038,29 +1039,9 @@ fn archive_digests(path: &Path) -> Result<std::collections::BTreeMap<String, Str
     Ok(out)
 }
 
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .map(|meta| meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
-/// 命令在不在 PATH 上。
-fn command_available(command: &str) -> bool {
-    if command.contains('/') {
-        return Path::new(command).is_file();
-    }
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file()))
-        .unwrap_or(false)
-}
+// `is_executable` / `command_available` 搬去了 [`crate::util::path`]：全项目
+// 只有那一份 PATH 查找（执行层、Provider 元数据层、这里共用同一套边界）。
+// 以前这里判「是文件」、那边判「带执行位」，同一个依赖会出现两处结论不一致。
 
 // ── 脚手架 ──────────────────────────────────────────────────────────────────
 

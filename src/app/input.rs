@@ -468,6 +468,11 @@ pub fn handle_key(
                 }
             }
             KeyCode::Enter => app.files_enter(),
+            // 强制重扫这个目录：平时打开视图是复用已有结果的。
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.reload_files();
+                app.message = String::from("已重新扫描这个目录");
+            }
             KeyCode::Backspace => app.files_backspace(),
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.files_push(ch);

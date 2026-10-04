@@ -342,7 +342,7 @@ fn plan_with(
         if command.is_empty() {
             continue;
         }
-        if !command_available(&command) {
+        if !crate::util::path::command_available(&command) {
             missing_dependencies.push(command.clone());
             if let Some(hint) = &dependency.hint {
                 dep_hints.push((command.clone(), hint.clone()));
@@ -546,16 +546,6 @@ fn conflict_for(
             }
         }
     }
-}
-
-/// 命令在不在 PATH 上。
-fn command_available(command: &str) -> bool {
-    if command.contains('/') {
-        return Path::new(command).is_file();
-    }
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file()))
-        .unwrap_or(false)
 }
 
 // ── 执行 ────────────────────────────────────────────────────────────────────
@@ -1764,10 +1754,16 @@ mod tests {
 
     #[test]
     fn command_availability_handles_paths_and_bare_names() {
-        assert!(command_available("sh"));
-        assert!(command_available("/bin/sh"));
-        assert!(!command_available("definitely-not-a-real-command-xyz"));
-        assert!(!command_available("/definitely/not/here"));
+        // 走共享实现（src/util/path.rs）：以前这里自己扫 PATH 而且只看 is_file()，
+        // 一个「存在但没有可执行位」的文件会被当成依赖已满足。
+        assert!(crate::util::path::command_available("sh"));
+        assert!(crate::util::path::command_available("/bin/sh"));
+        assert!(!crate::util::path::command_available(
+            "definitely-not-a-real-command-xyz"
+        ));
+        assert!(!crate::util::path::command_available(
+            "/definitely/not/here"
+        ));
     }
 
     #[test]

@@ -93,7 +93,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .block(theme::panel(" 工具 "))
-        .row_highlight_style(Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT))
+        .row_highlight_style(theme::selected_row())
         .highlight_symbol("▸ ");
 
     let mut state = TableState::default().with_selected(Some(selected - start));

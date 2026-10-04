@@ -580,8 +580,23 @@ impl PackageView {
 
     fn handle(&mut self, response: Response) {
         match response {
-            Response::AllPackages(hits) => {
+            // 后台线程没了（panic 或提前退出）：不能一直停在「进行中」。
+            // 已经拿到的结果照样能看，所以只提示、不清空。
+            Response::ThreadGone => {
                 self.loading_all = false;
+                self.awaiting_official = false;
+                self.awaiting_aur = false;
+                self.message =
+                    String::from("包中心的后台线程已经退出（请重启程序）—— 之前的结果仍然可以看");
+            }
+            Response::AllPackages(mut hits) => {
+                self.loading_all = false;
+                // **在这里排一次**（名字序）。
+                //
+                // 以前是每次 rebuild_hits 都对全库重排一遍 —— 三万个包、字符串比较，
+                // 而且浏览时每走一次「重建」路径就要再付一次。排序只依赖名字与仓库，
+                // 与界面状态无关，所以到达时排一次就够，之后谁也不用再管顺序。
+                hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.repo.cmp(&b.repo)));
                 self.all_hits = hits;
                 // 用户已经开始搜了就别拿全库覆盖搜索结果
                 if self.searched.is_none() {
@@ -803,6 +818,9 @@ impl PackageView {
 
         // 浏览模式（还没按过 Enter）：铺全库；搜过之后：铺搜索结果
         let browsing = self.searched.is_none();
+        // 浏览时直接抄那一份**已经排好序**的全库（见 AllPackages 的处理）；
+        // 这笔克隆是 O(n) 的字符串搬运，而重排是 O(n log n) 的字符串比较 ——
+        // 去掉了后者才是这条路上真正的开销。
         let mut hits: Vec<PackageHit> = if browsing {
             self.all_hits.clone()
         } else {
@@ -821,10 +839,9 @@ impl PackageView {
             .trim_start_matches('^')
             .trim_end_matches('$')
             .to_string();
-        if browsing {
-            // 浏览全库时按名字排（搜索那种「相关的排前」在全库上没有意义）
-            hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.repo.cmp(&b.repo)));
-        } else {
+        if !browsing {
+            // 浏览态的顺序在 AllPackages 到达时就定好了，这里不动它。
+            // 搜索态才需要「相关的排前」——那在全库浏览上没有意义。
             hits.sort_by(|a, b| {
                 let exact = |hit: &PackageHit| hit.name.eq_ignore_ascii_case(&needle) as u8;
                 b.is_installed()

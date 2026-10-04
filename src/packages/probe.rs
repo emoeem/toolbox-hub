@@ -162,13 +162,12 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|error| format!("打不开浏览器（{opener}）：{error}"))
 }
 
-/// 扫 `PATH` 判断命令在不在。
+/// 命令在不在 `PATH` 上。
 ///
-/// 不走 `sh -c 'command -v …'`：后者每次要 spawn 一个 shell（约 20ms），而这里
-/// 只是给「更新 / 清缓存」挑条路，不值得多花那个钱。
+/// 走共享实现（`src/util/path.rs`）：它查的是「存在 **且可执行**」，
+/// 而不是「有这个文件」—— 一个存在但没有可执行位的文件不该被当成可用命令。
 fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+    crate::util::path::command_available(name)
 }
 
 /// `paru` 在不在（系统更新走 `paru -Syu` 才能把 AUR 包一起升上去）。

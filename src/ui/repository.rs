@@ -16,7 +16,7 @@ use crate::{
         repo_view::{Confirm, RepoMode, RepositoryView},
     },
     repository::{cache::CacheState, config::Trust},
-    ui::theme,
+    ui::{overlay, theme},
 };
 
 /// 详情区固定留几行。
@@ -395,12 +395,8 @@ fn draw_confirm(frame: &mut ratatui::Frame, view: &RepositoryView, confirm: &Con
     let plan = &confirm.plan;
     let height = area.height.saturating_sub(2).clamp(8, 16);
     let width = area.width.saturating_sub(6).clamp(30, 92);
-    let box_area = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
+    // 宽高按终端面积夹（跟帮助页按内容夹不是一回事），居中的那一步才共用。
+    let box_area = overlay::centered_rect(area, width, height);
     frame.render_widget(Clear, box_area);
 
     let action = if confirm.upgrading {

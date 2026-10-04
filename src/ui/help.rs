@@ -4,14 +4,17 @@
 //! 需要有个能查的地方。**这里是键位的唯一权威**，改键位就改这里。
 
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{app::App, ui::theme};
+use crate::{
+    app::App,
+    ui::{overlay, theme},
+};
 
 /// 帮助内容：一个模式一段。
 const SECTIONS: &[(&str, &[(&str, &str)])] = &[
@@ -168,12 +171,8 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
     // 居中的浮层，别铺满 —— 一眼能看出这是「盖在上面的一层」。
     let width = area.width.saturating_sub(8).min(76);
     let height = area.height.saturating_sub(4).min(total_lines() as u16 + 4);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    // 居中的那一步走 overlay：宽高还是按内容/上限夹（语义不同，没合并）。
+    let popup = overlay::centered_rect(area, width, height);
 
     // 先把底下那层清掉，否则会透过来。
     frame.render_widget(Clear, popup);

@@ -26,6 +26,7 @@ mod repository;
 mod runtime;
 mod state;
 mod ui;
+mod util;
 
 use std::{env, io, path::PathBuf, time::Duration};
 

@@ -38,6 +38,15 @@ pub fn title_style() -> Style {
     Style::default().fg(PURPLE).add_modifier(Modifier::BOLD)
 }
 
+/// 表格里「当前选中行」的高亮：HIGHLIGHT 底 + 正文色。
+///
+/// 只表达「这一行被选中」这一件事。焦点不在表上时各处的退化方式**并不一样**
+/// （包管理结果表只去掉底色、安装清单干脆什么都不加），那是刻意的差异，
+/// 所以那两处只共用这个函数的高亮分支，不要顺手把 else 也统一掉。
+pub fn selected_row() -> Style {
+    Style::default().bg(HIGHLIGHT).fg(TEXT)
+}
+
 /// 域的代表色，用于 Tabs 与详情区。
 pub fn domain_color(domain: Domain) -> Color {
     match domain {

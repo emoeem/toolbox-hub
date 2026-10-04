@@ -26,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -85,6 +86,12 @@ pub enum Response {
         search_id: u64,
         hits: Vec<PackageHit>,
     },
+    /// 两个常驻线程都退出了（panic 或提前返回）——**只发一次**。
+    ///
+    /// 和 repository::worker 的 ThreadGone 同语义。这里不能靠「通道断开」判断：
+    /// Worker 自己握着 `tx`（给一次性任务用），所以 rx 永远不会 Disconnected。
+    /// 改由两个线程各自退出时递减计数，最后一个退出的那个报一次。
+    ThreadGone,
     /// 某一路失败了（`source` 是「官方源」或「AUR」）。
     Failed {
         source: &'static str,
@@ -131,6 +138,8 @@ pub struct Worker {
     rx: Receiver<Response>,
     /// 一次性任务（PKGBUILD 这类）用它起**独立**线程，见 Worker::pkgbuild。
     tx: Sender<Response>,
+    /// 收到过 ThreadGone 没有（只报一次，别每帧刷屏）。
+    gone: std::cell::Cell<bool>,
     /// 本地已装包的 名字 → 版本：数据库线程写，网络线程读（给 AUR 命中标状态）。
     /// 界面自己不需要它，所以这里只留一个名字占位，避免字段被当成没用的东西删掉。
     _local: Arc<RwLock<HashMap<String, String>>>,
@@ -145,14 +154,17 @@ impl Worker {
         let (tx, rx) = mpsc::channel();
         let local: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        let db_tx = spawn_db(tx.clone(), Arc::clone(&local))?;
-        let net_tx = spawn_net(tx.clone(), Arc::clone(&local))?;
+        // 谁最后退出，谁就报一次「后台没了」。
+        let live = Arc::new(AtomicUsize::new(2));
+        let db_tx = spawn_db(tx.clone(), Arc::clone(&local), Arc::clone(&live))?;
+        let net_tx = spawn_net(tx.clone(), Arc::clone(&local), Arc::clone(&live))?;
 
         Ok(Self {
             db_tx,
             net_tx,
             rx,
             tx,
+            gone: std::cell::Cell::new(false),
             _local: local,
         })
     }
@@ -243,18 +255,46 @@ impl Worker {
 
     /// 非阻塞取一条结果。
     pub fn try_recv(&self) -> Option<Response> {
-        self.rx.try_recv().ok()
+        let response = self.rx.try_recv().ok()?;
+        // 报过就不再报第二次（否则每帧一句「后台没了」刷屏）。
+        if matches!(response, Response::ThreadGone) && self.gone.replace(true) {
+            return None;
+        }
+        Some(response)
+    }
+}
+
+/// 线程退出时递减存活计数；最后一个退出的负责报一句 ThreadGone。
+///
+/// 用 drop 守卫而不是在函数末尾写一句：**panic 也会走 drop**，而「线程 panic 了
+/// 却没人告诉界面」正是要修的那个「永远进行中」。
+struct GoneGuard {
+    live: Arc<AtomicUsize>,
+    tx: Sender<Response>,
+}
+
+impl Drop for GoneGuard {
+    fn drop(&mut self) {
+        if self.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = self.tx.send(Response::ThreadGone);
+        }
     }
 }
 
 fn spawn_db(
     tx: Sender<Response>,
     local: Arc<RwLock<HashMap<String, String>>>,
+    live: Arc<AtomicUsize>,
 ) -> Result<Sender<DbRequest>, String> {
     let (db_tx, db_rx) = mpsc::channel::<DbRequest>();
+    let guard = GoneGuard {
+        live,
+        tx: tx.clone(),
+    };
     thread::Builder::new()
         .name(String::from("pkg-db"))
         .spawn(move || {
+            let _guard = guard;
             // 句柄在这里开：libalpm 不 Send，它这辈子就住在这个线程里。
             let db = match Db::open() {
                 Ok(db) => db,
@@ -325,11 +365,17 @@ fn spawn_db(
 fn spawn_net(
     tx: Sender<Response>,
     local: Arc<RwLock<HashMap<String, String>>>,
+    live: Arc<AtomicUsize>,
 ) -> Result<Sender<NetRequest>, String> {
     let (net_tx, net_rx) = mpsc::channel::<NetRequest>();
+    let guard = GoneGuard {
+        live,
+        tx: tx.clone(),
+    };
     thread::Builder::new()
         .name(String::from("pkg-net"))
         .spawn(move || {
+            let _guard = guard;
             let mut net = Net::new();
             while let Ok(request) = net_rx.recv() {
                 let response = match request {
@@ -570,8 +616,60 @@ mod tests {
         ));
     }
 
+    /// 最后一个退出的线程负责报一次「后台没了」。
+    #[test]
+    fn the_last_thread_out_reports_gone_once() {
+        let (tx, rx) = mpsc::channel();
+        let live = Arc::new(AtomicUsize::new(2));
+        {
+            let _first = GoneGuard {
+                live: Arc::clone(&live),
+                tx: tx.clone(),
+            };
+            let _second = GoneGuard {
+                live: Arc::clone(&live),
+                tx: tx.clone(),
+            };
+        }
+        assert!(matches!(rx.try_recv(), Ok(Response::ThreadGone)));
+        assert!(rx.try_recv().is_err(), "只报一次");
+    }
+
+    /// 还有一个活着的时候不该报。
+    #[test]
+    fn a_still_living_thread_keeps_quiet() {
+        let (tx, rx) = mpsc::channel();
+        let live = Arc::new(AtomicUsize::new(2));
+        {
+            let _first = GoneGuard {
+                live: Arc::clone(&live),
+                tx: tx.clone(),
+            };
+        }
+        assert!(rx.try_recv().is_err(), "还有线程活着就别吓唬界面");
+    }
+
+    /// **panic 也要走到它** —— 线程崩掉正是最需要报出来的那一次。
+    /// 这正是用 drop 守卫而不是在函数末尾写一句的理由。
+    #[test]
+    fn a_panicking_thread_still_reports_gone() {
+        let (tx, rx) = mpsc::channel();
+        let live = Arc::new(AtomicUsize::new(1));
+        let guard = GoneGuard {
+            live: Arc::clone(&live),
+            tx: tx.clone(),
+        };
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("模拟后台线程崩掉");
+        }));
+        assert!(panicked.is_err());
+        assert!(matches!(rx.try_recv(), Ok(Response::ThreadGone)));
+    }
+
     fn describe(response: &Response) -> &'static str {
         match response {
+            Response::ThreadGone => "后台线程没了",
             Response::Official { .. } => "官方源结果",
             Response::AllPackages(_) => "全部包",
             Response::Aur { .. } => "AUR 结果",

@@ -127,12 +127,10 @@ pub fn dependencies_of(required: &[String]) -> Dependencies {
     }
 }
 
-pub fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|meta| meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
+/// 见 [`crate::util::path::is_executable`]：全项目唯一一份（是普通文件 + 带执行位）。
+///
+/// 这里就地再导出，是不想动 `scripted` / `fftools` 那些调用点。
+pub use crate::util::path::is_executable;
 
 /// 把命令名在 `PATH` 里解析成绝对路径；带 `/` 的按路径直接判断。
 ///
@@ -144,10 +142,7 @@ pub fn resolve_program(program: &str) -> Option<PathBuf> {
         let path = PathBuf::from(program);
         return is_executable(&path).then_some(path);
     }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
+    crate::util::path::find_on_path(program)
 }
 
 /// 依赖探测结果缓存。
@@ -170,25 +165,11 @@ fn command_exists(name: &str) -> bool {
         return hit;
     }
 
-    let found = lookup_command(name);
+    let found = crate::util::path::command_available(name);
     if let Ok(mut cache) = COMMAND_CACHE.lock() {
         cache.insert(name.to_string(), found);
     }
     found
-}
-
-fn lookup_command(name: &str) -> bool {
-    // 空名字必须单独挡掉：`dir.join("")` 就是 `dir` 本身，而目录通常带执行位，
-    // 不挡的话空依赖会被误判成「已满足」。
-    if name.is_empty() {
-        return false;
-    }
-    if name.contains('/') {
-        return is_executable(Path::new(name));
-    }
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(name))))
-        .unwrap_or(false)
 }
 
 /// 清空依赖探测缓存。
@@ -204,9 +185,10 @@ pub fn clear_command_cache() {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_LINES, clear_command_cache, command_exists, dependencies, is_internal, lookup_command,
-        meta, read_head, split_list,
+        HEAD_LINES, clear_command_cache, command_exists, dependencies, is_internal, meta,
+        read_head, split_list,
     };
+    use crate::util::path::command_available;
 
     #[test]
     fn meta_requires_exact_script_name_prefix_and_trims() {
@@ -283,7 +265,7 @@ mod tests {
         assert!(command_exists("/bin/sh"));
         assert!(!command_exists("/nonexistent/dir/app"));
         // 空名字不能因为 `dir.join("") == dir` 且目录带执行位就被误判成可用
-        assert!(!lookup_command(""));
+        assert!(!command_available(""));
     }
 
     #[test]

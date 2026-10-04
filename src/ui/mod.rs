@@ -20,6 +20,7 @@ mod form;
 mod header;
 mod help;
 mod history;
+mod overlay;
 pub mod packages;
 pub(crate) mod picker;
 pub mod repository;

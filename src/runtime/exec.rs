@@ -109,25 +109,16 @@ pub fn execute_action(
 
 /// 在 `$PATH` 里找一个可执行文件。
 ///
-/// 为什么这里自己扫一遍：`runtime` 的约定是只依赖 [`crate::model`]，
-/// 不去碰 `providers` 里的工具发现逻辑（那边有一份带缓存的同类实现）。
-/// 这点有意为之的重复，比让执行层反过来依赖 Provider 层划算。
+/// 实现只有一份，在 [`crate::util::path`]：执行层、Provider 元数据层、仓库作者
+/// 校验层共用同一套边界（是普通文件 + 带执行位），不再各写各的 —— 以前那种
+/// 重复的代价已经显形了：同一个目录能被一处算成命令、另一处不算。
 ///
-/// `pub(crate)` 是因为 `ui pick` 也要找同一个程序（优先 yazi）—— 两处各写一份
-/// 找 PATH 的逻辑，迟早会有一处忘了处理「是目录不是文件」这类边界。
-pub(crate) fn find_on_path(program: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
-}
+/// 这里保留一个就地再导出，是因为 `ui pick` 这类调用点只认识 `runtime`；
+/// 换实现时不该逼着它们改 import。
+pub(crate) use crate::util::path::find_on_path;
 
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
+/// 见 [`crate::util::path::is_executable`]：全项目唯一一份。
+use crate::util::path::is_executable;
 
 /// 把终端交给某个程序跑一遍（安装、交互式确认这类）。
 ///
@@ -428,7 +419,8 @@ impl RunningJob {
         if let Some(pid) = self.pid() {
             let _ = signal_group(pid, libc::SIGKILL);
         }
-        // 注意：收尾线程只在两条流 EOF 之后才会持有这把锁去 wait，所以这里不会卡住。
+        // 注意：收尾线程等进程用的是 try_wait 轮询，锁只被短暂持有（不持锁阻塞），
+        // 所以这里不会卡住 —— 以前它持锁 wait()，退出时就会顶在这把锁上。
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
@@ -464,6 +456,12 @@ fn is_progress_key(key: &str) -> bool {
     ];
     KEYS.contains(&key) || (key.starts_with("stream_") && key.ends_with("_q"))
 }
+
+/// 收尾线程轮询子进程状态的间隔。
+///
+/// 只在「两条输出流都 EOF 了、进程却还没退出」这种少见情况下才会真的睡上几次：
+/// 正常路径一次 `try_wait` 就出。10ms 是「不烧 CPU」与「退出马上能拿锁」之间的取舍。
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// 在**后台**跑一条命令并捕获输出。
 ///
@@ -515,11 +513,27 @@ pub fn spawn_captured(
     thread::spawn(move || {
         let out = stdout_reader.join().ok().unwrap_or_default();
         let err = stderr_reader.join().ok().unwrap_or_default();
-        // 两条流都 EOF 了，子进程基本已经结束，这里 wait 不会久等。
-        let status = finished_child
-            .lock()
-            .ok()
-            .and_then(|mut child| child.wait().ok());
+        // 等子进程退出，但**不在持锁状态里阻塞**。
+        //
+        // `Child::wait()` 需要 `&mut Child`，也就是必须在锁里调用：一旦它在那
+        // 里阻塞（进程把 stdout/stderr 关了却还在跑），RunningJob::drop /
+        // cancel() 的 `child.lock()` 就会跟着一起卡住 —— 退出时那一下正是
+        //「按 q 半天退不出去」的来源。所以这里改用 `try_wait()` 轮询：每次持锁
+        // 只做一次非阻塞系统调用，锁立刻放掉，等待落在临界区之外。
+        //
+        // 两条流都 EOF 之后进程基本已经结束，这个循环通常第一次就拿到状态。
+        let status = loop {
+            match finished_child.lock() {
+                Ok(mut child) => match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {}
+                    Err(_) => break None,
+                },
+                Err(_) => break None,
+            }
+            // 到这儿锁已经放掉了，睡的时候谁都能拿走这把锁。
+            thread::sleep(WAIT_POLL_INTERVAL);
+        };
 
         let _ = tx.send(JobEvent::Done(Box::new(Captured {
             label: finished_label,
@@ -885,6 +899,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!marker.exists(), "drop 之后子进程必须已经死了（pid {pid}）");
+    }
+
+    /// 收尾线程**不许持锁**等子进程。
+    ///
+    /// 造一个「把 stdout/stderr 关掉、自己继续睡」的命令：两条流立刻 EOF，
+    /// 收尾线程于是进入「等进程退出」，而进程还活着。旧实现是持锁
+    /// `child.wait()`，此时 `pid()` / `drop` 的 `child.lock()` 会被钉住 ——
+    /// 退出时就是「按 q 半天退不出去」。
+    #[test]
+    fn waiting_for_the_child_does_not_hold_the_lock() {
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        let job = spawn_captured(
+            &PathBuf::from("/bin/sh"),
+            &[String::from("-c"), String::from("exec 1>&- 2>&-; sleep 30")],
+            &PathBuf::from("/tmp"),
+            "sh",
+        )
+        .expect("spawn");
+
+        // 等收尾线程真的走到「等进程」那一步（两条流 EOF 之后才会进）。
+        std::thread::sleep(Duration::from_millis(300));
+        let pid = job.pid().expect("有 pid") as i32;
+        assert!(
+            alive(pid),
+            "这条命令关了两条流但还在跑 —— 收尾线程此时应该正在等它"
+        );
+
+        let started = Instant::now();
+        drop(job);
+        let waited = started.elapsed();
+        eprintln!("持锁等待检查：子进程还活着时 drop(job) 用了 {waited:?}");
+        assert!(
+            waited < Duration::from_secs(2),
+            "drop 被收尾线程持锁 wait 钉住了：{waited:?}"
+        );
+
+        // Drop 里的 kill 要真的把它带走。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && alive(pid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(pid), "drop 之后子进程要死（pid {pid}）");
     }
 
     /// `terminate()` 走的是**整个进程组**：工具自己拉起来的孙子进程也要一起走。

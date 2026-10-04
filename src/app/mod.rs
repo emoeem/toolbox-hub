@@ -16,8 +16,8 @@ pub use text_input::TextInput;
 pub use update_check::UpdateCheck;
 
 use std::{
-    collections::VecDeque,
-    io,
+    collections::{HashMap, VecDeque},
+    fs, io,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -261,6 +261,12 @@ pub struct Viewer {
     /// 最长那一行的显示宽度（列）。横向滚动按它夹紧 —— 否则一直按 `→`
     /// 会滚进一片空白，看着像界面卡死了。
     pub max_line_width: u16,
+    /// 正文有多少行。
+    ///
+    /// **缓存**，不是每帧数：正文可能有几百 KB，而渲染每帧都要知道总行数
+    /// （算最大滚动位置）。以前这里是 `body.lines().count()`，等于每帧把整篇
+    /// 正文扫一遍 —— 和「每帧克隆整篇」是同一类开销，只是更隐蔽。
+    pub lines: usize,
 }
 
 impl Viewer {
@@ -282,7 +288,7 @@ impl Viewer {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll = self.body.lines().count();
+        self.scroll = self.lines;
     }
 
     /// 把一个字符串包成可滚动的视图（`toolbox-hub ui pager` 用）。
@@ -298,6 +304,8 @@ impl Viewer {
             .max()
             .unwrap_or(0)
             .min(u16::MAX as usize) as u16;
+        // 反正这一趟已经走过 lines() 了，顺手把行数留下 —— 渲染每帧都要用。
+        let lines = body.lines().count();
         Self {
             title,
             body,
@@ -305,6 +313,7 @@ impl Viewer {
             scroll: 0,
             horizontal_scroll: 0,
             max_line_width,
+            lines,
         }
     }
 
@@ -343,6 +352,7 @@ impl Viewer {
             .max()
             .unwrap_or(0)
             .min(u16::MAX as usize) as u16;
+        let lines = body.lines().count();
 
         Some(Self {
             title: if multiple {
@@ -355,6 +365,7 @@ impl Viewer {
             scroll: 0,
             horizontal_scroll: 0,
             max_line_width,
+            lines,
         })
     }
 }
@@ -478,6 +489,16 @@ pub struct App {
     pub state_path: PathBuf,
     /// 执行历史落在哪；`None` = 默认位置（测试可以指到临时文件）。
     pub history_path: Option<PathBuf>,
+    /// 「最近使用」的缓存（`None` = 需要重算）。
+    ///
+    /// 它从执行历史里推出来，而 `App::apply_filter` 每敲一个键就要问一次 ——
+    /// 不缓存的话就是「打一个字，读并解析一遍历史文件」。写完一条新历史就作废。
+    pub recent_ids: Option<Vec<String>>,
+    /// 探过的媒体时长：路径 → (文件修改时间, 秒数)。
+    ///
+    /// `None` 也是有效结果（探过、探不出来），所以用 `Option<f64>` 存 ——
+    /// 否则每次碰到同一个坏文件都要再开一次 ffprobe。
+    duration_cache: HashMap<PathBuf, (Option<std::time::SystemTime>, Option<f64>)>,
     /// 安装队列落在哪；`None` = 默认位置（测试可以指到临时文件，
     /// 免得并行测试互相踩真实的安装队列）。
     pub queue_path: Option<PathBuf>,
@@ -541,6 +562,8 @@ impl App {
             state: state::load(),
             state_path: state::path(),
             history_path: None,
+            recent_ids: None,
+            duration_cache: HashMap::new(),
             queue_path: None,
             needs_full_redraw: false,
             work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -892,15 +915,41 @@ impl App {
             return false;
         };
         let mut changed = false;
-        while let Some((key, outcome)) = resolver.try_recv() {
+        while let Some(response) = resolver.try_recv() {
             changed = true;
-            if let Some(form) = self.form.as_mut() {
-                match outcome {
-                    Ok(candidates) => {
-                        form.candidates.insert(key, candidates);
+            match response {
+                crate::dynamic::Response::Candidates { key, outcome } => {
+                    if let Some(form) = self.form.as_mut() {
+                        match outcome {
+                            Ok(candidates) => {
+                                form.candidates.insert(key, candidates);
+                            }
+                            Err(problem) => {
+                                form.candidate_errors.insert(key, problem);
+                            }
+                        }
                     }
-                    Err(problem) => {
-                        form.candidate_errors.insert(key, problem);
+                }
+                // 候选线程没了（只报一次，见 dynamic::Response）：把还没有结论的动态
+                // 字段当场标一句错 —— 不能让表单永远停在「解析中」。
+                crate::dynamic::Response::WorkerGone => {
+                    let keys: Vec<String> = self
+                        .form_arguments()
+                        .iter()
+                        .filter(|argument| argument.kind == ArgKind::Dynamic)
+                        .map(|argument| argument.key.clone())
+                        .collect();
+                    if let Some(form) = self.form.as_mut() {
+                        for key in keys {
+                            if !form.candidates.contains_key(&key)
+                                && !form.candidate_errors.contains_key(&key)
+                            {
+                                form.candidate_errors.insert(
+                                    key,
+                                    String::from("候选解析线程已经不在了（重启程序再试）"),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1727,7 +1776,12 @@ impl App {
 
     /// 按 `F`：看看这个目录里到底有什么（脚本会看到的就是这些）。
     pub fn open_files(&mut self) {
-        self.refresh_media();
+        // 已经有这个目录的扫描结果就直接用 —— 以前每按一次 F 都在 UI 线程上重走
+        // 一遍目录（工作目录大时是明显的一卡），而目录根本没变。
+        // 想让新出现的文件立刻显形，按 `Ctrl-R`。
+        if self.media_root != self.work_dir {
+            self.refresh_media();
+        }
         let label = self.media_label();
         self.files = Some(FilesView {
             root: self.work_dir.clone(),
@@ -1741,6 +1795,28 @@ impl App {
             files.apply_filter();
         }
         self.message = format!("{label} · Enter 切到该文件所在目录");
+    }
+
+    /// 重新扫描当前目录，并把结果灌进已经打开的文件视图（保留过滤词与尽量保留选中项）。
+    ///
+    /// 这是文件视图里 `Ctrl-R` 的行为：想立刻看到新拷进来的文件时用它。
+    /// 平时打开视图不重扫（见 `open_files`），否则每按一次 F 都要等一遍目录遍历。
+    pub fn reload_files(&mut self) {
+        self.refresh_media();
+        let root = self.work_dir.clone();
+        let all = self.media.files.clone();
+        let truncated = self.media.truncated;
+        let Some(view) = self.files.as_mut() else {
+            return;
+        };
+        // 目录在扫描期间被换掉了：那就不是这个视图该显示的东西了。
+        if view.root != root {
+            return;
+        }
+        view.all = all;
+        view.truncated = truncated;
+        view.apply_filter();
+        view.selected = view.selected.min(view.visible.len().saturating_sub(1));
     }
 
     pub fn close_files(&mut self) {
@@ -2046,7 +2122,7 @@ impl App {
     /// 顺序：动作声明的 `limit_from`（裁剪类：这次只做 N 秒）> `duration_from`
     /// 指向那个文件的时长。都拿不到就没有百分比 —— 不猜。
     pub fn total_seconds_for(
-        &self,
+        &mut self,
         action: &crate::model::Action,
         values: &ArgumentValues,
     ) -> Option<f64> {
@@ -2070,7 +2146,28 @@ impl App {
         } else {
             self.work_dir.join(raw)
         };
-        crate::runtime::probe_duration(&path)
+        self.probe_duration_cached(&path)
+    }
+
+    /// 带缓存的时长探测。
+    ///
+    /// `ffprobe` 是**外部进程**，而这条路径在 UI 线程上被调用（单文件直接跑时）。
+    /// 同一个文件反复探、或者反复探一个已知探不出结果的文件，都是白等。
+    ///
+    /// 键里带修改时间：文件换了内容就重新探一次，不会拿着旧时长去裁剪。
+    fn probe_duration_cached(&mut self, path: &Path) -> Option<f64> {
+        let stamp = fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        if let Some((cached_stamp, cached)) = self.duration_cache.get(path)
+            && *cached_stamp == stamp
+        {
+            return *cached;
+        }
+        let seconds = crate::runtime::probe_duration(path);
+        self.duration_cache
+            .insert(path.to_path_buf(), (stamp, seconds));
+        seconds
     }
 
     /// 取消正在跑的任务（队列里剩下的也一起清掉）。
@@ -2541,13 +2638,23 @@ impl App {
     /// 最近用过的工具 id，新的在前。
     ///
     /// 直接从执行历史里推，不额外存一份 —— 历史已经在记了。
-    pub fn recent_tool_ids(&self) -> Vec<String> {
+    pub fn recent_tool_ids(&mut self) -> Vec<String> {
+        if let Some(cached) = self.recent_ids.clone() {
+            return cached;
+        }
+        // 从**同一个地方**读：record_history 写的是历史路径（测试会把它指到临时目录），
+        // 这里要是固定读默认路径，两边就会各说各话 —— 写进去的东西「最近」里看不见。
+        let entries = match self.history_path.as_deref() {
+            Some(path) => history::load_from(path, 200),
+            None => history::load(200),
+        };
         let mut ids: Vec<String> = Vec::new();
-        for entry in history::load(200) {
+        for entry in entries {
             if !ids.contains(&entry.tool_id) {
                 ids.push(entry.tool_id);
             }
         }
+        self.recent_ids = Some(ids.clone());
         ids
     }
 
@@ -2641,7 +2748,13 @@ impl App {
     ///
     /// 历史里的命令要能直接重跑，所以必须带上程序名 —— 少了它，重跑时会把
     /// 第一个参数当成命令（这个坑是实拍历史记录时发现的）。
-    pub fn record_run(&self, tool: &ToolDefinition, argv: &[String], success: bool, millis: u128) {
+    pub fn record_run(
+        &mut self,
+        tool: &ToolDefinition,
+        argv: &[String],
+        success: bool,
+        millis: u128,
+    ) {
         let mut full = vec![tool.path.display().to_string()];
         full.extend(argv.iter().cloned());
         // 表单还开着的时候顺手把取值抄一份 —— 历史里的「回填再改」全靠它。
@@ -2655,9 +2768,10 @@ impl App {
     /// 记一条执行历史（`argv` 必须已含程序名）。
     ///
     /// `argv` 必须是**已经做过敏感值替换**的（用 [`crate::model::Action::redacted`]）。
-    /// 历史写不进去只报一声，绝不影响执行本身。
+    /// 历史写不进去只在**状态行**报一声，绝不影响执行本身 —— 也不能往 stderr
+    /// 写：那时我们正占着备用屏，直接写会把手绘的界面搅花。
     pub fn record_history(
-        &self,
+        &mut self,
         tool_id: &str,
         tool_name: &str,
         argv: &[String],
@@ -2678,8 +2792,12 @@ impl App {
             Some(path) => history::append_to(path, &entry),
             None => history::append(&entry),
         };
-        if let Err(error) = written {
-            eprintln!("Toolbox: 执行历史写入失败: {error}");
+        match written {
+            // 写成功：最近列表的缓存作废（它就是从历史里推出来的）。
+            Ok(()) => self.recent_ids = None,
+            // 写失败**不能 eprintln**：我们正占着备用屏，往 stderr 直接写会把界面
+            // 搅花（旧版就是这样）。放到状态行里说 —— 它本来也有地方说话。
+            Err(error) => self.message = format!("执行历史没能写进去：{error}"),
         }
     }
 
@@ -3787,7 +3905,8 @@ mod tests {
     fn total_seconds_comes_from_the_declared_argument() {
         use crate::model::{Action, ArgumentValues};
 
-        let app = action_app();
+        // 时长探测带缓存，所以它要有可变借用。
+        let mut app = action_app();
 
         // 1) limit_from：裁剪类动作这次只做 10 秒
         let action = Action {
@@ -4084,6 +4203,35 @@ mod tests {
         app.apply_filter();
         assert!(app.open_form());
         app
+    }
+
+    /// 「最近使用」是带缓存的，但**写完一条新历史必须作废** ——
+    ///
+    /// 这是那条缓存最容易出的错：加完缓存忘了失效，刚跑完的工具就不在「最近」里，
+    /// 而用户会以为历史没记上。
+    #[test]
+    fn a_just_recorded_run_shows_up_in_the_recent_list() {
+        let mut app = action_app();
+        let dir =
+            std::env::temp_dir().join(format!("toolbox-hub-test-recent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("history.log");
+        let _ = std::fs::remove_file(&file);
+        app.history_path = Some(file);
+
+        // 先把缓存建立起来（此刻历史是空的）
+        assert!(app.recent_tool_ids().is_empty(), "还没有历史");
+
+        let id = app.registry.tools()[0].id.clone();
+        let name = app.registry.tools()[0].name.clone();
+        app.record_history(&id, &name, &[String::from("/bin/true")], &[], true, 3);
+
+        let recent = app.recent_tool_ids();
+        assert!(
+            recent.contains(&id),
+            "刚写进去的必须出现在最近列表里：{recent:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `foreach`：每个输入各跑一次，输出按 `{stem}` 之类的模板替换。

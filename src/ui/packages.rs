@@ -12,10 +12,10 @@ use crate::{
         App,
         package_view::{Confirm, PackageMode, PackageView, Pane},
     },
-    ui::{display_width, theme, window},
+    ui::{display_width, overlay, theme, window},
 };
 use ratatui::{
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
@@ -353,7 +353,7 @@ fn draw_health_rows(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) 
 /// 结果表统一的高亮样式（焦点不在结果区时不高亮，免得看错地方）。
 fn row_style(view: &PackageView) -> Style {
     if view.pane == Pane::Rows {
-        Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT)
+        theme::selected_row()
     } else {
         Style::default().fg(theme::TEXT)
     }
@@ -636,8 +636,10 @@ fn draw_queue(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         ],
     )
     .row_highlight_style(if focused {
-        Style::default().bg(theme::HIGHLIGHT).fg(theme::TEXT)
+        theme::selected_row()
     } else {
+        // 焦点不在这张表上就完全不高亮：跟结果表只去掉底色的退化不一样，
+        // 这里是刻意的（安装清单本来就靠 Tab 切过去才动手）。
         Style::default()
     })
     .highlight_symbol("➤ ");
@@ -714,18 +716,6 @@ fn pad_to_width(value: &str, width: usize) -> String {
     padded
 }
 
-// ── 浮层：排序菜单与执行确认 ────────────────────────────────────────────────
-
-fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
-    let vertical = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .split(area);
-    let horizontal = Layout::horizontal([Constraint::Percentage(width_percent)])
-        .flex(Flex::Center)
-        .split(vertical[0]);
-    horizontal[0]
-}
-
 /// 维护面板右边的明细。
 fn draw_health_detail(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     let block = theme::panel(" 这一项在说什么 ");
@@ -778,10 +768,14 @@ fn draw_health_detail(frame: &mut ratatui::Frame, view: &PackageView, area: Rect
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+// ── 浮层：排序菜单与执行确认 ────────────────────────────────────────────────
+// 位置统一交给 [`overlay`]（居中的那一步只有一份），这里只决定「多宽多高」：
+// 宽度按终端的百分比走，高度按内容行数。
+
 fn draw_sort_menu(frame: &mut ratatui::Frame, view: &PackageView, selected: usize, area: Rect) {
     let sorts = view.available_sorts();
     let height = sorts.len() as u16 + 2;
-    let popup = centered(area, 40, height);
+    let popup = overlay::centered_percent(area, 40, height);
     frame.render_widget(Clear, popup);
 
     let lines: Vec<Line> = sorts
@@ -811,7 +805,7 @@ fn draw_sort_menu(frame: &mut ratatui::Frame, view: &PackageView, selected: usiz
 
 fn draw_confirm(frame: &mut ratatui::Frame, confirm: &Confirm, area: Rect) {
     let height = (confirm.notes.len() as u16 + 6).min(area.height);
-    let popup = centered(area, 76, height);
+    let popup = overlay::centered_percent(area, 76, height);
     frame.render_widget(Clear, popup);
 
     let mut lines = vec![
