@@ -5,3 +5,24 @@
 /packaging/pkg/
 /packaging/*.pkg.tar.*
 /packaging/*.tar.gz
+
+# 本地测试 / 临时产物（跑端到端验证时会落在仓库根）：都不该进版本库。
+#
+# 写成显式清单而不是一条通配：通配很容易顺手把 .github/ 这类该提交的东西也吞掉。
+/.consumer/
+/.author/
+/.authorcheck/
+/.ct/
+/.final/
+/.g/
+/.scratch-reg/
+/.smoke/
+/.t/
+/.upd/
+/.verify/
+/.ci-tmp/
+# 调试用的临时补丁脚本与提交信息文件
+/.commitmsg*.txt
+/.*.py
+# git bundle 是搬运用的产物，不是源码
+/*.bundle
