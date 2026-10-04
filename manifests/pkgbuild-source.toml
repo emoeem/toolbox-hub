@@ -1,0 +1,340 @@
+# 「打包」域：给你自己的 Arch 软件包仓库（pkgbuild-source）用。
+#
+# 二十个动作都经 `tbx-pkgbuild` 转给那个仓库的 `manage.sh <代号>`：
+#
+#   · `tbx-pkgbuild` 是个几行的转发脚本，只干一件事 —— **找仓库**：
+#     $TOOLBOX_HUB_PKGBUILD_SRC > ~/pkgbuild-source > ~/code/pkgbuild-source。
+#     仓库在哪儿只有你知道，所以没法写死在随包发布的 manifest 里。
+#   · 源码用户：./scripts/pkgbuild-source/install.sh（装到 ~/.local/bin）
+#   · 装包用户：PKGBUILD 已经把它放进 /usr/bin
+#
+# 没装那个仓库时，这些动作会显示「依赖缺失」并给出上面那条安装办法 ——
+# 不装也不影响别的域，这个域本来就是可选的。
+#
+# mode 是**实测**分出来的：只读的走 capture（输出留在工具箱的输出视图里），
+# 要 fzf 选包 / sudo 提权的走 interactive（把终端交给它）。
+# 想加动作：先看 `tbx-pkgbuild --list`，再照抄一条。
+
+# ── 只读：留在工具箱里看 ───────────────────────────────────────────────────
+
+[[action]]
+id = "pkgsrc-dashboard"
+name = "软件仓库 · 状态总览"
+summary = "分支 / 工作区 / 包数 / 最近 Actions / 时序与修复记录条数"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["dashboard"]
+mode = "capture"
+pin = 0
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "无"
+output = "一屏状态"
+features = "只读，不会动仓库"
+
+[[action]]
+id = "pkgsrc-doctor"
+name = "软件仓库 · 环境自检"
+summary = "Git / 包元数据 / CI 配置 / ShellCheck / gh / podman / ccache / 磁盘 / 网络"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["doctor"]
+mode = "capture"
+pin = 1
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "无"
+output = "体检报告 + READY 结论"
+features = "只读；有警告也退 0，结论看最后一行"
+
+[[action]]
+id = "pkgsrc-audit"
+name = "软件仓库 · 审计全部软件包"
+summary = "把 13 个包全过一遍：namcap / ShellCheck / PKGBUILD 规范"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["audit"]
+mode = "capture"
+pin = 2
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "无"
+output = "逐包审计结论"
+features = "只读，但包多时要跑一会儿"
+
+[[action]]
+id = "pkgsrc-timing"
+name = "软件仓库 · 构建时序统计"
+summary = "download / prepare / build / package 各阶段耗时与 ccache 命中率"
+domain = "打包"
+tags = ["构建"]
+program = "tbx-pkgbuild"
+base_argv = ["timing"]
+mode = "capture"
+pin = 3
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "无"
+output = "阶段耗时汇总"
+features = "读 state/timing-history.jsonl；没有记录就直说"
+
+[[action]]
+id = "pkgsrc-pull"
+name = "软件仓库 · 拉取 main"
+summary = "git pull --ff-only：把远端 main 合到本地（工作区脏就拒绝，不覆盖你的改动）"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["pull"]
+mode = "capture"
+pin = 4
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "无"
+output = "更新后的工作区"
+features = "工作区有未提交修改时它会**拒绝**并退 1，不会硬覆盖"
+
+# ── 要用 fzf 选包 / sudo 提权：把终端交给它 ────────────────────────────────
+
+[[action]]
+id = "pkgsrc-add-aur"
+name = "软件仓库 · 添加 AUR 软件包"
+summary = "按 AUR 包名加进来：抓 PKGBUILD、写 .aur-url、生成 .SRCINFO"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["add-aur"]
+mode = "interactive"
+pin = 5
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "AUR 包名"
+output = "packages/ 下多一个目录"
+features = "会在终端里问你包名；加完可以顺手用「构建」触发一次"
+
+[[action]]
+id = "pkgsrc-add-custom"
+name = "软件仓库 · 从自定义 Git 添加"
+summary = "非 AUR 的上游：给一个 Git 地址和包名，生成 PKGBUILD 骨架"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["add-custom"]
+mode = "interactive"
+pin = 6
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "Git 地址 + 包名"
+output = "packages/ 下多一个目录"
+features = "生成的是骨架，pkgver()/build() 多半还要你自己补"
+
+[[action]]
+id = "pkgsrc-remove"
+name = "软件仓库 · 删除软件包"
+summary = "从仓库里删掉一个包：目录、AUR 记录、相关的构建覆盖"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["remove"]
+mode = "interactive"
+pin = 7
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "要删的包（fzf 选）"
+output = "干净的仓库"
+features = "会删文件；删完记得单独跑一次发布流程才会从仓库里消失"
+
+[[action]]
+id = "pkgsrc-sync-aur"
+name = "软件仓库 · 同步 AUR 源"
+summary = "在 GitHub 上跑 Sync AUR：拉各包上游最新版，有变化就提交并触发构建"
+domain = "打包"
+tags = ["构建"]
+program = "tbx-pkgbuild"
+base_argv = ["sync-aur"]
+mode = "interactive"
+pin = 8
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "选包（fzf）"
+output = "上游同步后的源码树"
+features = "会推提交、会触发 CI；本地也可以只跑 --check 预览"
+
+[[action]]
+id = "pkgsrc-build"
+name = "软件仓库 · 在 GitHub 上构建"
+summary = "挑包 dispatch 一次构建：只构建变化的包 + 递归依赖"
+domain = "打包"
+tags = ["构建"]
+program = "tbx-pkgbuild"
+base_argv = ["build"]
+mode = "interactive"
+pin = 9
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "要构建的包（fzf 选）"
+output = "新的构建产物"
+features = "构建完会走发布；想看进度就用「跟踪正在运行的构建」"
+
+[[action]]
+id = "pkgsrc-track"
+name = "软件仓库 · 跟踪正在运行的构建"
+summary = "看 CI 现在跑到哪一步：阶段、耗时、失败点"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["track"]
+mode = "interactive"
+pin = 10
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "选一次运行（fzf）"
+output = "构建进度"
+features = "只读；会占着终端直到你退出"
+
+[[action]]
+id = "pkgsrc-triage"
+name = "软件仓库 · 排查失败的构建"
+summary = "把失败的运行挑出来，给出根因分类、提供者与建议动作"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["triage"]
+mode = "interactive"
+pin = 11
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "选一次失败运行（fzf）"
+output = "根因 + 建议"
+features = "只读；59 条规则分 16 类"
+
+[[action]]
+id = "pkgsrc-check-local"
+name = "软件仓库 · 检查本地 PKGBUILD"
+summary = "对选中的包跑 check-package.sh：语法 / .SRCINFO / ShellCheck / namcap"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["check-local"]
+mode = "interactive"
+pin = 12
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "选包（fzf，可多选）"
+output = "逐项检查结论"
+features = "只读；提交前跑一遍最省事"
+
+[[action]]
+id = "pkgsrc-plan"
+name = "软件仓库 · 构建计划与 DAG"
+summary = "这次会构建哪些包、为什么，以及包之间的依赖波次"
+domain = "打包"
+tags = ["构建"]
+program = "tbx-pkgbuild"
+base_argv = ["plan"]
+mode = "interactive"
+pin = 13
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "范围：全部 / 与上个提交的差异 / 指定包"
+output = "Build Plan + DAG"
+features = "只读；构建前先看这个能省一轮 CI"
+
+[[action]]
+id = "pkgsrc-parallel"
+name = "软件仓库 · 并行构建（本地）"
+summary = "按 DAG 波次在本机并行构建，可选只预演不真构建"
+domain = "打包"
+tags = ["构建"]
+program = "tbx-pkgbuild"
+base_argv = ["parallel"]
+mode = "interactive"
+pin = 14
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "预演 / 真实构建"
+output = "本地构建的包"
+features = "真构建会写文件、吃 CPU；先选「预演」看一眼波次"
+
+[[action]]
+id = "pkgsrc-repair"
+name = "软件仓库 · 修复中心"
+summary = "分级自动修复（Level 0-3）：快照 + 校验 + 失败逐字节回滚"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["repair"]
+mode = "interactive"
+pin = 15
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "选修复项（fzf）"
+output = "修好的仓库 + 审计记录"
+features = "有修复预算；Level 4 只给建议不动手"
+
+[[action]]
+id = "pkgsrc-updates"
+name = "软件仓库 · 检查本地可更新"
+summary = "13 个包里哪些本机装的版本和仓库里的不一样"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["updates"]
+mode = "interactive"
+pin = 16
+danger = "safe"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "无（结果用 fzf 翻）"
+output = "状态 / 本机版本 / 仓库版本"
+features = "只读；本地仓库库旧了先跑「更新本地 pacman 仓库」"
+
+[[action]]
+id = "pkgsrc-update-repo"
+name = "软件仓库 · 更新本地 pacman 仓库"
+summary = "sudo pacman -Sy，然后列出私人仓库里有哪些包"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["update-repo"]
+mode = "interactive"
+pin = 17
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "sudo 密码"
+output = "刷新后的本地仓库索引"
+features = "会同步 pacman 数据库（-Sy），要 root"
+
+[[action]]
+id = "pkgsrc-install"
+name = "软件仓库 · 从私人仓库安装"
+summary = "fzf 里挑包，sudo pacman -S --needed 装上（带仓库前缀）"
+domain = "打包"
+tags = ["仓库"]
+program = "tbx-pkgbuild"
+base_argv = ["install"]
+mode = "interactive"
+pin = 18
+danger = "caution"
+install = "./scripts/pkgbuild-source/install.sh（仓库默认找 ~/pkgbuild-source）"
+input = "选包（fzf，可多选）"
+output = "装好的包"
+features = "要 root；装之前先跑一次「更新本地 pacman 仓库」"
+
+[[action]]
+id = "pkgsrc-actions"
+name = "软件仓库 · 最近的 GitHub Actions"
+summary = "最近 30 次运行：状态、结论、工作流、标题，可挑一次看详情"
+domain = "打包"
+tags = ["诊断"]
+program = "tbx-pkgbuild"
+base_argv = ["actions"]
+mode = "interactive"
+pin = 19
+danger = "safe"
+install = "自带（~/pkgbuild-source），需要 gh 已登录"
+input = "选一次运行（fzf）"
+output = "运行详情"
+features = "只读；没登录 gh 会直说"

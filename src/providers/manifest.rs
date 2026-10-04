@@ -63,6 +63,18 @@ const BUNDLED: &[(&str, &str)] = &[
         "sing-box.toml",
         include_str!("../../manifests/sing-box.toml"),
     ),
+    // 「发现」域：工具仓库界面本身。它不是命令，而是工具箱自己的一个界面。
+    (
+        "discover.toml",
+        include_str!("../../manifests/discover.toml"),
+    ),
+    // 「打包」域：给你自己的 Arch 软件包仓库（pkgbuild-source）用。
+    // 和 sing-box 同一个套路 —— manifest 里写裸命令名 `tbx-pkgbuild`，
+    // 真正找仓库、转发给 `manage.sh <代号>` 的是 scripts/pkgbuild-source/ 那个脚本。
+    (
+        "pkgbuild-source.toml",
+        include_str!("../../manifests/pkgbuild-source.toml"),
+    ),
 ];
 
 #[cfg(test)]
@@ -189,6 +201,47 @@ impl ManifestProvider {
     }
 }
 
+/// 解析一段 manifest 文本，按给定身份产出工具定义。
+///
+/// 这是**唯一**的 manifest 解析入口：Manifest Provider 与 Repository Provider
+/// 都走它，所以仓库里的动作和用户手写的动作行为必然一致。
+///
+/// 返回值里的第二项是问题清单（不致命）：一个动作写坏了不影响同文件里的其它动作。
+pub(crate) fn load_actions(
+    source: &str,
+    text: &str,
+    provider_id: &str,
+    provider_label: &str,
+) -> (Vec<ToolDefinition>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let parsed: ManifestFile = match toml::from_str(text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warnings.push(format!("{source}: {error}"));
+            return (Vec::new(), warnings);
+        }
+    };
+
+    let mut tools = Vec::new();
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    for spec in &parsed.action {
+        match spec.build_for(provider_id, provider_label) {
+            Ok(tool) => {
+                if !claimed.insert(spec.id.trim().to_string()) {
+                    warnings.push(format!(
+                        "{source}: 动作 id 重复「{}」，跳过这一条",
+                        spec.id.trim()
+                    ));
+                    continue;
+                }
+                tools.push(tool);
+            }
+            Err(problem) => warnings.push(format!("{source}: {problem}")),
+        }
+    }
+    (tools, warnings)
+}
+
 impl Provider for ManifestProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID
@@ -223,6 +276,36 @@ impl Provider for ManifestProvider {
 struct ManifestFile {
     #[serde(default)]
     action: Vec<ManifestAction>,
+    /// 包级依赖声明。
+    ///
+    /// 规范上依赖属于包（写在 toolbox.toml 里），但作者会很自然地把「这条动作要跑
+    /// docker」写在动作旁边 —— 实测就是这个结果：把 [[dependencies]] 写进
+    /// manifests/*.toml，然后整份动作定义解析失败、包装了等于没装。
+    /// 与其让人踩一次坑，不如两边都收（合并时去重）。
+    #[serde(default)]
+    dependencies: Vec<ManifestDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestDependency {
+    command: String,
+    #[serde(default)]
+    hint: Option<String>,
+}
+
+/// 读一份 manifest 里声明的包级依赖（[[dependencies]]）。
+///
+/// 返回 (命令, 提示)；解析不了就返回空 —— 真正的报错由 load_actions 统一给。
+pub(crate) fn declared_dependencies(text: &str) -> Vec<(String, Option<String>)> {
+    let Ok(parsed) = toml::from_str::<ManifestFile>(text) else {
+        return Vec::new();
+    };
+    parsed
+        .dependencies
+        .into_iter()
+        .map(|dependency| (dependency.command, dependency.hint))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,6 +380,9 @@ struct ManifestArgument {
     dir_only: bool,
     #[serde(default)]
     separator: Option<String>,
+    /// `kind = "dynamic"` 的候选来源（内置名字或 `command:…`）。
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     help: Option<String>,
 }
@@ -310,7 +396,17 @@ struct ManifestChoice {
 
 impl ManifestAction {
     /// 翻译成工具定义；`Err` 里是给用户看的毛病说明。
+    /// 按本 Provider 的身份构造（内置 / 用户 manifest 走这条）。
     fn build(&self) -> Result<ToolDefinition, String> {
+        self.build_for(PROVIDER_ID, PROVIDER_LABEL)
+    }
+
+    /// 按**指定身份**构造。
+    ///
+    /// 给 Repository Provider 用：仓库包里的动作定义和用户手写的 manifest 是
+    /// 同一套格式，所以解析只能有一份 —— 否则「用户写的」和「装来的」迟早会
+    /// 出现两种行为。
+    fn build_for(&self, provider_id: &str, provider_label: &str) -> Result<ToolDefinition, String> {
         let id = self.id.trim();
         if id.is_empty() {
             return Err(String::from("有个动作缺少 id"));
@@ -379,9 +475,9 @@ impl ManifestAction {
         let ready = deps.is_ready();
 
         Ok(ToolDefinition {
-            id: format!("{PROVIDER_ID}:{id}"),
+            id: format!("{provider_id}:{id}"),
             name: self.name.trim().to_string(),
-            provider: PROVIDER_LABEL.to_string(),
+            provider: provider_label.to_string(),
             domain,
             tags: self
                 .tags
@@ -436,12 +532,33 @@ impl ManifestArgument {
             "path" => ArgKind::Path,
             "choice" => ArgKind::Choice,
             "toggle" => ArgKind::Toggle,
+            "dynamic" => ArgKind::Dynamic,
             other => {
                 return Err(format!(
-                    "{action_id}/{key}: 不认识的参数类型「{other}」，可用 text / path / choice / toggle"
+                    "{action_id}/{key}: 不认识的参数类型「{other}」，\
+                     可用 text / path / choice / toggle / dynamic"
                 ));
             }
         };
+
+        // 动态候选必须说清候选从哪来，否则它就是个普通文本框 —— 那是静默失效。
+        if kind == ArgKind::Dynamic {
+            let source = self.source.as_deref().map(str::trim).unwrap_or("");
+            if source.is_empty() {
+                return Err(format!(
+                    "{action_id}/{key}: kind = dynamic 必须写 source（内置名字，或 command:<命令行>）"
+                ));
+            }
+            if !self.choices.is_empty() {
+                return Err(format!(
+                    "{action_id}/{key}: dynamic 的候选来自 source，不要再写 choices"
+                ));
+            }
+        } else if self.source.is_some() {
+            return Err(format!(
+                "{action_id}/{key}: 只有 kind = dynamic 能写 source"
+            ));
+        }
 
         if kind == ArgKind::Choice && self.choices.is_empty() {
             return Err(format!("{action_id}/{key}: kind = choice 必须写 choices"));
@@ -507,6 +624,7 @@ impl ManifestArgument {
             repeat_flag: self.repeat_flag,
             dir_only: self.dir_only,
             separator: self.separator.clone().unwrap_or_else(|| String::from(",")),
+            source: self.source.clone(),
             help: self.help.clone(),
         })
     }
@@ -690,34 +808,52 @@ mod tests {
         );
     }
 
-    /// 需要 root 的两个动作：`sudo` 必须打头，而且 `-Rns` 只能出现一次。
+    /// 「包管理」域里只准留**只读查询 + 进中心的入口**。
     ///
-    /// 这条抓到过真问题：`program` 从 `pacman` 改成 `sudo` 之后，参数里那个
-    /// `flag = "-Rns"` 会和 `base_argv` 里的撞车，变成 `sudo pacman -Rns -Rns bash`。
+    /// 会改系统的动作一律走软件包中心（有队列、有命令预览、有演练模式）或命令行
+    /// （`-i` / `-r` / `-u` / `--clear-cache`）—— 以前这个域塞了十几个
+    /// `sudo pacman -Rns` 这类包装动作，和中心完全重复，于是只能靠
+    /// 「进域自动开中心」把列表藏起来，层级就乱了。
+    ///
+    /// 这是一条**策略**测试：以后想往这个域加一个直接改系统的动作，它会红。
+    /// （提权本身由 `packages::escalate` 负责，那有自己的测试。）
     #[test]
-    fn root_actions_put_sudo_first_and_do_not_repeat_flags() {
+    fn the_packages_domain_only_keeps_read_only_actions() {
         let discovery = bundled_discovery();
+        let mut saw_entries = 0;
 
-        let remove = by_id(&discovery, "manifest:pkg-remove");
-        let action = remove.action.as_ref().expect("带动作");
-        let mut values = action.default_values();
-        values.set("package", "fzf bash");
-        assert_eq!(
-            action.build_argv(&values).expect("应能构建"),
-            vec!["pacman", "-Rns", "fzf", "bash"],
-            "sudo 是程序，pacman -Rns 在后面，包名最后"
-        );
-        assert_eq!(action.program, "sudo");
+        for tool in &discovery.tools {
+            if tool.domain != crate::model::Domain::Packages {
+                continue;
+            }
+            match tool.mode {
+                // 进中心的入口
+                crate::model::RunMode::Native => {
+                    saw_entries += 1;
+                    assert_eq!(
+                        tool.danger,
+                        crate::model::Danger::Safe,
+                        "{} 只是开个界面，不该标 caution",
+                        tool.id
+                    );
+                }
+                // 只有命令行能做的只读查询
+                crate::model::RunMode::Capture => assert_eq!(
+                    tool.danger,
+                    crate::model::Danger::Safe,
+                    "{} 是只读查询，不该标 caution",
+                    tool.id
+                ),
+                crate::model::RunMode::Interactive => panic!(
+                    "{} 会改系统：这类动作该走软件包中心或命令行，不该留在域列表里",
+                    tool.id
+                ),
+            }
+        }
 
-        let cache = by_id(&discovery, "manifest:pkg-clean-cache");
-        let action = cache.action.as_ref().expect("带动作");
-        assert_eq!(action.program, "sudo");
-        assert_eq!(
-            action
-                .build_argv(&action.default_values())
-                .expect("应能构建"),
-            vec!["paccache", "-rk1"],
-            "paccache 认 -rk1 这种连写"
+        assert!(
+            saw_entries >= 4,
+            "包管理域该有四个进中心的入口（搜索/已安装/新闻/维护），现在只有 {saw_entries} 个"
         );
     }
 
@@ -993,50 +1129,6 @@ mod tests {
         );
     }
 
-    /// 会改系统的包管理动作必须标 `danger = "caution"`。
-    ///
-    /// 这是一条**策略**测试：以后再加安装/卸载/更新类的动作，忘了标危险度就会红。
-    #[test]
-    fn destructive_package_actions_are_marked_caution() {
-        let discovery = bundled_discovery();
-        let destructive = [
-            "manifest:pkg-install",
-            "manifest:pkg-remove",
-            "manifest:pkg-upgrade",
-            "manifest:pkg-clean-cache",
-        ];
-
-        for id in destructive {
-            let tool = by_id(&discovery, id);
-            assert_eq!(
-                tool.danger,
-                crate::model::Danger::Caution,
-                "{id} 会改系统，必须标 caution"
-            );
-            // 而且要接管终端：sudo 密码、Y/n 都得你自己回答
-            assert_eq!(
-                tool.mode,
-                crate::model::RunMode::Interactive,
-                "{id} 要 sudo / 要确认，必须 interactive"
-            );
-        }
-
-        // 只读的那些反过来：不该打扰用户
-        for id in [
-            "manifest:pkg-search",
-            "manifest:pkg-updates",
-            "manifest:pkg-orphans",
-        ] {
-            let tool = by_id(&discovery, id);
-            assert_eq!(tool.danger, crate::model::Danger::Safe, "{id} 是只读的");
-            assert_eq!(
-                tool.mode,
-                crate::model::RunMode::Capture,
-                "{id} 该留在界面里"
-            );
-        }
-    }
-
     /// 内置的 foreach 动作必须配得对（真跑时才知道痛，所以这里先钉住）。
     #[test]
     fn bundled_foreach_actions_are_configured_correctly() {
@@ -1237,14 +1329,8 @@ help = "随便"
         type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], bool);
         let cases: &[Case] = &[
             ("manifest:pkg-search", &[("query", "fzf")], true),
-            ("manifest:pkg-info", &[("package", "fzf")], true),
-            ("manifest:aur-search", &[("query", "pacsea")], true),
-            ("manifest:aur-info", &[("package", "pacsea-bin")], true),
             ("manifest:pkg-owner", &[("file", "/usr/bin/pac")], true),
             ("manifest:pkg-files", &[("package", "pacman")], true),
-            // 孤儿包完全可能是 0 个，所以只要求跑通
-            ("manifest:pkg-orphans", &[], false),
-            ("manifest:pkg-cache-size", &[], true),
         ];
 
         for (id, values, needs_output) in cases {
@@ -1266,19 +1352,6 @@ help = "随便"
                 );
             }
         }
-
-        // checkupdates 要读数据库，慢一点，单独跑；有没有更新都算成功。
-        let updates = run_built(
-            &discovery,
-            "manifest:pkg-updates",
-            &[],
-            std::path::Path::new("/tmp"),
-        );
-        assert!(
-            updates.status.success() || updates.status.code() == Some(2),
-            "checkupdates 退出码 {}（2 = 没有更新，也算正常）",
-            updates.status
-        );
     }
 
     /// `cargo test -- --ignored --nocapture smoke_run_bundled_actions`

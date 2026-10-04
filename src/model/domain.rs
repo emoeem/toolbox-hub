@@ -1,8 +1,8 @@
 /// 工具箱的一级分类（域）。
 ///
-/// 每个域下面可以挂一个或多个 [`crate::providers::Provider`]。
-/// 当前只有 `Media` 域有真实 Provider（FFTools），其余域是待接入的空骨架：
-/// 它们的工具数会是 0，UI 显示「Provider 待接入」，而不是假装有内容。
+/// 每个域下面可以挂一个或多个 [`crate::providers::Provider`]（FFTools 脚本 /
+/// 本地注解脚本 / TOML manifest）。域本身只是分类：某个域暂时没有工具时，
+/// UI 会显示「Provider 待接入」而不是假装有内容 —— 所以加一个域是安全的。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Domain {
     /// 音视频、字幕、转码 —— 当前由 FFTools Provider 提供。
@@ -19,19 +19,26 @@ pub enum Domain {
     Tools,
     /// pacman / AUR 包管理（安装、卸载、更新、清理、查信息）。
     Packages,
+    /// 给自己打包：私有 Arch 仓库的构建、发布与维护（CI、Build Plan、修复中心…）。
+    Packaging,
+    /// 工具仓库：搜索 / 安装 / 更新远程的 ToolHub 工具包（和 pacman 无关）。
+    Discover,
 }
 
 impl Domain {
     /// 域的展示顺序，等于 Tabs 的顺序。
-    pub const ALL: [Domain; 7] = [
+    pub const ALL: [Domain; 9] = [
         Domain::Media,
         Domain::Image,
         Domain::System,
         Domain::Network,
         Domain::Dev,
         Domain::Tools,
-        // 放在最后是为了**保住你已经习惯的数字键 1-6**：包管理是 7。
+        // 包管理放第 7；「打包」追加到最后 —— 新域不该动你已经记住的 1-7。
         Domain::Packages,
+        Domain::Packaging,
+        // 「发现」也追加到最后：新域不该动你已经记住的 1-8。
+        Domain::Discover,
     ];
 
     /// Tabs 上的短标签。
@@ -44,6 +51,8 @@ impl Domain {
             Domain::Dev => "开发",
             Domain::Tools => "工具",
             Domain::Packages => "包管理",
+            Domain::Packaging => "打包",
+            Domain::Discover => "发现",
         }
     }
 
@@ -57,6 +66,8 @@ impl Domain {
             Domain::Dev => "开发工具 / 构建 / 仓库",
             Domain::Tools => "未归类的通用脚本",
             Domain::Packages => "pacman / AUR 包管理",
+            Domain::Packaging => "给自己的软件包打包 / 私有仓库 / CI",
+            Domain::Discover => "工具仓库 / 搜索 / 安装 / 更新",
         }
     }
 
@@ -70,6 +81,8 @@ impl Domain {
             Domain::Dev => "dev",
             Domain::Tools => "tools",
             Domain::Packages => "packages",
+            Domain::Packaging => "packaging",
+            Domain::Discover => "discover",
         }
     }
 
@@ -83,7 +96,7 @@ impl Domain {
             .find(|domain| needle == domain.label() || needle == domain.id())
     }
 
-    /// 在 [`Domain::ALL`] 中的下标，用于排序和按键映射（`1`..=`6`）。
+    /// 在 [`Domain::ALL`] 中的下标，用于排序和按键映射（`1`..=`8`）。
     pub fn index(self) -> usize {
         Domain::ALL
             .iter()
@@ -91,7 +104,7 @@ impl Domain {
             .unwrap_or(0)
     }
 
-    /// 从 `1`..=`6` 的数字键解析域。
+    /// 从 `1`..=`8` 的数字键解析域（超出域数量的数字返回 `None`）。
     pub fn from_digit(digit: char) -> Option<Self> {
         let index = digit.to_digit(10)? as usize;
         if (1..=Domain::ALL.len()).contains(&index) {
@@ -135,9 +148,14 @@ mod tests {
             assert_eq!(Domain::from_digit(digit), Some(*domain), "{digit}");
         }
         assert_eq!(Domain::from_digit('0'), None);
-        // 超出域数量的数字要落空（现在是 7 个域，所以 8 不行）
-        let beyond = char::from_digit(Domain::ALL.len() as u32 + 1, 10).expect("数字");
-        assert_eq!(Domain::from_digit(beyond), None);
+        // 现在正好 9 个域：单个数字 1-9 刚好用满。再加域就没有数字键可用了，
+        // 那时要么改成 g+数字 之类的前缀，要么接受新域没有快捷键。
+        assert_eq!(Domain::ALL.len(), 9);
+        assert_eq!(Domain::from_digit('9'), Some(Domain::ALL[8]));
+        if Domain::ALL.len() < 9 {
+            let beyond = char::from_digit(Domain::ALL.len() as u32 + 1, 10).expect("数字");
+            assert_eq!(Domain::from_digit(beyond), None);
+        }
         assert_eq!(Domain::from_digit('x'), None);
     }
 

@@ -1,0 +1,204 @@
+# docker-cleanup 的动作定义。
+#
+# 分工是刻意的：
+#   * 只读的三条直接跑 docker —— program 写裸命令名 docker，不在本包 scripts/ 里，
+#     于是依赖会被自动记成 docker，缺了界面就提示安装；
+#   * 会删东西的四条走本包的 scripts/docker-cleanup：默认只预览（列出会被删掉的
+#     对象 + 当前 docker system df），只有把「真的删」开关打开才会执行 prune -f。
+#     脚本自己也会在没装 docker 时给人话并且退出码 1。
+
+# ── 体检：占了哪块盘 ────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-disk-usage"
+name = "看 Docker 占了多少磁盘"
+summary = "docker system df：镜像 / 容器 / 卷 / 构建缓存各占多少，能回收多少"
+domain = "工具"
+tags = ["docker", "磁盘", "体检"]
+program = "docker"
+base_argv = ["system", "df"]
+mode = "capture"
+allow_empty = true
+install = "sudo pacman -S docker"
+input = "没有"
+output = "一张占用表"
+features = "只读；不用填任何参数；不删东西"
+
+# ── 体检：容器清单（含停掉的） ──────────────────────────────────────────────
+
+[[action]]
+id = "docker-list-containers"
+name = "列出所有容器（含已停止）"
+summary = "容器名 / 状态 / 镜像一行一个，默认把停掉的也列出来"
+domain = "工具"
+tags = ["docker", "容器", "体检"]
+program = "docker"
+base_argv = ["ps", "-a", "--format", "{{.Names}}  {{.Status}}  {{.Image}}"]
+mode = "capture"
+install = "sudo pacman -S docker"
+input = "没有（可按状态过滤）"
+output = "一行一个容器"
+features = "只读；可按运行中 / 已停止 / 已创建过滤"
+
+[[action.argument]]
+key = "status"
+label = "只看哪些"
+kind = "choice"
+flag = "--filter"
+help = "默认全列。想只找停掉的容器，选「已停止」"
+choices = [
+  { label = "全部（含已停止）", value = "" },
+  { label = "运行中", value = "status=running" },
+  { label = "已停止", value = "status=exited" },
+  { label = "已创建未启动", value = "status=created" },
+]
+
+# ── 体检：环境自检 ──────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-doctor"
+name = "docker 环境自检"
+summary = "docker 在哪、客户端与守护进程版本、存储驱动、数据根目录"
+domain = "工具"
+tags = ["docker", "体检"]
+program = "docker-cleanup"
+base_argv = ["doctor"]
+mode = "capture"
+allow_empty = true
+install = "sudo pacman -S docker"
+input = "没有"
+output = "一段环境报告"
+features = "只读；没装 docker 时直接告诉你怎么装、怎么起服务"
+
+# ── 清理：指定容器 ──────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-remove-container"
+name = "删掉指定的容器"
+summary = "按名字删一个容器；不加 -f 时只删已停止的，加 -f 连运行中的也能删"
+domain = "工具"
+tags = ["docker", "容器", "清理"]
+program = "docker"
+base_argv = ["rm"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S docker"
+input = "容器名"
+output = "docker rm 的结果"
+features = "容器名从 docker ps 的候选里挑；-f 强制删运行中的"
+
+[[action.argument]]
+key = "container"
+label = "容器"
+kind = "dynamic"
+source = "docker-containers"
+required = true
+help = "候选来自 docker ps（正在跑的容器）。要删已经停掉的容器，直接手打它的名字"
+
+[[action.argument]]
+key = "force"
+label = "强制（连运行中的一起删）"
+kind = "toggle"
+flag = "-f"
+default = "false"
+help = "关着的时候只能删已停止的容器 —— 这是保护，不是限制"
+
+# ── 清理：停掉的容器 ────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-prune-containers"
+name = "清理停掉的容器"
+summary = "把所有已停止 / 已创建未启动的容器一次删掉"
+domain = "工具"
+tags = ["docker", "容器", "清理"]
+program = "docker-cleanup"
+base_argv = ["containers"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S docker"
+input = "没有"
+output = "会被删掉的容器清单 → 回收了多少"
+features = "默认只预览；打开「真的删」才执行 docker container prune -f"
+
+[[action.argument]]
+key = "yes"
+label = "真的删"
+kind = "toggle"
+flag = "--yes"
+default = "false"
+help = "关着 = 只列出会被删掉的容器；打开才会执行 prune"
+
+# ── 清理：悬空镜像 ──────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-prune-images"
+name = "清理悬空镜像"
+summary = "删掉 dangling 镜像（没标签、也没人引用的那些中间层）"
+domain = "工具"
+tags = ["docker", "镜像", "清理"]
+program = "docker-cleanup"
+base_argv = ["images"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S docker"
+input = "没有"
+output = "会被删掉的镜像 → 回收了多少"
+features = "默认只预览；打开「真的删」才执行 docker image prune -f"
+
+[[action.argument]]
+key = "yes"
+label = "真的删"
+kind = "toggle"
+flag = "--yes"
+default = "false"
+help = "关着 = 只列出会被删掉的镜像；打开才会执行 prune"
+
+# ── 清理：未使用的卷 ────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-prune-volumes"
+name = "清理未使用的卷"
+summary = "删掉没有任何容器在用的卷 —— 注意这是真删数据，删了找不回来"
+domain = "工具"
+tags = ["docker", "卷", "清理"]
+program = "docker-cleanup"
+base_argv = ["volumes"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S docker"
+input = "没有"
+output = "会被删掉的卷 → 回收了多少"
+features = "默认只预览；打开「真的删」才执行 docker volume prune -f"
+
+[[action.argument]]
+key = "yes"
+label = "真的删"
+kind = "toggle"
+flag = "--yes"
+default = "false"
+help = "卷里是数据，删掉不会进回收站。想清楚再打开"
+
+# ── 清理：一锅端 ────────────────────────────────────────────────────────────
+
+[[action]]
+id = "docker-prune-all"
+name = "清理全部可回收对象（不含卷）"
+summary = "停掉的容器 + 悬空镜像 + 没用到的网络 + 构建缓存，一次清完"
+domain = "工具"
+tags = ["docker", "清理"]
+program = "docker-cleanup"
+base_argv = ["all"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S docker"
+input = "没有"
+output = "四类对象的清单 → 回收了多少"
+features = "默认只预览；刻意不碰卷（卷里是数据，请单独确认）"
+
+[[action.argument]]
+key = "yes"
+label = "真的删"
+kind = "toggle"
+flag = "--yes"
+default = "false"
+help = "关着 = 只预览四类对象；打开才会依次执行四条 prune"

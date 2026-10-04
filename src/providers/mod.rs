@@ -11,6 +11,7 @@
 //! | [`fftools`] | `~/.local/bin/fzf-*` 脚本头部元数据 | 媒体 |
 //! | [`scripted`] | 任意带注解的可执行脚本 | 由注解决定 |
 //! | [`manifest`] | TOML 写的「动作 + 参数」，包装已装 CLI | 由声明决定 |
+//! | [`repository`] | 从 ToolHub 仓库安装的包（事实来源是账本） | 由包里的 manifest 决定 |
 //!
 //! 这里刻意**不**接桌面应用条目（`.desktop`）：工具箱服务的是命令行工具，
 //! 不是应用启动器。
@@ -18,6 +19,7 @@
 pub mod fftools;
 pub mod manifest;
 pub mod metadata;
+pub mod repository;
 pub mod scripted;
 
 use std::path::Path;
@@ -82,6 +84,9 @@ pub fn all(bin_dir: &Path) -> Vec<Box<dyn Provider>> {
         Box::new(fftools::FftoolsProvider::new(bin_dir.to_path_buf())),
         Box::new(scripted::ScriptedProvider::with_defaults(bin_dir)),
         Box::new(manifest::ManifestProvider::with_defaults()),
+        // 仓库排在最后：用户手写的 manifest 与内置动作优先，装来的包不能把
+        // 同 id 的动作抢走（去重时先注册的胜出）。
+        Box::new(repository::RepositoryProvider::with_defaults(bin_dir)),
     ]
 }
 
@@ -97,11 +102,11 @@ mod tests {
         let ids: Vec<_> = providers.iter().map(|provider| provider.id()).collect();
         assert_eq!(
             ids,
-            vec!["fftools", "scripted", "manifest"],
+            vec!["fftools", "scripted", "manifest", "repository"],
             "注册顺序即去重优先级"
         );
 
         let labels: Vec<_> = providers.iter().map(|provider| provider.label()).collect();
-        assert_eq!(labels, vec!["FFTools", "本地脚本", "Manifest"]);
+        assert_eq!(labels, vec!["FFTools", "本地脚本", "Manifest", "仓库"]);
     }
 }

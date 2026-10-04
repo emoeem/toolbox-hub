@@ -1,0 +1,26 @@
+# docker-cleanup 的包元数据。
+#
+# [package] 的 id 与 version 必须和索引里的那条记录逐字一致（客户端会核对）。
+# 其余字段是写给人看的。
+
+[package]
+id = "docker-cleanup"
+name = "Docker 清理与体检"
+version = "1.0.0"
+summary = "看清 Docker 占了多少磁盘、有哪些容器，再按需清理悬空镜像 / 未用卷 —— 默认只预览"
+description = "把 Docker 的磁盘占用、容器清单和可回收对象摆出来，再决定要不要动手。三条体检动作（占用表、容器清单、环境自检）直接调用 docker；清理动作走本包的 scripts/docker-cleanup，默认只列出会被删掉的东西，加 --yes 才真删。悬空镜像、未使用的卷、停掉的容器、没人用的网络、构建缓存各一条，互不牵连。"
+categories = ["tools"]
+tags = ["docker", "容器", "清理", "磁盘"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+
+# 包里带着四条会真删东西的动作，所以包级危险度诚实地写 caution：
+# 装之前就知道它是干什么的，而不是装完在动作列表里才发现。
+danger = "caution"
+
+# 清理动作走本包脚本，program 不是裸的 docker，所以这里显式记一笔依赖：
+# 界面上缺 docker 时会按 hint 提示怎么装。
+[[dependencies]]
+command = "docker"
+hint = "sudo pacman -S docker"

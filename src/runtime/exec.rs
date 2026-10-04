@@ -60,15 +60,34 @@ struct Job {
 /// 执行期间会挂起 TUI（离开备用屏幕 + 关闭 raw mode），把终端完整交给工具，
 /// 全部跑完后等一次回车再恢复界面。
 pub fn execute_tools(tools: &[ToolDefinition], cwd: &Path) -> io::Result<ExecReport> {
-    let jobs: Vec<Job> = tools
+    run_batch(&jobs_from_tools(tools), cwd)
+}
+
+/// 不带表单取值的工具要怎么跑：`base_argv` + 各字段默认值。
+///
+/// 抽成一个函数是因为**两条路都要它**：capture 在 `App` 的队列那边拼，
+/// interactive 从这儿拼。曾经两条路都写成空的 `Vec::new()`，于是
+/// 「本体命令写在 `base_argv` 里」的动作全变成光跑程序名 ——
+/// 实测：`manage.sh <动作代号>` 变成光跑 `manage.sh`（弹出它自己的菜单），
+/// `sudo pacman -Rns` 会变成光跑 `sudo`。这类动作在用户 manifest 里很常见
+///（`program` 只是个包装器，真正的东西在 `base_argv`），所以两条路必须一致。
+pub(crate) fn default_argv(tool: &ToolDefinition) -> Vec<String> {
+    tool.action
+        .as_ref()
+        .and_then(|action| action.build_argv(&action.default_values()).ok())
+        .unwrap_or_default()
+}
+
+/// 把一批「不用填参数」的工具变成可执行的作业。
+fn jobs_from_tools(tools: &[ToolDefinition]) -> Vec<Job> {
+    tools
         .iter()
         .map(|tool| Job {
             label: tool.name.clone(),
             program: tool.path.clone(),
-            argv: Vec::new(),
+            argv: default_argv(tool),
         })
-        .collect();
-    run_batch(&jobs, cwd)
+        .collect()
 }
 
 /// 执行一件带参数的动作：程序取自工具，参数由表单构建。
@@ -93,7 +112,10 @@ pub fn execute_action(
 /// 为什么这里自己扫一遍：`runtime` 的约定是只依赖 [`crate::model`]，
 /// 不去碰 `providers` 里的工具发现逻辑（那边有一份带缓存的同类实现）。
 /// 这点有意为之的重复，比让执行层反过来依赖 Provider 层划算。
-fn find_on_path(program: &str) -> Option<PathBuf> {
+///
+/// `pub(crate)` 是因为 `ui pick` 也要找同一个程序（优先 yazi）—— 两处各写一份
+/// 找 PATH 的逻辑，迟早会有一处忘了处理「是目录不是文件」这类边界。
+pub(crate) fn find_on_path(program: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join(program))
@@ -682,7 +704,64 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{Captured, ExecReport, JobEvent, is_executable, spawn_captured};
+    use super::{
+        Captured, ExecReport, JobEvent, default_argv, is_executable, jobs_from_tools,
+        spawn_captured,
+    };
+
+    /// 不带参数的工具也必须把 `base_argv` 传下去。
+    ///
+    /// 这条抓到过真 bug：`execute_tools`（interactive 路径）里 `argv` 写死成
+    /// 空 `Vec`，于是「本体命令在 `base_argv` 里」的动作全变成光跑程序名 ——
+    /// 实测 `manage.sh <动作代号>` 变成了光跑 `manage.sh`（弹出它自己的菜单）。
+    /// capture 那条路也踩过同一个坑。两条路现在共用一个 `default_argv`。
+    #[test]
+    fn a_tool_without_a_form_still_runs_its_base_argv() {
+        use crate::model::{Action, Danger, Domain, RunMode, ToolDefinition};
+
+        let tool = ToolDefinition {
+            id: String::from("probe"),
+            name: String::from("探针"),
+            provider: String::from("test"),
+            domain: Domain::Tools,
+            tags: Vec::new(),
+            summary: String::new(),
+            input: None,
+            output: None,
+            features: None,
+            requires: Vec::new(),
+            missing_deps: Vec::new(),
+            install_hint: None,
+            action: Some(Action {
+                program: String::from("/usr/bin/echo"),
+                base_argv: vec![String::from("dashboard")],
+                arguments: Vec::new(),
+                duration_from: None,
+                limit_from: None,
+                ok_exit_codes: vec![0],
+                allow_empty: false,
+                foreach: None,
+            }),
+            pin: None,
+            mode: RunMode::Interactive,
+            danger: Danger::Safe,
+            path: PathBuf::from("/usr/bin/echo"),
+            ready: true,
+        };
+
+        assert_eq!(
+            default_argv(&tool),
+            vec![String::from("dashboard")],
+            "base_argv 是本体命令时不能丢"
+        );
+        let jobs = jobs_from_tools(&[tool]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].argv,
+            vec![String::from("dashboard")],
+            "interactive 那条路必须带上 base_argv"
+        );
+    }
 
     #[test]
     fn executable_check_requires_an_execute_permission_bit() {

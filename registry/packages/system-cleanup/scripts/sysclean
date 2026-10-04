@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+#
+# sysclean —— 系统清理预检：先看清楚能清什么、各有多大，再决定动不动手。
+#
+# 除了 pacman-prune，所有目标都是只读的：只跑 du / find / journalctl --disk-usage /
+# pacman -Qdtq，不删任何东西。
+#
+# pacman-prune 默认也只预览（paccache --dryrun），只有加 --yes 才真删；
+# 真删要 root，而这里不会偷偷提权 —— 提不了权就把该跑的命令原样告诉你。
+set -euo pipefail
+
+PROG="${0##*/}"
+TARGET=""
+APPLY=0
+TOP=15
+KEEP=1
+
+usage() {
+    cat <<'EOF'
+用法: sysclean [选项] <目标>
+
+目标（除 pacman-prune 外都是只读）:
+  report        下面每一节都跑一遍，一次看完
+  pacman-cache  pacman 包缓存占了多少、多少个包
+  journal       systemd 日志占了多少
+  user-cache    ~/.cache 里谁最占地方
+  thumbnails    缩略图缓存
+  orphans       孤儿包（没人依赖、也不是显式安装的）
+  pacman-prune  清 pacman 缓存：默认只预览
+
+选项:
+  -k, --keep N   pacman-prune 保留最近 N 个旧版本，默认 1
+      --top  N   user-cache 列前 N 个，默认 15
+  -y, --yes      pacman-prune 真的删（需要 root）
+  -h, --help     显示这份帮助
+
+例子:
+  sysclean report                 # 只读体检，先看这里
+  sysclean pacman-prune           # 预览会被删掉的包
+  sysclean pacman-prune --yes     # 真删（会先试 sudo -n，不行就告诉你怎么跑）
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    exit "${2:-1}"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+section() { printf '\n── %s ──\n' "$1"; }
+
+# du -sh 的人类可读大小；读不到就回空串（权限不足的目录会让 du 报错）。
+du_h() {
+    local out=""
+    out="$(du -sh "$1" 2>/dev/null | awk 'NR==1{print $1}')" || true
+    printf '%s' "$out"
+}
+
+# 数文件。$2 是 find 的 -name 模式，给了就只数当前层的匹配项。
+count_files() {
+    local n="" pattern="${2:-}"
+    if [ -n "$pattern" ]; then
+        n="$(find "$1" -maxdepth 1 -type f -name "$pattern" 2>/dev/null | wc -l)" || true
+    else
+        n="$(find "$1" -type f 2>/dev/null | wc -l)" || true
+    fi
+    printf '%s' "${n// /}"
+}
+
+pacman_cache_dir() { printf '%s' "/var/cache/pacman/pkg"; }
+
+report_pacman_cache() {
+    local dir size count
+    dir="$(pacman_cache_dir)"
+    section "pacman 包缓存（$dir）"
+    if [ ! -d "$dir" ]; then
+        printf '没有这个目录 —— 这台机器可能不是 Arch 系，或者缓存被挪到别处了。\n'
+        return 0
+    fi
+    size="$(du_h "$dir")"
+    count="$(count_files "$dir" '*.pkg.tar.*')"
+    printf '大小：%s\n' "${size:-读不出来（多半是权限不够）}"
+    printf '缓存包数：%s\n' "$count"
+    printf '可以清：paccache -d -k %s 先预览，paccache -r -k %s 真删（需要 root）\n' "$KEEP" "$KEEP"
+}
+
+report_journal() {
+    section "systemd 日志"
+    if ! have journalctl; then
+        printf '本机没有 journalctl（不是 systemd 系统？），跳过。\n'
+        return 0
+    fi
+    if ! journalctl --disk-usage 2>/dev/null; then
+        printf 'journalctl --disk-usage 读不了（多半是没进 systemd-journal 组）。\n'
+    fi
+    if [ -d /var/log/journal ]; then
+        printf '/var/log/journal 目录本身：%s\n' "$(du_h /var/log/journal)"
+    fi
+    printf '可以清：sudo journalctl --vacuum-size=200M（或 --vacuum-time=2weeks）\n'
+}
+
+report_user_cache() {
+    local cache
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}"
+    section "用户缓存（$cache）"
+    if [ ! -d "$cache" ]; then
+        printf '没有 %s 这个目录。\n' "$cache"
+        return 0
+    fi
+    printf '总大小：%s\n' "$(du_h "$cache")"
+    printf '\n最占地方的前 %s 个：\n' "$TOP"
+    du -sh "$cache"/* "$cache"/.[!.]* 2>/dev/null | sort -rh | head -n "$TOP" || true
+    printf '\n注意：这里面很多是应用自己的缓存（浏览器、包管理器…），\n'
+    printf '删掉它们通常安全但会变慢，动手前先看清楚是哪个程序的。\n'
+}
+
+report_thumbnails() {
+    local dir size count
+    dir="${XDG_CACHE_HOME:-$HOME/.cache}/thumbnails"
+    section "缩略图缓存（$dir）"
+    if [ ! -d "$dir" ]; then
+        printf '没有这个目录 —— 这台机器还没生成过缩略图。\n'
+        return 0
+    fi
+    size="$(du_h "$dir")"
+    count="$(count_files "$dir")"
+    printf '大小：%s\n' "${size:-读不出来}"
+    printf '文件数：%s\n' "$count"
+    printf '可以清：rm -rf %s/*（删了以后会自动重建，只是下次看图慢一点）\n' "$dir"
+}
+
+report_orphans() {
+    section "孤儿包（没人依赖、也不是你显式装的）"
+    if ! have pacman; then
+        printf '本机没有 pacman，跳过。\n'
+        return 0
+    fi
+    local list="" n=0
+    list="$(pacman -Qdtq 2>/dev/null)" || list=""
+    if [ -z "$list" ]; then
+        printf '一个孤儿包都没有，很干净。\n'
+        return 0
+    fi
+    printf '%s\n' "$list"
+    n="$(printf '%s\n' "$list" | wc -l)" || n=0
+    printf '\n共 %s 个。可以清：sudo pacman -Rns $(pacman -Qdtq)\n' "${n// /}"
+}
+
+report_all() {
+    report_pacman_cache
+    report_journal
+    report_user_cache
+    report_thumbnails
+    report_orphans
+    printf '\n以上全是只读的，什么都没删。要真清哪一项，见每节末尾那条命令。\n'
+}
+
+prune_pacman_cache() {
+    section "清理 pacman 包缓存（保留最近 $KEEP 个旧版本）"
+    if ! have paccache; then
+        printf '%s\n' "本机没有 paccache —— 它在 pacman-contrib 里，是唯一带 --dryrun 预览的那个。"
+        printf '%s\n' "  装：sudo pacman -S pacman-contrib"
+        printf '%s\n' "  不想装的话，官方的等价物是 sudo pacman -Sc（清空整个缓存，没有预览）"
+        exit 1
+    fi
+    if ! [ -d "$(pacman_cache_dir)" ]; then
+        printf '%s\n' "没有 $(pacman_cache_dir)，没东西可清。"
+        exit 0
+    fi
+
+    if [ "$APPLY" -eq 0 ]; then
+        printf '%s\n' "预览模式（paccache --dryrun）：下面是会被删掉的包。"
+        printf '\n$ paccache -d -k %s\n' "$KEEP"
+        paccache -d -k "$KEEP"
+        printf '\n确认没问题，就把「真的删」打开（或加 --yes）再跑一次。\n'
+        printf '提示：真删要 root，命令行里就是 sudo %s pacman-prune -k %s --yes\n' "$PROG" "$KEEP"
+        return 0
+    fi
+
+    printf '%s\n' "真的要删（--yes）"
+    if [ "$(id -u)" -eq 0 ]; then
+        paccache -r -k "$KEEP"
+    elif have sudo && sudo -n true 2>/dev/null; then
+        printf '%s\n' "（以 root 身份执行，sudo 免密可用）"
+        sudo -n paccache -r -k "$KEEP"
+    else
+        {
+            printf '%s\n' "$PROG: 删 /var/cache/pacman/pkg 里的包需要 root，这里没法替你提权。"
+            printf '\n  上面预览列出的就是会被删掉的包。要真删，请自己跑一次：\n'
+            printf '      sudo %s pacman-prune -k %s --yes\n' "$PROG" "$KEEP"
+            printf '\n  （工具箱不会替你 sudo；把这条命令贴到终端里跑就行。）\n'
+        } >&2
+        exit 1
+    fi
+    section "清完之后"
+    report_pacman_cache
+}
+
+main() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes) APPLY=1 ;;
+            -k|--keep)
+                [ $# -ge 2 ] || die "-k 后面要跟一个数字" 2
+                KEEP="$2"; shift
+                ;;
+            --keep=*) KEEP="${1#--keep=}" ;;
+            --top)
+                [ $# -ge 2 ] || die "--top 后面要跟一个数字" 2
+                TOP="$2"; shift
+                ;;
+            --top=*) TOP="${1#--top=}" ;;
+            -h|--help) usage; exit 0 ;;
+            --)
+                shift
+                [ $# -gt 0 ] && TARGET="$1"
+                break
+                ;;
+            -*) usage >&2; die "不认识的选项「$1」" 2 ;;
+            *)
+                if [ -n "$TARGET" ]; then die "只接受一个目标（-h 看用法）" 2; fi
+                TARGET="$1"
+                ;;
+        esac
+        shift
+    done
+
+    case "$KEEP" in
+        ''|*[!0-9]*) usage >&2; die "-k 要一个非负整数，给的是「$KEEP」" 2 ;;
+    esac
+    case "$TOP" in
+        ''|*[!0-9]*) usage >&2; die "--top 要一个非负整数，给的是「$TOP」" 2 ;;
+    esac
+
+    if [ -z "$TARGET" ]; then
+        usage >&2
+        die "没说要清什么（-h 看用法）" 2
+    fi
+
+    case "$TARGET" in
+        report)       report_all ;;
+        pacman-cache) report_pacman_cache ;;
+        journal)      report_journal ;;
+        user-cache)   report_user_cache ;;
+        thumbnails)   report_thumbnails ;;
+        orphans)      report_orphans ;;
+        pacman-prune) prune_pacman_cache ;;
+        *) usage >&2; die "不认识的目标「$TARGET」（-h 看用法）" 2 ;;
+    esac
+}
+
+main "$@"

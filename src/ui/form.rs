@@ -12,6 +12,17 @@ use ratatui::{
 
 use crate::{app::App, model::ArgKind, ui::theme};
 
+/// 字段值的显示文本：空值给一个占位符，编辑态带光标。
+fn display_or_placeholder(raw: &str, editing: bool) -> String {
+    if editing {
+        format!("{raw}▌")
+    } else if raw.is_empty() {
+        String::from("（空）")
+    } else {
+        raw.to_string()
+    }
+}
+
 /// 字段列表：占原来表格的位置。
 pub fn draw_fields(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let block = theme::panel(" 填写参数 ");
@@ -45,15 +56,27 @@ pub fn draw_fields(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 }
                 // 用箭头暗示「这里可以左右换」。
                 ArgKind::Choice => format!("◀ {} ▶", argument.choice_label(raw)),
-                ArgKind::Text | ArgKind::Path => {
-                    if editing {
+                // 动态候选：解析出来了就是可左右换的；还在路上就说清楚在等什么。
+                ArgKind::Dynamic => {
+                    let candidates = form.candidates_for(&argument.key);
+                    if !candidates.is_empty() {
+                        format!(
+                            "◀ {} ▶  {} 个候选",
+                            display_or_placeholder(raw, editing),
+                            candidates.len()
+                        )
+                    } else if let Some(problem) = form.candidate_errors.get(&argument.key) {
+                        format!(
+                            "◀ {} ▶  （候选取不到：{problem}）",
+                            display_or_placeholder(raw, editing)
+                        )
+                    } else if editing {
                         format!("{raw}▌")
-                    } else if raw.is_empty() {
-                        String::from("（空）")
                     } else {
-                        raw.to_string()
+                        format!("{}  （候选解析中…）", display_or_placeholder(raw, editing))
                     }
                 }
+                ArgKind::Text | ArgKind::Path => display_or_placeholder(raw, editing),
             };
 
             let value_style = match argument.kind {
@@ -65,6 +88,13 @@ pub fn draw_fields(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     }
                 }
                 ArgKind::Choice => Style::default().fg(theme::CYAN),
+                ArgKind::Dynamic => {
+                    if form.candidates_for(&argument.key).is_empty() {
+                        Style::default().fg(theme::FAINT)
+                    } else {
+                        Style::default().fg(theme::CYAN)
+                    }
+                }
                 ArgKind::Text | ArgKind::Path => {
                     if editing || (raw.is_empty() && argument.required) {
                         Style::default().fg(theme::YELLOW)

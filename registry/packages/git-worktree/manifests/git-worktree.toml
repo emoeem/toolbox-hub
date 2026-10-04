@@ -1,0 +1,238 @@
+# git-worktree 的动作定义 —— 五个子命令，一个脚本。
+#
+# program 是本包 scripts/git-worktree；脚本内部调用系统 git，
+# 所以 [[dependencies]] 里声明 git。
+#
+# 分支类参数用 kind = "dynamic" + source = "git-branches"：
+# 候选来自**当前工作目录**那个仓库的分支（grok 一下：TUI 里直接能选）。
+
+# ── 列出 worktree ───────────────────────────────────────────────────────────
+
+[[action]]
+id = "git-worktree-list"
+name = "列出 worktree"
+summary = "一行一个 worktree：目录、HEAD、签出的分支"
+domain = "开发"
+tags = ["git", "worktree", "分支"]
+program = "git-worktree"
+base_argv = ["list"]
+mode = "capture"
+install = "sudo pacman -S git"
+input = "一个 git 仓库（默认当前目录）"
+output = "worktree 清单"
+features = "可以换仓库；可以输出 --porcelain 给脚本用"
+
+[[action.argument]]
+key = "repo"
+label = "仓库目录"
+kind = "path"
+flag = "--repo"
+default = "."
+dir_only = true
+help = "在哪个仓库里干活；默认当前目录"
+
+[[action.argument]]
+key = "porcelain"
+label = "机器可读格式（porcelain）"
+kind = "toggle"
+flag = "--porcelain"
+default = "false"
+help = "打开后每行一个字段，方便脚本解析；关着就是给人看的对齐输出"
+
+# ── 新建 worktree ───────────────────────────────────────────────────────────
+
+[[action]]
+id = "git-worktree-add"
+name = "新建 worktree"
+summary = "给某个分支开一个独立的工作目录，互不打扰；也可以顺手开新分支"
+domain = "开发"
+tags = ["git", "worktree", "新建"]
+program = "git-worktree"
+base_argv = ["add"]
+mode = "capture"
+install = "sudo pacman -S git"
+input = "分支 + 目标目录"
+output = "新建出来的 worktree"
+features = "分支有候选列表；可以新建分支并指定起点；目标已存在时可强制"
+
+[[action.argument]]
+key = "repo"
+label = "仓库目录"
+kind = "path"
+flag = "--repo"
+default = "."
+dir_only = true
+help = "在哪个仓库里干活；默认当前目录"
+
+[[action.argument]]
+key = "branch"
+label = "分支"
+kind = "dynamic"
+flag = "--branch"
+required = true
+source = "git-branches"
+help = "要签出的分支；候选是当前仓库已有的分支，也可以直接手打一个新名字（配合下面的「新建分支」）"
+
+[[action.argument]]
+key = "path"
+label = "worktree 目录"
+kind = "path"
+flag = "--path"
+required = true
+help = "落到哪个目录，例如 ../wt-login；相对路径按「仓库目录」解析"
+
+[[action.argument]]
+key = "create"
+label = "新建分支（-b）"
+kind = "toggle"
+flag = "--new"
+default = "false"
+help = "把「分支」当成新分支名；不打开就是签出已经存在的分支"
+
+[[action.argument]]
+key = "start"
+label = "新分支起点"
+kind = "dynamic"
+flag = "--start"
+source = "git-branches"
+help = "只在「新建分支」打开时有用；留空 = 从 HEAD（当前分支）开始"
+
+[[action.argument]]
+key = "force"
+label = "目标已存在也硬上（--force）"
+kind = "toggle"
+flag = "--force"
+default = "false"
+help = "git worktree add --force：目标目录存在但不是 worktree 时会覆盖"
+
+# ── 已合并的分支 ────────────────────────────────────────────────────────────
+
+[[action]]
+id = "git-worktree-merged"
+name = "列出已合并的分支"
+summary = "看看哪些分支已经并进 main（或你指定的基准），可以放心删"
+domain = "开发"
+tags = ["git", "分支", "清理"]
+program = "git-worktree"
+base_argv = ["merged"]
+mode = "capture"
+install = "sudo pacman -S git"
+input = "一个仓库 + 基准分支"
+output = "已合并的分支清单（标出当前分支 / worktree 占用的）"
+features = "基准可选；可以连远程分支一起列；只读"
+
+[[action.argument]]
+key = "repo"
+label = "仓库目录"
+kind = "path"
+flag = "--repo"
+default = "."
+dir_only = true
+help = "在哪个仓库里干活；默认当前目录"
+
+[[action.argument]]
+key = "base"
+label = "基准"
+kind = "dynamic"
+flag = "--base"
+default = "HEAD"
+source = "git-branches"
+help = "以谁为准判断「已合并」；默认 HEAD = 当前分支"
+
+[[action.argument]]
+key = "remote"
+label = "连远程分支一起列"
+kind = "toggle"
+flag = "--remote"
+default = "false"
+help = "打开后会列出 origin/xxx 这类远程分支"
+
+# ── 清理已合并的分支 ────────────────────────────────────────────────────────
+
+[[action]]
+id = "git-worktree-cleanup"
+name = "清理已合并的分支"
+summary = "删掉已经合并的分支；默认只列出来，确认无误再加「真的删」"
+domain = "开发"
+tags = ["git", "分支", "清理"]
+program = "git-worktree"
+base_argv = ["cleanup"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S git"
+input = "一个仓库 + 基准分支"
+output = "待删清单，或删除结果"
+features = "默认预演；当前分支 / main / master / worktree 占用的分支一定删除"
+
+[[action.argument]]
+key = "repo"
+label = "仓库目录"
+kind = "path"
+flag = "--repo"
+default = "."
+dir_only = true
+help = "在哪个仓库里干活；默认当前目录"
+
+[[action.argument]]
+key = "base"
+label = "基准"
+kind = "dynamic"
+flag = "--base"
+default = "HEAD"
+source = "git-branches"
+help = "以谁为准判断「已合并」；默认 HEAD = 当前分支"
+
+[[action.argument]]
+key = "keep"
+label = "额外保住的分支"
+kind = "text"
+flag = "--keep"
+help = "逗号分隔，例如 develop,release；main / master / 当前分支 / 基准本来就会保住"
+
+[[action.argument]]
+key = "delete"
+label = "真的删（不然只列出来）"
+kind = "toggle"
+flag = "--delete"
+default = "false"
+help = "打开才执行 git branch -d；删的只会是确实合并过的分支"
+
+# ── 清理失效的 worktree 记录 ────────────────────────────────────────────────
+
+[[action]]
+id = "git-worktree-prune"
+name = "清理失效的 worktree 记录"
+summary = "手动删掉 worktree 目录之后，把 .git 里留下的记录一并清掉"
+domain = "开发"
+tags = ["git", "worktree", "清理"]
+program = "git-worktree"
+base_argv = ["prune"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S git"
+input = "一个 git 仓库"
+output = "被清掉的记录（如果没有就什么都不打印）"
+features = "可以先 --dry-run 预演；只动 .git/worktrees 里的管理文件，不动你的工作目录"
+
+[[action.argument]]
+key = "repo"
+label = "仓库目录"
+kind = "path"
+flag = "--repo"
+default = "."
+dir_only = true
+help = "在哪个仓库里干活；默认当前目录"
+
+[[action.argument]]
+key = "dry_run"
+label = "只预演（--dry-run）"
+kind = "toggle"
+flag = "--dry-run"
+default = "false"
+help = "打开后只说会清掉什么，什么都不改"
+
+# ── 外部依赖 ────────────────────────────────────────────────────────────────
+
+[[dependencies]]
+command = "git"
+hint = "sudo pacman -S git"

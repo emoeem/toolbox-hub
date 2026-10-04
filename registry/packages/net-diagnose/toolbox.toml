@@ -1,0 +1,22 @@
+# net-diagnose 的包元数据。
+
+[package]
+id = "net-diagnose"
+name = "网络诊断"
+version = "1.0.0"
+summary = "一个域名/IP 的 DNS 解析、连通性、路由、端口连通性，以及本机出口 IP 与 DNS 配置"
+description = "排查「网不通」的标准四件套：域名解析（dig）、连通性（ping，次数可填）、路由（traceroute，跳数可填）、端口通不通（nc -z，端口可填），外加一条只看本机的体检 —— 本机地址、默认路由、出口源地址、DNS 配置到底是谁。DNS / ping / traceroute / 端口这四条直接调用系统里已有的命令，缺了会提示装；本机体检走包里的 scripts/net-diagnose。全部只读，不改任何网络配置。"
+categories = ["network"]
+tags = ["网络", "诊断", "dns", "ping", "traceroute"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+
+# 全部动作只读：不改网络配置，也不删东西。
+danger = "safe"
+
+# 本机体检那条走包里的脚本（program 是 net-diagnose，不是裸命令），
+# 所以它用的 ip 命令显式记一笔。
+[[dependencies]]
+command = "ip"
+hint = "sudo pacman -S iproute2"

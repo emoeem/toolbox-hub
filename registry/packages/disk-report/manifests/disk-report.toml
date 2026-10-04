@@ -1,0 +1,202 @@
+# disk-report 的动作定义 —— 三个动作都是同一个脚本的子命令。
+#
+# program 写的是 scripts/disk-report（本包一起装的命令），所以不会被记成
+# 外部依赖；脚本真正用到的 du / find 在下面的 [[dependencies]] 里显式声明。
+#
+# 大小换算与排序都在脚本里做（argv 只是把选项原样传过去）：
+#   base_argv = ["dirs"] → disk-report dirs --path … --depth … --top …
+
+# ── 目录汇总：谁最占地方 ────────────────────────────────────────────────────
+
+[[action]]
+id = "disk-report-dirs"
+name = "目录占用汇总"
+summary = "把某个目录按深度汇总，按占用倒序排：一眼看出哪一层最占地方"
+domain = "系统"
+tags = ["磁盘", "占用", "du"]
+program = "disk-report"
+base_argv = ["dirs"]
+mode = "capture"
+install = "sudo pacman -S findutils coreutils"
+input = "一个目录"
+output = "按占用倒序的目录清单（人类可读大小 + 合计）"
+features = "深度可填；显示条数可填；不跨文件系统；只读"
+
+[[action.argument]]
+key = "path"
+label = "目录"
+kind = "path"
+flag = "--path"
+required = true
+default = "."
+dir_only = true
+help = "从哪个目录开始看；默认当前目录"
+
+[[action.argument]]
+key = "depth"
+label = "汇总深度"
+kind = "choice"
+flag = "--depth"
+required = true
+default = "1"
+help = "1 = 只看直接子目录；2 = 再往里一层，依此类推"
+choices = [
+  { label = "1 层（直接子目录）", value = "1" },
+  { label = "2 层", value = "2" },
+  { label = "3 层", value = "3" },
+  { label = "4 层", value = "4" },
+]
+
+[[action.argument]]
+key = "top"
+label = "显示前几项"
+kind = "choice"
+flag = "--top"
+required = true
+default = "20"
+help = "只打印最大的前 N 项，其余只计入合计"
+choices = [
+  { label = "前 10 项", value = "10" },
+  { label = "前 20 项", value = "20" },
+  { label = "前 50 项", value = "50" },
+  { label = "前 100 项", value = "100" },
+]
+
+# ── 最大的文件 ──────────────────────────────────────────────────────────────
+
+[[action]]
+id = "disk-report-files"
+name = "找出最大的文件"
+summary = "在某个目录里按大小倒序列出最大的文件，可限定深度和最小体积"
+domain = "系统"
+tags = ["磁盘", "大文件", "find"]
+program = "disk-report"
+base_argv = ["files"]
+mode = "capture"
+install = "sudo pacman -S findutils coreutils"
+input = "一个目录"
+output = "最大的文件清单（大小 + 路径 + 合计）"
+features = "深度可填；最小体积可选；显示条数可填；不跨文件系统；只读"
+
+[[action.argument]]
+key = "path"
+label = "目录"
+kind = "path"
+flag = "--path"
+required = true
+default = "."
+dir_only = true
+help = "从哪个目录开始找；默认当前目录"
+
+[[action.argument]]
+key = "depth"
+label = "搜索深度"
+kind = "choice"
+flag = "--depth"
+required = true
+default = "3"
+help = "往下找几层；「全部」在很大的目录上会很慢"
+choices = [
+  { label = "1 层", value = "1" },
+  { label = "2 层", value = "2" },
+  { label = "3 层（默认）", value = "3" },
+  { label = "5 层", value = "5" },
+  { label = "全部（慢）", value = "all" },
+]
+
+[[action.argument]]
+key = "min_size"
+label = "最小体积"
+kind = "choice"
+flag = "--min-size"
+required = true
+default = "0"
+help = "比这个还小的文件直接不算；用来过滤掉零碎小文件"
+choices = [
+  { label = "不限", value = "0" },
+  { label = "≥ 1 MiB", value = "1048576" },
+  { label = "≥ 10 MiB", value = "10485760" },
+  { label = "≥ 100 MiB", value = "104857600" },
+  { label = "≥ 1 GiB", value = "1073741824" },
+]
+
+[[action.argument]]
+key = "top"
+label = "显示前几个"
+kind = "choice"
+flag = "--top"
+required = true
+default = "20"
+help = "只打印最大的前 N 个，其余只计入合计"
+choices = [
+  { label = "前 10 个", value = "10" },
+  { label = "前 20 个", value = "20" },
+  { label = "前 50 个", value = "50" },
+  { label = "前 100 个", value = "100" },
+]
+
+# ── 按扩展名统计 ────────────────────────────────────────────────────────────
+
+[[action]]
+id = "disk-report-ext"
+name = "按扩展名统计"
+summary = "统计某目录下每种扩展名占了多少个文件、多大体积、占比多少"
+domain = "系统"
+tags = ["磁盘", "扩展名", "统计"]
+program = "disk-report"
+base_argv = ["ext"]
+mode = "capture"
+install = "sudo pacman -S findutils coreutils"
+input = "一个目录"
+output = "扩展名 → 文件数 / 总大小 / 占比"
+features = "深度可填；显示条数可填；无扩展名的文件归为一类；只读"
+
+[[action.argument]]
+key = "path"
+label = "目录"
+kind = "path"
+flag = "--path"
+required = true
+default = "."
+dir_only = true
+help = "统计哪个目录；默认当前目录"
+
+[[action.argument]]
+key = "depth"
+label = "统计深度"
+kind = "choice"
+flag = "--depth"
+required = true
+default = "3"
+help = "往下统计几层；「全部」在很大的目录上会很慢"
+choices = [
+  { label = "1 层", value = "1" },
+  { label = "2 层", value = "2" },
+  { label = "3 层（默认）", value = "3" },
+  { label = "5 层", value = "5" },
+  { label = "全部（慢）", value = "all" },
+]
+
+[[action.argument]]
+key = "top"
+label = "显示前几种"
+kind = "choice"
+flag = "--top"
+required = true
+default = "20"
+help = "只打印最大的前 N 种扩展名，其余只计入合计"
+choices = [
+  { label = "前 10 种", value = "10" },
+  { label = "前 20 种", value = "20" },
+  { label = "前 50 种", value = "50" },
+]
+
+# ── 外部依赖（脚本内部真正调用的命令） ──────────────────────────────────────
+
+[[dependencies]]
+command = "find"
+hint = "sudo pacman -S findutils"
+
+[[dependencies]]
+command = "du"
+hint = "sudo pacman -S coreutils"

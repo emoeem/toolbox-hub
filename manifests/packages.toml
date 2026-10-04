@@ -1,49 +1,97 @@
-# 包管理：pacman / paru 相关的系统包操作。
+# 包管理域 = 「进软件包中心」的四个入口 + 三个只有命令行才做得了的查询。
 #
-# **第一项就是软件包中心本身**（mode = "native"）：进这个域按 Enter 得到的是
-# 那个界面，而不是一张填参数的表单。以前这里只有 13 个 CLI 动作，界面上按 Enter
-# 第一项就弹表单 —— 那不是「包管理界面」该有的样子。
+# 为什么这里**不再**是十几个包装动作：搜索 / 安装 / 卸载 / 更新 / 清缓存 /
+# 孤儿包 / 待更新数 / 官方源信息 / AUR 信息 —— 这些软件包中心里**全都有**，
+# 而且中心还能看依赖、能排队、能先摆出要跑的命令、能开演练模式。
+# 把它们再包一层，只会让这个域看起来是一张和中心重复的表 ——
+# 于是「进域就自动开中心」这种补丁就出现了，层级也就乱了。
 #
-# 其余动作保留：单条查询、以及不经过队列的一次性操作，都有它们的用处。
+# 现在和其余六个域一致：**进域 = 动作列表，选中才进视图**；会改系统的动作
+# 一律走中心（`i` / `r` / `u` / `c` / `o` 那些键）或命令行
+# （`-i` / `-r` / `-u` / `--clear-cache`）。
 #
 # 会改系统的动作统一标 danger = "caution"，执行时接管终端处理 sudo / Y-n。
 # **需要 root 的动作把 program 写成 sudo**：pacman / paccache 自己不会提权，
 # 直接跑只会回一句 “unless you are root”。
 
-# ── 查询：只读，留在界面里看 ────────────────────────────────────────────────
-
-
-# ── 界面：进这个域的第一项 ──────────────────────────────────────────────────
+# ── 界面：四个入口（program 是**界面名[:模式]**，不是命令）──────────────────
 
 [[action]]
 id = "pkg-center"
-name = "软件包中心"
-summary = "全库浏览 / 搜官方源与 AUR / 排队安装 —— 包管理界面就在这儿"
+name = "搜索并安装"
+summary = "全库浏览 / 搜官方源与 AUR / 排队安装 —— 装包走这条"
 domain = "包管理"
-tags = ["安装", "搜索", "AUR"]
-# program 这里是**界面名**，不是命令（mode = "native"）
-program = "package-center"
+tags = ["安装"]
+program = "package-center:search"
 mode = "native"
-# 置顶：进这个域第一眼就该看到它（域内默认按名字排，不然它会沉到底部）
+# pin 决定域内顺序：四个入口按「最常用」排在最前面
 pin = 0
 danger = "safe"
 install = "自带"
 input = "无"
 output = "装好的包"
-features = "和列表里按 p 是同一个界面；一进去就是全库列表（打字即时过滤）"
+features = "和列表里按 p 是同一个界面；一进去就是全库列表。`/` 进过滤、`1-4` 切面板、`i` 装、`r` 卸"
+
+[[action]]
+id = "pkg-center-installed"
+name = "已安装 · 卸载"
+summary = "看本机装了什么：全部 / 显式 / 依赖 / 外来 / 孤儿，直接排队卸载"
+domain = "包管理"
+tags = ["卸载"]
+program = "package-center:installed"
+mode = "native"
+pin = 1
+danger = "safe"
+install = "自带"
+input = "无"
+output = "卸载后的系统"
+features = "五种预过滤；`Enter` 先摆出 `pacman -Rns` 那条命令，再按一次才动手"
+
+[[action]]
+id = "pkg-center-news"
+name = "Arch 新闻"
+summary = "官方新闻源：未读 / 已读，★ 标出「上次升级之后发布的」"
+domain = "包管理"
+tags = ["维护"]
+program = "package-center:news"
+mode = "native"
+pin = 2
+danger = "safe"
+install = "自带"
+input = "无"
+output = "看过的新闻"
+features = "`Enter` 抓一次 / 打开链接，`m` 标记已读，`M` 当前列表全标已读"
+
+[[action]]
+id = "pkg-center-health"
+name = "系统维护"
+summary = "一屏看完该处理的事：孤儿 / 依赖完整性 / .pacnew / 缓存 / 更新 / 文件完整性"
+domain = "包管理"
+tags = ["维护"]
+program = "package-center:health"
+mode = "native"
+pin = 3
+danger = "safe"
+install = "自带"
+input = "无"
+output = "处理好的系统"
+features = "每项直接 `Enter` 处理；文件完整性要真跑 `pacman -Qk`（几秒），所以单独一项"
+
+# ── 查询：只有命令行能做、中心里没有的 ──────────────────────────────────────
 
 [[action]]
 id = "pkg-search"
-name = "搜索官方源"
-summary = "pacman -Ss：官方源里有这个包吗（已安装的会标出来）"
+name = "用正则搜官方源"
+summary = "pacman -Ss：中心是子串匹配，要 `^fzf$` 这种就写这条"
 domain = "包管理"
-tags = ["搜索"]
+tags = ["查询"]
 program = "pacman"
 mode = "capture"
+pin = 4
 install = "自带（pacman）"
 input = "关键词"
 output = "匹配的包"
-features = "官方源；正则可用；标出 [已安装]"
+features = "官方源；**支持正则**；标出 [已安装]"
 
 [[action.argument]]
 key = "query"
@@ -54,76 +102,14 @@ required = true
 help = "包名或描述里的词；支持正则，例如 ^fzf$"
 
 [[action]]
-id = "pkg-info"
-name = "看官方源包信息"
-summary = "pacman -Sii：版本、依赖、大小、仓库、可选依赖"
-domain = "包管理"
-tags = ["信息"]
-program = "pacman"
-mode = "capture"
-install = "自带（pacman）"
-input = "包名"
-output = "详细信息"
-features = "-Sii 比 -Si 多出「必需者 / 可选者 / 安装原因」"
-
-[[action.argument]]
-key = "package"
-label = "包名"
-kind = "text"
-flag = "-Sii"
-required = true
-help = "要查的包名，例如 fzf"
-
-[[action]]
-id = "aur-search"
-name = "搜索官方源 + AUR"
-summary = "paru -Ss：一次搜两处，AUR 的也列出来"
-domain = "包管理"
-tags = ["搜索", "AUR"]
-program = "paru"
-mode = "capture"
-install = "sudo pacman -S paru"
-input = "关键词"
-output = "两边的匹配"
-features = "官方源 + AUR；AUR 包会标出得票"
-
-[[action.argument]]
-key = "query"
-label = "关键词"
-kind = "text"
-flag = "-Ss"
-required = true
-help = "包名或描述里的词"
-
-[[action]]
-id = "aur-info"
-name = "看 AUR 包信息"
-summary = "paru -Sii：维护者、得票、依赖、快照地址（装之前先看这个）"
-domain = "包管理"
-tags = ["信息", "AUR"]
-program = "paru"
-mode = "capture"
-install = "sudo pacman -S paru"
-input = "包名"
-output = "AUR 元数据"
-features = "维护者 / 得票 / 最后更新 / 快照 URL；装 AUR 包前该看的就是它"
-
-[[action.argument]]
-key = "package"
-label = "包名"
-kind = "text"
-flag = "-Sii"
-required = true
-help = "AUR 包名，例如 pacsea-bin"
-
-[[action]]
 id = "pkg-owner"
 name = "这个文件属于哪个包"
 summary = "pacman -Qo：某个可执行文件 / 配置文件是哪个包装的"
 domain = "包管理"
-tags = ["信息"]
+tags = ["查询"]
 program = "pacman"
 mode = "capture"
+pin = 5
 install = "自带（pacman）"
 input = "文件路径"
 output = "所属包"
@@ -142,9 +128,10 @@ id = "pkg-files"
 name = "这个包装了哪些文件"
 summary = "pacman -Ql：列出已安装包的全部文件"
 domain = "包管理"
-tags = ["信息"]
+tags = ["查询"]
 program = "pacman"
 mode = "capture"
+pin = 6
 install = "自带（pacman）"
 input = "包名"
 output = "文件清单"
@@ -157,185 +144,3 @@ kind = "text"
 flag = "-Ql"
 required = true
 help = "必须是**已安装**的包"
-
-[[action]]
-id = "pkg-orphans"
-name = "孤儿包"
-summary = "pacman -Qdt：装了但没有任何包依赖它们（可以清掉）"
-domain = "包管理"
-tags = ["清理"]
-program = "pacman"
-# -Qdt 是这个动作的本体（查：已安装、无人依赖、且不是显式安装的）
-base_argv = ["-Qdt"]
-# 没有孤儿包时 pacman 退出码是 1 —— 「没匹配到」不是失败
-ok_exit_codes = [0, 1]
-mode = "capture"
-install = "自带（pacman）"
-input = "无"
-output = "孤儿包列表"
-features = "只列出，不动手；要删就用下面的「卸载包」"
-
-[[action.argument]]
-key = "quiet"
-label = "只看包名"
-kind = "toggle"
-flag = "-q"
-help = "打开的话输出只有包名，方便复制粘贴"
-
-[[action]]
-id = "pkg-updates"
-name = "有哪些更新"
-summary = "checkupdates：不动系统，只列出官方源里能更新的包"
-domain = "包管理"
-tags = ["更新"]
-program = "checkupdates"
-# 没有更新时 checkupdates 退出码是 2
-ok_exit_codes = [0, 2]
-mode = "capture"
-install = "sudo pacman -S pacman-contrib"
-input = "无"
-output = "待更新的包"
-features = "只查不装，问「有多少更新」最安全的一条"
-
-[[action]]
-id = "pkg-cache-size"
-name = "包缓存占多大"
-summary = "du -sh：/var/cache/pacman/pkg 现在占了多少磁盘"
-domain = "包管理"
-tags = ["清理"]
-program = "du"
-# 缓存目录里有只有 root 能读的子目录，du 会因此退 1 —— 但总量照样给出来了
-ok_exit_codes = [0, 1]
-mode = "capture"
-install = "自带（coreutils）"
-input = "无"
-output = "占用大小"
-features = "清理之前先看一眼值不值得清"
-
-[[action.argument]]
-key = "human"
-label = "人类可读"
-kind = "toggle"
-flag = "-h"
-default = "true"
-help = "输出 3.2G 这种而不是一串字节数"
-
-[[action.argument]]
-key = "summarize"
-label = "只报总量"
-kind = "toggle"
-flag = "-s"
-default = "true"
-help = "只给一行总数，不列每个文件"
-
-[[action.argument]]
-key = "path"
-label = "目录"
-kind = "path"
-placement = "trailing"
-default = "/var/cache/pacman/pkg"
-help = "默认是 pacman 的包缓存目录"
-
-# ── 操作：会改系统，接管终端（sudo / Y-n 都要你自己回答）────────────────────
-
-[[action]]
-id = "pkg-install"
-name = "安装包（含 AUR）"
-summary = "paru -S：官方源没有就自动找 AUR；sudo 密码在这里输入"
-domain = "包管理"
-tags = ["安装"]
-program = "paru"
-mode = "interactive"
-danger = "caution"
-install = "sudo pacman -S paru"
-input = "包名"
-output = "装好的包"
-features = "官方源 + AUR；会把要装的东西列给你确认，按 Y/n。界面上按 p 更顺手：能搜、能看依赖、能排队，还能先看要跑的命令"
-
-[[action.argument]]
-key = "package"
-label = "包名"
-kind = "text"
-flag = "-S"
-required = true
-repeatable = true
-separator = " "
-help = "多个包用空格分隔；AUR 包会先编译（可能要一会儿）"
-
-[[action]]
-id = "pkg-remove"
-name = "卸载包（连依赖与配置）"
-summary = "sudo pacman -Rns：把包、它的依赖、以及 /etc 下的配置一起删掉"
-domain = "包管理"
-tags = ["卸载"]
-# 为什么 program 是 sudo 而不是 pacman：pacman **必须**以 root 跑，直接执行只会
-# 得到一句 “you cannot perform this operation unless you are root”。
-# 软件包中心那边走 packages::escalate()，是同一套判断。
-program = "sudo"
-base_argv = ["pacman", "-Rns"]
-mode = "interactive"
-danger = "caution"
-install = "自带（pacman）"
-input = "包名"
-output = "已卸载"
-features = "**会删配置**，删之前先看清楚列表；软件包中心（p）里会先列出谁依赖它"
-
-[[action.argument]]
-key = "package"
-label = "包名"
-kind = "text"
-# **不给 flag**：`-Rns` 已经写在 base_argv 里了，这里再写一遍会变成
-# `sudo pacman -Rns -Rns bash`。不带 flag 的参数就是追在后面的位置参数。
-required = true
-repeatable = true
-separator = " "
-help = "多个包用空格分隔；想保留配置就用 pacman -R"
-
-[[action]]
-id = "pkg-upgrade"
-name = "全系统更新"
-summary = "paru -Syu：先同步数据库，再更新官方源与 AUR 的全部包"
-domain = "包管理"
-tags = ["更新"]
-program = "paru"
-# -Syu 是这个动作的本体（同步数据库 + 更新全部）
-base_argv = ["-Syu"]
-mode = "interactive"
-danger = "caution"
-install = "sudo pacman -S paru"
-input = "无"
-output = "更新后的系统"
-features = "更新前建议先看「有哪些更新」；AUR 包会重新编译"
-
-[[action.argument]]
-key = "devel"
-label = "含开发版（-git）"
-kind = "toggle"
-flag = "--devel"
-help = "打开的话 -git / -svn 这类包也会一起更新"
-
-[[action]]
-id = "pkg-clean-cache"
-name = "清理旧包缓存"
-summary = "sudo paccache -rk1：每个包只留最近一个版本（能腾出不少空间）"
-domain = "包管理"
-tags = ["清理"]
-# 同上：paccache 要写 /var/cache/pacman/pkg，非 root 跑不动
-program = "sudo"
-base_argv = ["paccache"]
-mode = "interactive"
-danger = "caution"
-install = "sudo pacman -S pacman-contrib"
-input = "无"
-output = "腾出来的空间"
-features = "保留策略可改；默认只删旧版本，不会动当前装的"
-
-[[action.argument]]
-key = "keep"
-label = "每个包保留几个版本"
-kind = "text"
-flag = "-rk"
-flag_join = true          # paccache 认 -rk1 这种连写
-required = true
-default = "1"
-help = "默认 1（只留最新）；想保守点就写 2 或 3"

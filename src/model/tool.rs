@@ -131,6 +131,8 @@ impl ToolDefinition {
             Domain::Dev => "项目目录 / 源码文件",
             Domain::Tools => "按工具提示选择输入",
             Domain::Packages => "包名 / 文件路径 / 关键词",
+            Domain::Packaging => "包名 / 范围 / 分支",
+            Domain::Discover => "关键词 / 包名",
         })
     }
 
@@ -144,6 +146,8 @@ impl ToolDefinition {
             Domain::Dev => "构建产物 / 命令输出",
             Domain::Tools => "按工具操作流程生成",
             Domain::Packages => "包信息 / 安装结果",
+            Domain::Packaging => "构建结论 / 计划 / 报告",
+            Domain::Discover => "搜索与安装结果",
         })
     }
 

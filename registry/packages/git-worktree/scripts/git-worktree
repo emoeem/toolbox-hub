@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+#
+# git-worktree —— worktree / 分支的日常管理：列出来、开新的、清理已合并的。
+#
+# 只调用系统里的 git；不联网、不需要 root（除非你的仓库配置让 git 自己去连）。
+#
+# 退出码：0 正常；1 运行出错（不是 git 仓库、git 自己失败）；2 用法不对。
+set -euo pipefail
+
+PROG="${0##*/}"
+VERSION="1.0.0"
+
+usage() {
+    cat <<EOF
+用法: $PROG <子命令> [选项]
+
+围绕 git worktree 与分支的几件日常事。所有子命令都认 --repo <目录>，
+默认在当前目录的仓库上干活；相对路径一律按 --repo 解析。
+
+子命令:
+  list     列出所有 worktree（--porcelain 输出给脚本看的格式）
+  add      新建一个 worktree（签出已有分支，或顺手开一个新分支）
+  merged   列出已经合并到某个分支的分支（只读）
+  cleanup  删掉已经合并的分支（默认只列出，加 --delete 才真的删）
+  prune    清掉「目录已经没了」的 worktree 记录
+
+通用:
+  -h, --help      显示这份帮助
+  -V, --version   显示版本
+
+各子命令的选项:
+  $PROG list    [--repo 目录] [--porcelain]
+  $PROG add     [--repo 目录] --branch 分支 --path 目录
+                [--new] [--start 起点] [--force]
+  $PROG merged  [--repo 目录] [--base 基准] [--remote]
+  $PROG cleanup [--repo 目录] [--base 基准] [--keep a,b] [--delete]
+  $PROG prune   [--repo 目录] [--dry-run]
+
+  --repo      在哪个仓库里干活（默认 .）
+  --branch    要签出的分支；TUI 里会把当前仓库的分支列成候选
+  --path      worktree 落到哪个目录
+  --new       把 --branch 当作新分支名（git worktree add -b）
+  --start     新分支从哪儿开始（默认 HEAD），只在 --new 时有用
+  --force     目标已存在时也硬上（git worktree add --force）
+  --base      比较基准（默认 HEAD，也就是当前分支）
+  --remote    merged 用：连远程分支一起列
+  --keep      cleanup 要保住的分支，逗号分隔；main / master / 当前分支 /
+              基准分支默认一定保住
+  --delete    cleanup 用：真的删。不写就只列出来
+  --dry-run   prune 用：只说会清掉什么，不动手
+
+示例:
+  $PROG list
+  $PROG add --branch feature/login --path ../wt-login
+  $PROG add --branch feature/new --path ../wt-new --new --start main
+  $PROG merged --base main
+  $PROG cleanup --base main --keep develop
+  $PROG cleanup --base main --keep develop --delete
+  $PROG prune --dry-run
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; printf '%s: 用 -h 看用法\n' "$PROG" >&2; exit 1; }
+bad_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+# 多行文本里有没有这一行（精确匹配，纯 bash，不依赖 grep）
+contains_line() {
+    local line
+    while IFS= read -r line; do
+        if [ "$line" = "$2" ]; then
+            return 0
+        fi
+    done <<< "$1"
+    return 1
+}
+
+require_repo() {
+    [ -d "$1" ] || die "「$1」不是目录"
+    git -C "$1" rev-parse --git-dir >/dev/null 2>&1 \
+        || die "「$1」不是一个 git 仓库（或者它里面没有 .git）"
+}
+
+current_branch() { git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || true; }
+
+# 给人看的基准名字：HEAD 就顺带把当前分支名写出来
+base_label() {
+    if [ "$2" = "HEAD" ]; then
+        local head_branch
+        head_branch="$(current_branch "$1")"
+        [ -n "$head_branch" ] && { printf 'HEAD（当前分支 %s）' "$head_branch"; return; }
+    fi
+    printf '%s' "$2"
+}
+
+# 已经在某个 worktree 里签出的分支（这些分支删不得）
+worktree_branches() {
+    git -C "$1" worktree list --porcelain 2>/dev/null \
+        | awk '/^branch / { sub("^refs/heads/", "", $2); print $2 }'
+}
+
+# ── list：列出 worktree ─────────────────────────────────────────────────────
+
+cmd_list() {
+    local repo="." porcelain=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || bad_usage "list: --repo 后面要跟目录"; repo="$2"; shift 2 ;;
+            --porcelain) porcelain=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) bad_usage "list: 不认识的参数「$1」" ;;
+        esac
+    done
+    require_repo "$repo"
+
+    printf 'worktree  %s\n\n' "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$repo")"
+    if [ "$porcelain" -eq 1 ]; then
+        git -C "$repo" worktree list --porcelain
+    else
+        git -C "$repo" worktree list
+        printf '\n（方括号里是它签出的分支；目录已经不在了的会标 prunable）\n'
+    fi
+}
+
+# ── add：新建 worktree ──────────────────────────────────────────────────────
+
+cmd_add() {
+    local repo="." branch="" path="" create=0 start="" force=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || bad_usage "add: --repo 后面要跟目录"; repo="$2"; shift 2 ;;
+            --branch) [ "$#" -ge 2 ] || bad_usage "add: --branch 后面要跟分支名"; branch="$2"; shift 2 ;;
+            --path) [ "$#" -ge 2 ] || bad_usage "add: --path 后面要跟目录"; path="$2"; shift 2 ;;
+            --new) create=1; shift ;;
+            --start) [ "$#" -ge 2 ] || bad_usage "add: --start 后面要跟起点"; start="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) bad_usage "add: 不认识的参数「$1」" ;;
+        esac
+    done
+    [ -n "$branch" ] || bad_usage "add: 必须给 --branch（要签出或新建的分支名）"
+    [ -n "$path" ] || bad_usage "add: 必须给 --path（worktree 落到哪个目录）"
+    require_repo "$repo"
+
+    set --
+    [ "$force" -eq 1 ] && set -- "$@" --force
+    if [ "$create" -eq 1 ]; then
+        printf '从 %s 新建分支 %s，worktree 落到 %s\n' "${start:-HEAD}" "$branch" "$path"
+        git -C "$repo" worktree add "$@" -b "$branch" -- "$path" "${start:-HEAD}"
+    else
+        printf '签出已有分支 %s，worktree 落到 %s\n' "$branch" "$path"
+        git -C "$repo" worktree add "$@" -- "$path" "$branch"
+    fi
+}
+
+# ── merged：列出已合并的分支 ────────────────────────────────────────────────
+
+cmd_merged() {
+    local repo="." base="HEAD" remote=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || bad_usage "merged: --repo 后面要跟目录"; repo="$2"; shift 2 ;;
+            --base) [ "$#" -ge 2 ] || bad_usage "merged: --base 后面要跟基准"; base="$2"; shift 2 ;;
+            --remote) remote=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) bad_usage "merged: 不认识的参数「$1」" ;;
+        esac
+    done
+    require_repo "$repo"
+
+    local refs="refs/heads/"
+    [ "$remote" -eq 1 ] && refs="refs/remotes/"
+    local merged cur wts
+    merged="$(git -C "$repo" for-each-ref --merged "$base" --format='%(refname:short)' "$refs")"
+    cur="$(current_branch "$repo")"
+    wts="$(worktree_branches "$repo")"
+
+    printf '已合并的分支（基准 %s）：\n\n' "$(base_label "$repo" "$base")"
+    if [ -z "$merged" ]; then
+        printf '  （没有）\n'
+        return 0
+    fi
+    local b mark note
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        case "$b" in */HEAD) continue ;; esac
+        mark=" "
+        note=""
+        if [ "$b" = "$cur" ]; then
+            mark="*"; note="  ← 当前分支，cleanup 不会动它"
+        elif contains_line "$wts" "$b"; then
+            mark="+"; note="  ← 已在别的 worktree 里签出，cleanup 不会动它"
+        fi
+        case "$b" in
+            main|master) note="$note  ← 主分支，cleanup 默认保住" ;;
+        esac
+        printf '  %s %s%s\n' "$mark" "$b" "$note"
+    done <<< "$merged"
+}
+
+# ── cleanup：删掉已合并的分支 ───────────────────────────────────────────────
+
+cmd_cleanup() {
+    local repo="." base="HEAD" keep="" delete=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || bad_usage "cleanup: --repo 后面要跟目录"; repo="$2"; shift 2 ;;
+            --base) [ "$#" -ge 2 ] || bad_usage "cleanup: --base 后面要跟基准"; base="$2"; shift 2 ;;
+            --keep) [ "$#" -ge 2 ] || bad_usage "cleanup: --keep 后面要跟分支名"; keep="$2"; shift 2 ;;
+            --delete) delete=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) bad_usage "cleanup: 不认识的参数「$1」" ;;
+        esac
+    done
+    require_repo "$repo"
+
+    local cur wts merged
+    cur="$(current_branch "$repo")"
+    wts="$(worktree_branches "$repo")"
+    merged="$(git -C "$repo" for-each-ref --merged "$base" --format='%(refname:short)' refs/heads/)"
+
+    # 默认保住：当前分支、基准分支、main、master，外加 --keep 点名的
+    local protected="$cur"
+    protected="$protected"$'\n'"$base"
+    local fixed
+    for fixed in main master; do
+        protected="$protected"$'\n'"$fixed"
+    done
+    if [ -n "$keep" ]; then
+        local item
+        IFS=',' read -r -a keep_items <<< "$keep"
+        for item in "${keep_items[@]}"; do
+            item="${item#"${item%%[![:space:]]*}"}"
+            item="${item%"${item##*[![:space:]]}"}"
+            [ -n "$item" ] && protected="$protected"$'\n'"$item"
+        done
+    fi
+
+    local -a targets=()
+    local b
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        contains_line "$protected" "$b" && continue
+        contains_line "$wts" "$b" && continue
+        targets+=("$b")
+    done <<< "$merged"
+
+    if [ "${#targets[@]}" -eq 0 ]; then
+        printf '没有可清理的分支：已合并到 %s 的都还在保护名单里（当前分支 / 基准 / main / master / --keep）。\n' "$(base_label "$repo" "$base")"
+        return 0
+    fi
+
+    if [ "$delete" -eq 0 ]; then
+        printf '这些分支已合并到 %s，可以删（加 --delete 才真的删）：\n\n' "$(base_label "$repo" "$base")"
+        for b in "${targets[@]}"; do printf '  %s\n' "$b"; done
+        printf '\n共 %d 个。删除用的是 git branch -d（只会删确实合并过的）。\n' "${#targets[@]}"
+        return 0
+    fi
+
+    printf '删除已合并到 %s 的分支：\n' "$(base_label "$repo" "$base")"
+    for b in "${targets[@]}"; do
+        git -C "$repo" branch -d -- "$b"
+    done
+}
+
+# ── prune：清理失效的 worktree 记录 ─────────────────────────────────────────
+
+cmd_prune() {
+    local repo="." dry=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || bad_usage "prune: --repo 后面要跟目录"; repo="$2"; shift 2 ;;
+            --dry-run) dry=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) bad_usage "prune: 不认识的参数「$1」" ;;
+        esac
+    done
+    require_repo "$repo"
+
+    if [ "$dry" -eq 1 ]; then
+        printf '预演：下面这些 worktree 记录会被清掉（目录已经不在了）\n\n'
+        git -C "$repo" worktree prune --dry-run -v
+        printf '\n预演而已，什么都没改。\n'
+    else
+        printf '清理失效的 worktree 记录：\n'
+        git -C "$repo" worktree prune -v
+        printf '完成。\n'
+    fi
+}
+
+# ── 分发 ────────────────────────────────────────────────────────────────────
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+
+command="$1"
+shift
+case "$command" in
+    list)    cmd_list    "$@" ;;
+    add)     cmd_add     "$@" ;;
+    merged)  cmd_merged  "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    prune)   cmd_prune   "$@" ;;
+    -h|--help|help) usage; exit 0 ;;
+    -V|--version|version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    *) bad_usage "不认识的子命令「$command」（可用 list / add / merged / cleanup / prune）" ;;
+esac

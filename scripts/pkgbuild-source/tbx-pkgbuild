@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# 「打包」域那些动作的真正入口：把参数原样转给私人软件仓库里的 manage.sh。
+#
+# 为什么要有这一层：manifest 的 `program` 走 PATH 解析，而那个仓库在哪儿只有你知道，
+# 没法写死在随包发布的 manifest 里 —— 所以写成裸命令名 `tbx-pkgbuild`，
+# 由这个脚本按下面的顺序找仓库。
+#
+# 仓库位置（先命中先用）：
+#   1. $TOOLBOX_HUB_PKGBUILD_SRC
+#   2. ~/pkgbuild-source
+#   3. ~/code/pkgbuild-source
+#
+# 用法和 manage.sh 完全一致：
+#   tbx-pkgbuild --list        # 列出动作代号（给脚本 / 补全用）
+#   tbx-pkgbuild dashboard     # 跳过菜单，直接跑那一个动作
+#   tbx-pkgbuild               # 进它自己的 fzf 菜单
+set -Eeuo pipefail
+
+root="${TOOLBOX_HUB_PKGBUILD_SRC:-}"
+
+if [[ -z "$root" ]]; then
+    for candidate in "$HOME/pkgbuild-source" "$HOME/code/pkgbuild-source"; do
+        if [[ -x "$candidate/manage.sh" ]]; then
+            root="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$root" ]]; then
+    cat >&2 <<'EOF'
+找不到私人软件仓库（pkgbuild-source）。
+
+  把它放在 ~/pkgbuild-source（或 ~/code/pkgbuild-source），
+  或者显式指定：export TOOLBOX_HUB_PKGBUILD_SRC=/path/to/pkgbuild-source
+EOF
+    exit 2
+fi
+
+manage="$root/manage.sh"
+if [[ ! -x "$manage" ]]; then
+    printf '这个仓库里没有可执行的 manage.sh：%s\n' "$manage" >&2
+    exit 2
+fi
+
+exec "$manage" "$@"

@@ -1,0 +1,138 @@
+# system-cleanup 的动作定义。
+#
+# 全部动作都走本包的 scripts/sysclean（装到 ~/.local/bin），base_argv 决定做哪一节。
+# 除了 pacman-prune，每一节都只读：du / find / journalctl --disk-usage / pacman -Qdtq。
+# pacman-prune 默认只跑 paccache --dryrun 预览，--yes 才真删。
+
+# ── 一次看完 ────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "sysclean-report"
+name = "系统清理预检（一次看完）"
+summary = "pacman 缓存 / 日志 / ~/.cache / 缩略图 / 孤儿包各占多少，一条条列出来"
+domain = "系统"
+tags = ["清理", "体检", "磁盘"]
+program = "sysclean"
+base_argv = ["report"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "五节体检报告"
+features = "完全只读；一个字节都不删；每节末尾给出对应的清理命令"
+
+# ── 分项预检 ────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "sysclean-pacman-cache"
+name = "pacman 缓存占了多少"
+summary = "/var/cache/pacman/pkg 的大小与包数，以及 paccache 该怎么用"
+domain = "系统"
+tags = ["清理", "pacman", "磁盘"]
+program = "sysclean"
+base_argv = ["pacman-cache"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "大小 + 缓存包数"
+features = "只读；用 du 与 find 量，不动任何文件"
+
+[[action]]
+id = "sysclean-journal"
+name = "systemd 日志占了多少"
+summary = "journalctl --disk-usage，顺带量一下 /var/log/journal 目录"
+domain = "系统"
+tags = ["清理", "日志", "磁盘"]
+program = "sysclean"
+base_argv = ["journal"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "日志占用 + 归档命令"
+features = "只读；没进 systemd-journal 组会明说读不了，而不是假装 0"
+
+[[action]]
+id = "sysclean-user-cache"
+name = "~/.cache 里谁最占地方"
+summary = "用户缓存的总体积 + 最占地方的前 N 个目录"
+domain = "系统"
+tags = ["清理", "缓存", "磁盘"]
+program = "sysclean"
+base_argv = ["user-cache"]
+mode = "capture"
+input = "没有（可改显示条数）"
+output = "总体积 + 排行榜"
+features = "只读；条数可调；会提醒哪些是应用自己的缓存、别乱删"
+
+[[action.argument]]
+key = "top"
+label = "列前几个"
+kind = "text"
+flag = "--top"
+default = "15"
+help = "按体积从大到小排，只显示前这么多个"
+
+[[action]]
+id = "sysclean-thumbnails"
+name = "缩略图缓存占了多少"
+summary = "文件管理器与图片预览生成的缩略图缓存，大小与文件数"
+domain = "系统"
+tags = ["清理", "缓存", "缩略图"]
+program = "sysclean"
+base_argv = ["thumbnails"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "大小 + 文件数"
+features = "只读；删了会自动重建，所以安全，这里只把体积摆出来"
+
+[[action]]
+id = "sysclean-orphans"
+name = "孤儿包有哪些"
+summary = "没人依赖、也不是你显式安装的包（pacman -Qdtq）"
+domain = "系统"
+tags = ["清理", "pacman"]
+program = "sysclean"
+base_argv = ["orphans"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "孤儿包清单 + 数量"
+features = "只读；一个都没有时会明说「很干净」，而不是留一片空白"
+
+# ── 真清理（只有这一条） ────────────────────────────────────────────────────
+
+[[action]]
+id = "sysclean-pacman-prune"
+name = "清理 pacman 缓存"
+summary = "删掉旧版本的包缓存；默认只跑 paccache --dryrun 预览，加 --yes 才真删"
+domain = "系统"
+tags = ["清理", "pacman", "磁盘"]
+program = "sysclean"
+base_argv = ["pacman-prune"]
+mode = "capture"
+danger = "caution"
+input = "没有（可改保留几个版本）"
+output = "预览：会被删掉的包与能省多少；执行：paccache -r 的结果"
+features = "默认只预览；真删要 root，提不了权就把该跑的命令打出来，绝不偷偷 sudo"
+
+[[action.argument]]
+key = "keep"
+label = "每个包保留几个旧版本"
+kind = "choice"
+flag = "-k"
+default = "1"
+help = "保留得越多越保险、省得越少；0 就是全清（只留当前已装的）"
+choices = [
+  { label = "全清（-k 0）", value = "0" },
+  { label = "保留 1 个旧版本（-k 1，默认）", value = "1" },
+  { label = "保留 2 个（-k 2）", value = "2" },
+  { label = "保留 3 个（-k 3，paccache 的默认值）", value = "3" },
+]
+
+[[action.argument]]
+key = "yes"
+label = "真的删"
+kind = "toggle"
+flag = "--yes"
+default = "false"
+help = "关着 = 只跑 paccache --dryrun 列出会被删的包；打开才会执行 paccache -r"

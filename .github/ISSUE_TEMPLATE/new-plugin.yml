@@ -1,0 +1,91 @@
+name: 新插件提案
+description: 想往官方仓库加一个插件？先在这里把「它是什么、跑什么命令」说清楚。
+title: "[插件] "
+labels: ["plugin"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        写包之前先看一眼 [docs/plugin-authoring.md](https://github.com/emoeem/toolbox-hub/blob/main/docs/plugin-authoring.md)
+        和 [CONTRIBUTING.md](https://github.com/emoeem/toolbox-hub/blob/main/CONTRIBUTING.md)：
+        五分钟就能生成一个能跑通的骨架，提交时记得把 `index.json` 与 `artifacts/` 一起带上。
+
+        这个 issue 用来先对齐「值不值得收」；已经有完整实现的，直接开 PR 也可以。
+
+  - type: input
+    id: plugin-id
+    attributes:
+      label: 插件名（包 id）
+      description: 小写字母、数字、- _ .；它同时也是 registry/packages/<id>/ 的目录名。
+      placeholder: my-tool
+    validations:
+      required: true
+
+  - type: input
+    id: summary
+    attributes:
+      label: 一句话说明
+      description: 会显示在搜索结果和列表里，别写成「一个很有用的工具」。
+      placeholder: 把文件里的大写换成小写
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 它解决什么问题
+      description: 现在你是怎么忍过去的？为什么现成命令不够用？
+      placeholder: |
+        我要批量改一堆文件名的大小写，mv 一个一个来太慢，
+        写 for 循环每次都要重新查一遍大小写转换的写法。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actions
+    attributes:
+      label: 动作列表
+      description: 一条动作一行：界面上显示的名字 + 它实际跑的命令。一个动作只做一件事。
+      placeholder: |
+        - 转小写：my-tool --lower <文件>
+        - 转大写：my-tool --upper <文件>
+    validations:
+      required: true
+
+  - type: input
+    id: dependencies
+    attributes:
+      label: 依赖的命令
+      description: 动作的 program，以及脚本里调用到的其它命令。没有就写「无」。
+      placeholder: jq, coreutils
+    validations:
+      required: true
+
+  - type: dropdown
+    id: requires-root
+    attributes:
+      label: 是否需要 root
+      description: 官方仓库里 requires_root 一律 false（客户端不会替你提权）。需要 root 的话，一般得换个不需要 root 的做法。
+      options:
+        - 不需要
+        - 需要
+    validations:
+      required: true
+
+  - type: input
+    id: author
+    attributes:
+      label: 作者
+      description: 你的名字或 GitHub 用户名，会写进 toolbox.toml / 索引。
+      placeholder: emo
+    validations:
+      required: true
+
+  - type: input
+    id: repo
+    attributes:
+      label: 仓库地址（可选）
+      description: 如果你已经把它放在自己的仓库里（index.json 或源码目录），贴这里；没有就留空。
+      placeholder: https://github.com/you/my-tools
+    validations:
+      required: false

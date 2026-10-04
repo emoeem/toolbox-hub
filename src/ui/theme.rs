@@ -49,6 +49,10 @@ pub fn domain_color(domain: Domain) -> Color {
         Domain::Tools => TEXT,
         // 包管理用琥珀色：和开发紫、系统蓝区分得开，又不像危险色那样刺眼。
         Domain::Packages => YELLOW,
+        // 打包用粉：和包管理的琥珀、开发紫都分得开，又不像红那样像"出事了"。
+        Domain::Packaging => PINK,
+        // 发现用青绿：一眼认出「这是去外面拿东西」的那个面板。
+        Domain::Discover => CYAN,
     }
 }
 

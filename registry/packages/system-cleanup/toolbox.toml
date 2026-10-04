@@ -1,0 +1,25 @@
+# system-cleanup 的包元数据。
+
+[package]
+id = "system-cleanup"
+name = "系统清理预检"
+version = "1.0.0"
+summary = "先看清楚能清什么、各有多大：pacman 缓存 / 日志 / ~/.cache / 缩略图 / 孤儿包"
+description = "系统清理的「先称重、再动手」：pacman 包缓存、systemd 日志、~/.cache、缩略图、孤儿包各占多少磁盘，一条条列清楚。六条预检动作全部只读，只跑 du / find / journalctl --disk-usage / pacman -Qdtq，不删任何东西。唯一的清理动作只针对 pacman 缓存，默认走 paccache --dryrun 预览，加 --yes 才真删，而且真删需要 root —— 提不了权就把该跑的命令原样打出来。"
+categories = ["system"]
+tags = ["清理", "磁盘", "pacman", "系统"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+
+# 安装本身只写 ~/.local/bin，不需要 root；
+# 只有 pacman-prune 的 --yes 那一步需要 root，脚本会明说而不会偷偷提权。
+requires_root = false
+
+# 带一条真删 pacman 缓存的动作，包级危险度写 caution；其余六条都是只读预检。
+danger = "caution"
+
+# 脚本用 paccache 做预览（pacman-contrib 才有）；缺了会在界面上提示怎么装。
+[[dependencies]]
+command = "paccache"
+hint = "sudo pacman -S pacman-contrib"

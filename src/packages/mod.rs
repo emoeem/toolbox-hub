@@ -547,14 +547,6 @@ impl PackageOperation {
         }
     }
 
-    pub fn next(self) -> Self {
-        match self {
-            Self::Install => Self::Remove,
-            Self::Remove => Self::Download,
-            Self::Download => Self::Install,
-        }
-    }
-
     /// 哪个程序来干这活。
     ///
     /// 只有**队列里真有 AUR 包**时才请 paru —— 官方源的事 pacman 就够，
@@ -1107,8 +1099,7 @@ mod tests {
         assert_eq!(SortMode::Votes.label(), "得票");
         assert_eq!(SortMode::Version.label(), "版本");
         assert_eq!(PackageOperation::Remove.label(), "卸载");
-        assert_eq!(PackageOperation::Install.next(), PackageOperation::Remove);
-        assert_eq!(PackageOperation::Download.next(), PackageOperation::Install);
+        assert_eq!(PackageOperation::Download.label(), "仅下载");
     }
 
     /// 搜索响应留的是整个 [`AurPackage`]，转成结果行是它自己的事
@@ -1380,5 +1371,44 @@ mod tests {
         assert_eq!(news_key(&bare), "标题");
 
         let _ = fs::remove_file(&path);
+    }
+    /// 提权：paru/yay 自己会调 sudo，别的（pacman/paccache）非 root 时要补。
+    ///
+    /// 这条盯的是「界面上看到的那条命令 == 真正跑的那条」——
+    /// 以前这条覆盖写在 manifest 那边（`sudo pacman -Rns -Rns bash` 那次翻车），
+    /// 现在会改系统的动作都走中心，逻辑收到这里来了。
+    #[test]
+    fn escalate_only_wraps_programs_that_cannot_do_it_themselves() {
+        let argv = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // paru / yay 会自己提权：再加一层就成了 `sudo paru -S …`，会重复问密码。
+        for program in ["paru", "yay"] {
+            let (kept, args) = escalate(program, &argv(&["-S", "fzf"]));
+            assert_eq!(kept, program, "{program} 不该被包一层 sudo");
+            assert_eq!(args, argv(&["-S", "fzf"]), "argv 不该被动过");
+        }
+
+        let (program, args) = escalate("pacman", &argv(&["-Rns", "fzf"]));
+        if is_root() {
+            // root 跑测试（比如 CI 的 Arch 容器）时不动它
+            assert_eq!(program, "pacman");
+            assert_eq!(args, argv(&["-Rns", "fzf"]));
+        } else {
+            assert_eq!(program, "sudo", "pacman 自己不会提权");
+            assert_eq!(
+                args,
+                argv(&["pacman", "-Rns", "fzf"]),
+                "pacman 要跟在 sudo 后面"
+            );
+        }
+
+        // 带路径的程序同样处理
+        let (program, _) = escalate("/usr/bin/paccache", &argv(&["-rk1"]));
+        assert_eq!(program == "sudo", !is_root(), "非 root 时该补 sudo");
     }
 }

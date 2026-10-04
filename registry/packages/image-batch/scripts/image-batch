@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+#
+# image-batch —— 批量图片处理：转格式 / 缩放 / 去元数据。
+#
+# 底层用 ImageMagick 7 的 magick（ImageMagick 6 里叫 convert，这里不兼容）。
+# 会把结果写进「输出目录」，所以动作标了 caution。
+#
+# 退出码：0 全部成功；1 有文件处理失败、或者一个文件都没匹配上；2 用法不对。
+set -euo pipefail
+
+PROG="${0##*/}"
+VERSION="1.0.0"
+ALLOWED_FORMATS="jpg jpeg png webp avif tiff gif bmp"
+ALLOWED_FITS="inside cover stretch"
+
+# ── 全局取值（parse_args 填） ───────────────────────────────────────────────
+
+input_dir="."
+glob="*.jpg"
+output_dir="./out"
+format="jpg"
+quality=""
+strip_meta=0
+recursive=0
+overwrite=0
+dry_run=0
+width=""
+height=""
+fit="inside"
+no_auto_orient=0
+
+usage() {
+    cat <<EOF
+用法: $PROG <子命令> [选项]
+
+批量处理一个目录里的图片。三种活儿：转格式、缩放、去元数据。
+
+子命令:
+  convert  转格式（jpg / png / webp / avif / tiff / gif / bmp）
+  resize   缩放（可限制在框内、拉伸、或填满后裁剪）
+  strip    去掉元数据（EXIF / ICC / 注释等）
+
+通用选项:
+  --input-dir 目录   从哪个目录读（默认 .）
+  --glob 通配        挑哪些文件，逗号分隔（默认 *.jpg），例如 '*.jpg,*.png'
+  --output-dir 目录  写到哪个目录（默认 ./out；不存在会建出来）
+  --recursive        连子目录一起处理，输出保持相对目录结构
+  --overwrite        输出已存在时覆盖；默认跳过
+  --dry-run          只打印会执行的 magick 命令，不动文件
+  -h, --help         显示这份帮助
+  -V, --version      显示版本
+
+convert 专有:
+  --format jpg       输出格式（默认 jpg）
+  --quality 88       有损格式的质量 1-100（png / bmp 之类自动忽略）
+  --strip            顺便去掉元数据
+
+resize 专有:
+  --width 1600       目标宽度
+  --height 900       目标高度（可以只给一个）
+  --fit inside       怎么适配：inside = 限制在框内不放大；stretch = 强行拉伸；
+                     cover = 填满目标框后居中裁剪（需要宽高都给）
+  --quality 88       有损格式的质量 1-100
+  --no-auto-orient   不按 EXIF 方向自动转正（默认会转正）
+
+示例:
+  $PROG convert --input-dir ~/照片 --glob '*.png' --output-dir ~/照片-jpg --format jpg
+  $PROG resize  --input-dir . --glob '*.jpg' --output-dir ./small --width 1600
+  $PROG resize  --input-dir . --glob '*.jpg,*.png' --output-dir ./thumbs --width 400 --height 400 --fit cover
+  $PROG strip   --input-dir . --glob '*.jpg' --output-dir ./clean
+  $PROG resize  --input-dir . --output-dir ./small --dry-run
+
+输出约定:
+  * stdout 只有「写出来的文件路径」和最后的统计；
+  * 「跳过（已存在）」和「处理失败」这类提示走 stderr；
+  * 有任何一个文件失败、或者一个都没匹配上，退出码就是 1。
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; printf '%s: 用 -h 看用法\n' "$PROG" >&2; exit 1; }
+bad_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --input-dir)  [ "$#" -ge 2 ] || bad_usage "--input-dir 后面要跟目录"; input_dir="$2"; shift 2 ;;
+            --glob)       [ "$#" -ge 2 ] || bad_usage "--glob 后面要跟通配符"; glob="$2"; shift 2 ;;
+            --output-dir) [ "$#" -ge 2 ] || bad_usage "--output-dir 后面要跟目录"; output_dir="$2"; shift 2 ;;
+            --format)     [ "$#" -ge 2 ] || bad_usage "--format 后面要跟格式"; format="$2"; shift 2 ;;
+            --quality)    [ "$#" -ge 2 ] || bad_usage "--quality 后面要跟数字"; quality="$2"; shift 2 ;;
+            --strip)      strip_meta=1; shift ;;
+            --recursive)  recursive=1; shift ;;
+            --overwrite)  overwrite=1; shift ;;
+            --dry-run)    dry_run=1; shift ;;
+            --width)      [ "$#" -ge 2 ] || bad_usage "--width 后面要跟数字"; width="$2"; shift 2 ;;
+            --height)     [ "$#" -ge 2 ] || bad_usage "--height 后面要跟数字"; height="$2"; shift 2 ;;
+            --fit)        [ "$#" -ge 2 ] || bad_usage "--fit 后面要跟方式"; fit="$2"; shift 2 ;;
+            --no-auto-orient) no_auto_orient=1; shift ;;
+            -h|--help)    usage; exit 0 ;;
+            *)            bad_usage "不认识的参数「$1」" ;;
+        esac
+    done
+}
+
+check_positive_int() { # 名字 值
+    [ -n "$2" ] || return 0
+    case "$2" in *[!0-9]*) die "$1 得是正整数，收到「$2」" ;; esac
+    [ "$2" -gt 0 ] || die "$1 得大于 0"
+}
+
+validate() {
+    [ -n "$glob" ] || die "--glob 不能为空"
+    [ -n "$output_dir" ] || die "--output-dir 不能为空"
+    [ -d "$input_dir" ] || die "「$input_dir」不是目录（--input-dir）"
+    check_positive_int --width "$width"
+    check_positive_int --height "$height"
+    if [ -n "$quality" ]; then
+        case "$quality" in *[!0-9]*) die "--quality 得是整数，收到「$quality」" ;; esac
+        { [ "$quality" -ge 1 ] && [ "$quality" -le 100 ]; } || die "--quality 得在 1-100 之间"
+    fi
+    # 去掉输入目录末尾的斜杠，好让 ${f#前缀/} 算相对路径
+    case "$input_dir" in
+        /) ;;
+        */) input_dir="${input_dir%/}" ;;
+    esac
+}
+
+# 挑选输入文件，结果放进全局 FILES 数组
+FILES=()
+PATTERNS=()
+collect_files() {
+    local depth_args=()
+    [ "$recursive" -eq 1 ] || depth_args=(-maxdepth 1)
+    IFS=',' read -r -a PATTERNS <<< "$glob"
+    local i
+    for i in "${!PATTERNS[@]}"; do PATTERNS[i]="$(trim "${PATTERNS[i]}")"; done
+
+    FILES=()
+    local f name pat matched
+    while IFS= read -r f; do
+        name="${f##*/}"
+        matched=0
+        for pat in "${PATTERNS[@]}"; do
+            [ -n "$pat" ] || continue
+            case "$name" in
+                $pat) matched=1; break ;;
+            esac
+        done
+        if [ "$matched" -eq 1 ]; then
+            FILES+=("$f")
+        fi
+    done < <(find "$input_dir" "${depth_args[@]}" -type f 2>/dev/null | sort)
+}
+
+stem_of() {
+    local base="$1" stem
+    stem="${base%.*}"
+    [ -n "$stem" ] || stem="$base"
+    printf '%s' "$stem"
+}
+
+output_path() { # $1 子命令 $2 输入
+    local sub="$1" f="$2" rel dirp base
+    rel="${f#"$input_dir"/}"
+    case "$rel" in
+        */*) dirp="${rel%/*}"; base="${rel##*/}" ;;
+        *)   dirp=""; base="$rel" ;;
+    esac
+    case "$sub" in
+        convert) printf '%s/%s%s.%s' "$output_dir" "${dirp:+$dirp/}" "$(stem_of "$base")" "$format" ;;
+        *)       printf '%s/%s' "$output_dir" "$rel" ;;
+    esac
+}
+
+MAGICK_ARGS=()
+quality_args() { # $1 输出文件
+    [ -n "$quality" ] || return 0
+    local ext="${1##*.}"
+    ext="${ext,,}"
+    case "$ext" in
+        jpg|jpeg|webp|avif|heic|heif) MAGICK_ARGS+=(-quality "$quality") ;;
+    esac
+}
+
+build_args() { # $1 子命令 $2 输入 $3 输出
+    local sub="$1" f="$2" out="$3" geom
+    MAGICK_ARGS=(magick "$f")
+    case "$sub" in
+        convert)
+            [ "$no_auto_orient" -eq 0 ] && MAGICK_ARGS+=(-auto-orient)
+            [ "$strip_meta" -eq 1 ] && MAGICK_ARGS+=(-strip)
+            quality_args "$out"
+            ;;
+        resize)
+            [ "$no_auto_orient" -eq 0 ] && MAGICK_ARGS+=(-auto-orient)
+            if [ -n "$width" ] && [ -n "$height" ]; then geom="${width}x${height}"
+            elif [ -n "$width" ]; then geom="${width}x"
+            elif [ -n "$height" ]; then geom="x${height}"
+            else die "resize: --width 和 --height 至少要给一个"
+            fi
+            case "$fit" in
+                inside)  MAGICK_ARGS+=(-resize "${geom}>") ;;
+                stretch) MAGICK_ARGS+=(-resize "${geom}!") ;;
+                cover)
+                    [ -n "$width" ] && [ -n "$height" ] || die "--fit cover 需要同时给 --width 和 --height"
+                    MAGICK_ARGS+=(-resize "${width}x${height}^" -gravity center -extent "${width}x${height}")
+                    ;;
+                *) die "不认识的 --fit「$fit」（可用 inside / cover / stretch）" ;;
+            esac
+            quality_args "$out"
+            ;;
+        strip)
+            MAGICK_ARGS+=(-strip)
+            ;;
+        *) die "内部错误：不认识的子命令「$sub」" ;;
+    esac
+    MAGICK_ARGS+=("$out")
+}
+
+# 跑一批：统计写进 RESULT_OK / RESULT_SKIP / RESULT_FAIL
+RESULT_OK=0
+RESULT_SKIP=0
+RESULT_FAIL=0
+run_batch() { # $1 子命令
+    local sub="$1" f out
+    RESULT_OK=0; RESULT_SKIP=0; RESULT_FAIL=0
+    for f in "${FILES[@]}"; do
+        out="$(output_path "$sub" "$f")"
+        if [ -e "$out" ] && [ "$overwrite" -eq 0 ]; then
+            printf '跳过（已存在，加 --overwrite 可覆盖）  %s\n' "$out" >&2
+            RESULT_SKIP=$((RESULT_SKIP + 1))
+            continue
+        fi
+        build_args "$sub" "$f" "$out"
+        if [ "$dry_run" -eq 1 ]; then
+            printf '[预演] '
+            printf '%q ' "${MAGICK_ARGS[@]}"
+            printf '\n'
+            RESULT_OK=$((RESULT_OK + 1))
+            continue
+        fi
+        mkdir -p -- "$(dirname -- "$out")"
+        if "${MAGICK_ARGS[@]}"; then
+            printf '%s\n' "$out"
+            RESULT_OK=$((RESULT_OK + 1))
+        else
+            printf '处理失败  %s\n' "$f" >&2
+            RESULT_FAIL=$((RESULT_FAIL + 1))
+        fi
+    done
+}
+
+finish() { # $1 标题
+    printf '\n%s：成功 %d 个，跳过 %d 个，失败 %d 个\n' "$1" "$RESULT_OK" "$RESULT_SKIP" "$RESULT_FAIL"
+    if [ "$RESULT_FAIL" -gt 0 ]; then
+        return 1
+    fi
+    if [ "$RESULT_OK" -eq 0 ] && [ "$RESULT_SKIP" -eq 0 ]; then
+        printf '%s: 一个文件都没匹配上（--input-dir %s --glob %s）\n' "$PROG" "$input_dir" "$glob" >&2
+        return 1
+    fi
+    return 0
+}
+
+require_magick() {
+    command -v magick >/dev/null 2>&1 \
+        || die "找不到 magick —— 先装 ImageMagick 7：sudo pacman -S imagemagick"
+}
+
+# ── convert ─────────────────────────────────────────────────────────────────
+
+cmd_convert() {
+    parse_args "$@"
+    require_magick
+    validate
+    case " $ALLOWED_FORMATS " in
+        *" $format "*) ;;
+        *) die "不支持的输出格式「$format」（可用：$ALLOWED_FORMATS）" ;;
+    esac
+    collect_files
+    printf '批量转格式  %s  →  %s  （目标格式 %s，匹配 %d 个文件）\n' \
+        "$input_dir" "$output_dir" "$format" "${#FILES[@]}"
+    [ "$strip_meta" -eq 1 ] && printf '顺带去掉元数据（--strip）\n'
+    printf '\n'
+    run_batch convert
+    finish "转格式"
+}
+
+# ── resize ──────────────────────────────────────────────────────────────────
+
+cmd_resize() {
+    parse_args "$@"
+    require_magick
+    validate
+    case " $ALLOWED_FITS " in
+        *" $fit "*) ;;
+        *) die "不认识的 --fit「$fit」（可用：$ALLOWED_FITS）" ;;
+    esac
+    [ -n "$width$height" ] || die "resize 至少要给 --width 或 --height"
+    collect_files
+    printf '批量缩放  %s  →  %s  （宽 %s 高 %s，适配 %s；匹配 %d 个文件）\n' \
+        "$input_dir" "$output_dir" "${width:-auto}" "${height:-auto}" "$fit" "${#FILES[@]}"
+    [ "$no_auto_orient" -eq 0 ] && printf '按 EXIF 方向自动转正（--no-auto-orient 可关）\n'
+    printf '\n'
+    run_batch resize
+    finish "缩放"
+}
+
+# ── strip ───────────────────────────────────────────────────────────────────
+
+cmd_strip() {
+    parse_args "$@"
+    require_magick
+    validate
+    collect_files
+    printf '批量去元数据  %s  →  %s  （匹配 %d 个文件）\n\n' \
+        "$input_dir" "$output_dir" "${#FILES[@]}"
+    run_batch strip
+    finish "去元数据"
+}
+
+# ── 分发 ────────────────────────────────────────────────────────────────────
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+
+command="$1"
+shift
+case "$command" in
+    convert) cmd_convert "$@" ;;
+    resize)  cmd_resize  "$@" ;;
+    strip)   cmd_strip   "$@" ;;
+    -h|--help|help) usage; exit 0 ;;
+    -V|--version|version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    *) bad_usage "不认识的子命令「$command」（可用 convert / resize / strip）" ;;
+esac

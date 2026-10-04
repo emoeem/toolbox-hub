@@ -147,24 +147,41 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         ));
     }
 
-    // 筛选词就写在这儿（paru 也没有单独的搜索框）。
-    // 输入框**始终**在输入态，所以光标一直画着 —— 一眼就知道「打字是有效的」。
+    // 筛选词写在这儿（paru 也没有单独的搜索框）。
+    //
+    // **光标只在输入态画**：以前输入框常驻，光标一直在，于是字母键全被吃掉、
+    // 命令只能挂 Ctrl。现在光标本身就是「你在打字」的指示。
     {
         let (before, after) = view.query.split_at_cursor();
-        spans.push(Span::styled("   筛选 ", Style::default().fg(theme::GREEN)));
+        spans.push(Span::styled(
+            if view.typing {
+                "   过滤 "
+            } else {
+                "   筛选 "
+            },
+            Style::default().fg(theme::GREEN),
+        ));
         spans.push(Span::styled(
             before.to_string(),
             Style::default()
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled("▏", Style::default().fg(theme::PURPLE)));
+        if view.typing {
+            spans.push(Span::styled("▏", Style::default().fg(theme::PURPLE)));
+        }
         spans.push(Span::styled(
             after.to_string(),
             Style::default()
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ));
+        if !view.typing && view.query.is_empty() {
+            spans.push(Span::styled(
+                "（按 / 过滤）",
+                Style::default().fg(theme::FAINT),
+            ));
+        }
     }
 
     if view.dry_run {
@@ -203,7 +220,12 @@ fn draw_status(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
     ));
 
     // 右端：键提示（paru 那行 `Tab:多选 | Enter:安装 | …`）
-    let hint = "打字:过滤 · 1-4:模式 · Space:多选 · Enter:装 · Esc:清空 · Ctrl+R:上网搜";
+    // 键提示分输入态 / 非输入态两套 —— 键位本身不一样，提示不能只有一套。
+    let hint = if view.typing {
+        "打字:过滤 · Enter:收工 · Esc:清空 · Ctrl+U:全清"
+    } else {
+        "/:过滤 · 1-4:面板 · Space:排队 · Enter:执行 · i:装 · q:退出"
+    };
     let used: usize = spans
         .iter()
         .map(|span| display_width(span.content.as_ref()) as usize)
@@ -235,7 +257,10 @@ fn draw_tabs(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
 
     spans.push(Span::styled("│ ", Style::default().fg(theme::FAINT)));
 
-    for (label, on, count) in view.chips() {
+    // 焦点落在标签行（`Tab` 或 `[` `]`）时，焦点那个标签加下划线 ——
+    // 不再是「看不见的焦点」：开关之前得知道 Enter/Space 会作用在谁身上。
+    let tabs_focused = view.pane == Pane::Tabs;
+    for (index, (label, on, count)) in view.chips().into_iter().enumerate() {
         let color = if on {
             if label == "aur" {
                 theme::PURPLE
@@ -245,9 +270,15 @@ fn draw_tabs(frame: &mut ratatui::Frame, view: &PackageView, area: Rect) {
         } else {
             theme::FAINT
         };
+        let mut style = Style::default().fg(color);
+        if tabs_focused && index == view.chip_focus {
+            style = style
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                .bg(theme::HIGHLIGHT);
+        }
         spans.push(Span::styled(
             format!("[{label} {count}{}]", if on { "✓" } else { "·" }),
-            Style::default().fg(color),
+            style,
         ));
         spans.push(Span::raw(" "));
     }

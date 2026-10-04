@@ -142,6 +142,76 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 .TP
 .BR \-V ", " \-\-version
 显示版本。
+.SS 工具仓库（Toolbox Hub 自己的工具包）
+这些动词管的是
+.B ToolHub 的工具仓库
+（一个静态 JSON 索引加若干产物文件），和上面那些 pacman/AUR 软件包命令是两回事：
+装错一个 Arch 包会拆掉系统，卸掉一个工具包只会删掉几个文件。
+.PP
+.RS 4
+.TP
+.B repo list
+看有哪些仓库、开没开、缓存是新是旧。
+.TP
+.B repo add \fI地址\fR [\-\-name \fI名字\fR] [\-\-trust \fI等级\fR] [\-\-priority \fI整数\fR]
+加一个仓库。地址可以是 https URL、本地路径或 file:// 形式。
+.TP
+.B repo remove | enable | disable \fIid\fR
+删掉 / 启用 / 停用。
+.TP
+.B repo update [\fIid\fR]
+刷新索引（不带 id 就刷新全部已启用的）。刷新失败会退回本地缓存，不算命令失败。
+.TP
+.B repo search \fI词\fR
+只在仓库里搜。
+.TP
+.B search \fI词\fR [\-\-scope all|available|installed|upgradable]
+本地工具与仓库里的包一起搜。
+.TP
+.B info \fI名字\fR
+看详情。仓库里的包会打印完整的安装计划（来源 / 信任 / 依赖 / 文件 / 哈希）。
+.TP
+.B install \fI包...\fR [\-\-allow\-unverified]
+安装。装之前核对 SHA\-256，不一致直接拒绝；你改过的文件不会被覆盖。
+.TP
+.B uninstall \fI包...\fR [\-\-purge]
+卸载。默认不删你改过的文件（\-\-purge 才会）。
+.TP
+.B list
+列已安装的工具包。
+.TP
+.B update [\-\-check]
+升级已安装的工具包。加 \-\-check 是\fB只检查不升级\fR：有更新时退出码为 10，
+没有更新为 0，出错为 1 —— 脚本与定时任务靠这个分流。
+.TP
+.B run \fI工具\fR [\-\-字段 值]...
+填好参数直接跑。参数拼成 argv，不经过 shell；\-\-dry\-run 只打印将要执行的命令。
+.RE
+.SS 写插件（作者工具）
+.B new / check / build
+服务的是
+.B 写插件的人
+（完整说明见仓库里的
+.IR docs/plugin\-authoring.md ）。
+一个插件就是一个仓库包：一份
+.I toolbox.toml
+加若干动作定义。
+.PP
+.RS 4
+.TP
+.B new \fI包名\fR [\-\-kind script|recipe] [\-\-dir \fI目录\fR] [\-\-description \fI一句话\fR] [\-\-domain \fI域\fR] [\-\-program \fI命令\fR]
+造一个新插件骨架，生成出来就能直接跑通。
+.TP
+.B check [\fI目录\fR]
+校验插件包或整个仓库：符号链接、路径穿越、id 与目录名不一致、改了源码没重新打包，
+都会被报出来。有错时退出码为 1。
+.TP
+.B build [\fI目录\fR] [\-\-stamp]
+打包并重建
+.IR index.json 。
+产物可复现：同样的源码两次构建逐字节相同。默认不写 updated
+（写了索引就不可复现），要盖时间戳用 \-\-stamp。
+.RE
 .SS 界面组件（给你自己的脚本用）
 写脚本时缺的往往不是功能而是界面：挑一个输入文件、确认一次、翻一页长输出。
 这三个组件复用主界面同一套部件与键位，脚本拿
@@ -169,7 +239,23 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 .B 2
 没终端或参数错。
 .IP "3." 4
-键位与主界面一致：↑↓ / jk、g / G、PgUp / PgDn、Esc 取消、Tab 多选、打字即过滤。
+键位与主界面一致，而且组件**底部一直显示着这一行**（组件是独立开的会话，没有主界面
+那个 footer，不画出来就不知道按什么退出）：
+
+.RS 4
+.B ui confirm
+—— ←→ / hl / Tab 换按钮，Enter 确认当前那个，y / n 直达，Esc 取消。
+.br
+.B ui pick
+—— 这一节说的是\fB内置选择器\fR的键位（默认走 yazi，那时按 yazi 自己的键位）：
+↑↓ 选择，Enter 进目录 / 选中，← 上级，Tab 标记（--multi），打字过滤，
+Ctrl+U 清空，Ctrl+D 用当前目录（--dir-only），Esc 取消。
+\fB没有\fR j / k / g / G：那几个字母要留给过滤框。
+.br
+.B ui pager
+—— ↑↓ / jk 滚动，←→ / hl 横移，PgUp / PgDn / Space 翻页，
+g / G / Home / End 顶底，q / Esc 退出。
+.RE
 .RE
 .PP
 没有终端时不猜：
@@ -197,9 +283,21 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 .BI \-\-title " " 文字 。
 .TP
 .B ui pick
-在终端里挑文件，选中的路径打到
+挑文件，选中的路径打到
 .B stdout
-（一行一个）。可选
+（一行一个）。\fB优先交给外部文件管理器\fR（默认
+.BR yazi 
+），
+没装、没有控制终端或起不来时才用内置选择器（保证脚本不会因为少一个外部程序就跑不动）。
+在 yazi 里 Enter = 选中并退出、空格多选；
+选目录请\fB先进到那个目录再退出\fR（chooser 只认文件，目录的答案来自退出时所在的目录）。
+换程序设
+.B TOOLBOX_HUB_FILE_MANAGER
+（与主界面按
+.B y
+浏览目录共用同一个变量），设成
+.B builtin
+则明确用内置的。可选
 .BI \-\-dir " " 目录 、
 .BI \-\-filter " " 词 、
 .B \-\-multi
@@ -227,8 +325,8 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 .B /
 搜索（跨所有域）。
 .TP
-.BR ← → " / " 1\-7
-切换域（媒体 / 图像 / 系统 / 网络 / 开发 / 工具 / 包管理）。
+.BR ← → " / " 1\-8
+切换域（媒体 / 图像 / 系统 / 网络 / 开发 / 工具 / 包管理 / 打包）。
 .TP
 .BR 7 " / " ← →
 包管理域：\fB进入时自动打开软件包中心\fR（这个域的主界面）。
@@ -257,54 +355,81 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 打开或关闭帮助；
 .B q
 退出。
-.SS 软件包中心（按 p，或进「包管理」域）
-进入「包管理」域时会自动打开它；
-.B Esc
-回到那一域的 CLI 动作列表。
+.SS 软件包中心（按 p，或「包管理」域的四个入口）
+进「包管理」域**不再自动打开它**：和其它六个域一样，进域是动作列表，选中才进视图。
+那个列表是四个入口（搜索并安装 / 已安装·卸载 / Arch 新闻 / 系统维护）+ 三个只有
+命令行能做的查询（正则搜官方源 / 这个文件属于哪个包 / 这个包装了哪些文件）——
+会改系统的动作都在中心里或命令行上（B\-iR / B\-rR / B\-uR / B\-\-clear\-cacheR）。
 .PP
-\fB输入框是常驻的\fR：打字永远是过滤，命令一律走
-.BR Ctrl 。
-一进来铺的是全库（三万个包），所以随便打字就能筛；要换一个搜就按
-.B Esc
-清空（或
-.BR Ctrl+U ），接着打。停手 400ms 而本地一个都没匹配上时，会自动去 AUR
-问一次 —— 官方源的包本地全库就有，AUR 的包自动补上。
-.TP
+\fB输入是模态的\fR：按
+.B /
+进过滤态，打字即筛；一进来铺的是全库（三万个包），所以随便打字就能筛。
 .B Enter
-装选中的那个（队列空时自动加进去）；队列里有多个就装那些。
-\fB它先把要跑的命令摆出来，再按一次才真的动系统。\fR
-.TP
-.B Space
-多选：加入队列；\fB再按一次取消\fR。
-.TP
-.B Del
-把选中的那行移出队列。
-.TP
-.BR Ctrl+D
-结果面板焦点时向下翻页；队列或包信息面板焦点时清空队列。
-.TP
-.B Tab
-焦点：结果 → 队列 → 包信息（队列会整块顶掉列表）。
-.TP
+收工但**留着**筛选词，
 .B Esc
-有筛选词就清空（回到全库），空着就关界面。
+清空并退出输入态。为什么不是「打字永远有效」：常驻输入框会把字母和数字全吃掉，
+命令只能全挂在
+.BR Ctrl+S/M/T/O/X/K/A …
+上 —— 那套键位是被输入框挤出来的，不是设计出来的。
+停手 400ms 而本地一个都没匹配上时，会自动去 AUR 问一次。
 .TP
-.BR Ctrl+R " / " Ctrl+U
-用当前词上网搜（官方源 + AUR）/ 清空筛选词。
+.BR 1 " " 2 " " 3 " " 4
+直达四个面板：搜索 / 已安装 / 新闻 / 维护（标签上就写着数字）。
 .TP
-.BR ↑ ↓ " / " PgUp " " PgDn
-选择（输入框常驻，所以不是 j/k）；
+.BR /
+进过滤态：打字即筛，
+.B Enter
+收工（保留筛选词），
+.B Esc
+清空并退出。
+.TP
+.BR ↑ ↓ " / " j " " k
+选择（焦点在哪块就动哪块）；
+.BR PgUp " / " PgDn
+翻页；
+.BR g " / " G " / " Home " / " End
+首项 / 末项；
 .BR Alt+↑ " / " Alt+↓
 翻搜索历史。
 .TP
-.B 1-4
-直接切换搜索 / 已安装 / 新闻 / 维护模式。
+.BR Tab " / " Shift+Tab
+焦点：结果 → 队列 → 包信息 → 标签。
 .TP
-.BR Alt+1 " … " Alt+9 " / " Alt+0
-切换筛选标签；Alt+0 全开。
+.BR [ " ] / " ← " " →
+标签行：选上一个 / 下一个标签（焦点会跟过去）。
+.B Space
+在标签行上是开关它，在结果里是排队/取消，在队列里是移出。
 .TP
-.BR [ " " ]
-上一个 / 下一个模式。
+.B Enter
+执行：装选中的那个（队列空时自动加进去）；队列里有多个就装那些。
+\fB它先把要跑的命令摆出来，再按一次才真的动系统。\fR
+.TP
+.BR i " / " r
+装 / 卸（同上：先摆命令再确认）。
+.TP
+.BR u " / " c " / " o
+系统更新 / 清旧缓存 / 清孤儿包。
+.TP
+.BR s " / " D
+排序菜单 / 演练模式（确认后只显示命令，不动系统）。
+.TP
+.BR K " / " X " / " A
+检查 PKGBUILD（namcap + shellcheck）/ 看 PKGBUILD / 浏览器打开 AUR 页面。
+.TP
+.BR m " / " M
+新闻：标记这一条已读 / 当前列表全标已读。
+.TP
+.BR Ctrl+D
+结果面板焦点时向下翻页；其它面板上清空整个队列。
+.TP
+.BR Ctrl+R
+用当前筛选词上网搜（官方源 + AUR）。
+.TP
+.BR Ctrl+E " / " Ctrl+I
+导出 / 导入安装清单。
+.TP
+.BR Esc " / " q
+退出中心，回「包管理」域的动作列表。
 .TP
 .BR Ctrl+S " / " Ctrl+M " / " Ctrl+T " / " Ctrl+O
 排序菜单 / 队列操作（安装·卸载·仅下载）/ 演练模式 / 清孤儿包。
@@ -340,11 +465,35 @@ manifest 目录（冒号分隔），默认
 .B TOOLBOX_HUB_WORKDIR
 启动时的工作目录（工具在这里执行、找文件）。
 .TP
+.B TOOLBOX_HUB_PKGBUILD_SRC
+「打包」域要管的私人软件仓库在哪。默认依次找
+.I ~/pkgbuild-source
+与
+.IR ~/code/pkgbuild-source 。
+.TP
 .B TOOLBOX_HUB_FILE_MANAGER
 按
 .B y
 时启动的文件管理器，默认
 .BR yazi 。
+.TP
+.B TOOLBOX_HUB_CACHE
+索引缓存目录（默认
+.IR ~/.cache/toolbox\-hub ）。
+.TP
+.B TOOLBOX_HUB_REPOSITORIES
+覆盖仓库清单文件的位置（默认
+.IR <配置目录>/repositories.toml ）。
+.TP
+.B TOOLBOX_HUB_BIN_DIR
+工具包里的可执行脚本装到哪儿（默认
+.IR ~/.local/bin ）。
+.TP
+.B ~/.config/systemd/user/toolbox\-hub\-update.timer
+可选的「每天自动检查更新」单元（随包提供在 packaging/ 目录）。默认只跑
+.BR "toolbox\-hub update \-\-check" ；
+要无人值守自动升级，就把 ExecStart 换成
+.BR "toolbox\-hub update" 。
 .SH 文件
 .TP
 .I <配置目录>/state.toml

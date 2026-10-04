@@ -27,6 +27,9 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 toml = "1.1.6"
 unicode-width = "0.2"
+sha2 = "0.10"
+flate2 = "1.1.10"
+tar = "0.4.46"
 
 [profile.release]
 strip = true

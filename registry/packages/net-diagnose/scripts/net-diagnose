@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+#
+# net-diagnose —— 本机网络体检（只读）。
+#
+# 只回答一个问题：这台机器现在从哪出去、用哪个 DNS。
+# 不发任何探测包之外的东西，也不改任何配置。
+set -euo pipefail
+
+PROG="${0##*/}"
+TARGET=""
+
+usage() {
+    cat <<'EOF'
+用法: net-diagnose <目标>
+
+目标:
+  local   本机地址、默认路由、出口源地址、DNS 配置（只读，全都取自本机）
+  tools   这份动作依赖的外部命令装没装
+
+选项:
+  -h, --help  显示这份帮助
+
+说明:
+  出口 IP 走的是内核路由查询（ip route get），只是问「包会从哪张网卡出去」，
+  不会真的发包；DNS 配置优先读 resolvectl，读不到再退回 /etc/resolv.conf。
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    exit "${2:-1}"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+section() { printf '\n── %s ──\n' "$1"; }
+
+local_info() {
+    section "本机地址（公开 scope）"
+    if have ip; then
+        local v4 v6
+        v4="$(ip -o -4 addr show scope global 2>/dev/null | awk '{printf "  %-10s %s\n", $2, $4}')" || v4=""
+        if [ -n "$v4" ]; then printf '%s\n' "$v4"; else printf '  没有 IPv4 全局地址。\n'; fi
+        v6="$(ip -o -6 addr show scope global 2>/dev/null | awk '{printf "  %-10s %s\n", $2, $4}')" || v6=""
+        if [ -n "$v6" ]; then
+            printf '  （IPv6）\n'
+            printf '%s\n' "$v6"
+        fi
+    else
+        printf '  没有 ip 命令（iproute2），跳过。\n'
+    fi
+
+    section "默认路由"
+    if have ip; then
+        local def
+        def="$(ip route show default 2>/dev/null)" || def=""
+        if [ -n "$def" ]; then
+            printf '%s\n' "$def"
+        else
+            printf '  没有默认路由 —— 这台机器现在出不了网。\n'
+        fi
+    else
+        printf '  没有 ip 命令。\n'
+    fi
+
+    section "出口 IP（走哪张网卡、用哪个源地址）"
+    if have ip; then
+        local got src
+        got="$(ip route get 1.1.1.1 2>/dev/null | head -n 1)" || got=""
+        if [ -z "$got" ]; then
+            printf '  查不到出口路由（多半是没有默认路由）。\n'
+        else
+            printf '  %s\n' "$got"
+            src="$(printf '%s\n' "$got" | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')" || src=""
+            if [ -n "$src" ]; then
+                printf '\n  出口源地址：%s\n' "$src"
+            fi
+        fi
+        printf '\n  （这是内核的路由查询结果，没有真的发包出去。）\n'
+    else
+        printf '  没有 ip 命令。\n'
+    fi
+
+    section "DNS 配置"
+    if have resolvectl && resolvectl status >/dev/null 2>&1; then
+        printf '  来自 resolvectl status：\n\n'
+        resolvectl status 2>/dev/null | sed -n '1,40p' | sed 's/^/  /' || true
+    elif have resolvectl; then
+        printf '  resolvectl 在，但查询失败（systemd-resolved 没在跑？），改看 /etc/resolv.conf。\n'
+    else
+        printf '  没有 resolvectl（不是 systemd-resolved），看 /etc/resolv.conf。\n'
+    fi
+
+    if [ -r /etc/resolv.conf ]; then
+        section "/etc/resolv.conf"
+        grep -v '^[[:space:]]*#' /etc/resolv.conf 2>/dev/null | grep -v '^[[:space:]]*$' | sed 's/^/  /' || true
+        if grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+            printf '\n  指向 127.0.0.53 说明 DNS 由 systemd-resolved 代管，\n'
+            printf '  真正在用的上游服务器要看上面的 resolvectl 输出。\n'
+        fi
+    fi
+}
+
+tools_check() {
+    section "依赖的外部命令"
+    local missing=0 c
+    for c in dig ping traceroute nc ip; do
+        if have "$c"; then
+            printf '  ✓ %-11s %s\n' "$c" "$(command -v "$c")"
+        else
+            printf '  ✗ %-11s 没装\n' "$c"
+            missing=$((missing + 1))
+        fi
+    done
+    printf '\n  缺 %s 个。\n' "$missing"
+    return 0
+}
+
+main() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --)
+                shift
+                [ $# -gt 0 ] && TARGET="$1"
+                break
+                ;;
+            -*) usage >&2; die "不认识的选项「$1」" 2 ;;
+            *)
+                if [ -n "$TARGET" ]; then die "只接受一个目标（-h 看用法）" 2; fi
+                TARGET="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$TARGET" ]; then
+        usage >&2
+        die "没说要看什么（-h 看用法）" 2
+    fi
+
+    case "$TARGET" in
+        local) local_info ;;
+        tools) tools_check ;;
+        *) usage >&2; die "不认识的目标「$TARGET」（-h 看用法）" 2 ;;
+    esac
+}
+
+main "$@"

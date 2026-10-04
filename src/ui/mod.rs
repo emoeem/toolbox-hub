@@ -22,6 +22,7 @@ mod help;
 mod history;
 pub mod packages;
 pub(crate) mod picker;
+pub mod repository;
 mod run;
 mod table;
 mod tabs;
@@ -46,6 +47,30 @@ use crate::app::{App, Scope};
 /// 算出来的命中区和换行数都会偏。
 pub(crate) fn display_width(text: &str) -> u16 {
     unicode_width::UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
+}
+
+/// 把一串「` · `」分隔的键位提示塞进给定宽度：**整条整条地丢，绝不切一半**。
+///
+/// 主界面 footer 与 `toolbox-hub ui …` 那三个组件共用它 —— 硬裁出来的
+/// 「Ctrl+D 用当前」比不显示更糟：看着像有个键叫这个名字。
+pub(crate) fn fit_hints(hints: &str, width: usize) -> String {
+    let mut fitted = String::new();
+    for hint in hints.split(" · ") {
+        let separator = if fitted.is_empty() {
+            0
+        } else {
+            display_width(" · ")
+        };
+        let needed = separator + display_width(hint);
+        if display_width(&fitted) + needed > width as u16 {
+            break;
+        }
+        if !fitted.is_empty() {
+            fitted.push_str(" · ");
+        }
+        fitted.push_str(hint);
+    }
+    fitted
 }
 
 /// 把 `$HOME` 缩写成 `~`，让长路径在状态行与预览里放得下。
@@ -183,6 +208,8 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         history::draw(frame, app, list.union(detail));
     } else if app.packages.is_some() {
         packages::draw(frame, app, list.union(detail));
+    } else if app.repository.is_some() {
+        repository::draw(frame, app, list.union(detail));
     } else if app.files.is_some() {
         files::draw(frame, app, list.union(detail));
     } else if app.picker.is_some() {
@@ -460,8 +487,10 @@ mod tests {
         view.message = String::from("2 个结果");
         app.packages = Some(view);
 
-        // 光标画在它真正在的位置上（以前永远贴在末尾，因为压根没有光标）
+        // 光标画在它真正在的位置上（以前永远贴在末尾，因为压根没有光标）。
+        // 注意光标**只在输入态**画 —— 输入改模态之后它就是「你在打字」的指示。
         if let Some(view) = app.packages.as_mut() {
+            view.typing = true;
             view.query.set("fzf");
             view.query.left();
         }
@@ -1335,5 +1364,184 @@ mod tests {
         app.apply_filter();
         println!("{}", pretty(&render(&mut app, 108, 34)));
         println!("（查询「i」的跨域结果，第二行是命中分布）");
+    }
+}
+
+/// 「发现」页的渲染测试。
+///
+/// 单独一个模块是为了自带渲染脚手架：上面的 mod tests 里那套是给主列表用的，
+/// 这里要的是「把仓库界面推进去、看它到底画出了什么」。
+#[cfg(test)]
+mod repo_view_render_tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::draw;
+    use crate::{
+        app::{
+            App,
+            repo_view::{RepoMode, RepositoryView},
+        },
+        registry::{Registry, ReloadReport},
+        repository::{
+            cache,
+            config::{Repositories, RepositoryConfig},
+            install::Roots,
+            service::Service,
+        },
+    };
+    use std::path::PathBuf;
+
+    /// 去掉空白后的整屏文字（宽字符会留空档，所以断言前先压掉）。
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("测试终端");
+        terminal.draw(|frame| draw(frame, app)).expect("渲染一帧");
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()));
+            }
+        }
+        text.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    struct Fixture {
+        base: PathBuf,
+        service: Service,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("toolbox-hub-uirepo-{nanos}"));
+        std::fs::create_dir_all(&base).expect("mkdir");
+
+        let index = r#"{"schema_version": 1, "packages": [
+            {"id": "hello-tool", "name": "Hello", "version": "1.0.0", "summary": "打个招呼",
+             "artifact": {"url": "artifacts/h.tar.gz",
+                          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+             "files": [{"path": "scripts/hello-tool", "kind": "bin"}]}
+        ]}"#;
+        let meta = cache::IndexMeta {
+            fetched_at: Some(cache::now_secs()),
+            ..cache::IndexMeta::default()
+        };
+        cache::store(&base.join("cache"), "official", index, &meta).expect("store");
+
+        let repositories = Repositories {
+            repositories: vec![RepositoryConfig {
+                id: String::from("official"),
+                name: String::from("ToolHub Official"),
+                index: base.join("index.json").display().to_string(),
+                enabled: true,
+                priority: 0,
+                trust: Some(String::from("trusted")),
+                note: None,
+            }],
+        };
+        let roots = Roots {
+            bin: base.join("bin"),
+            data: base.join("data"),
+            config: base.join("config"),
+        };
+        let service = Service::with_parts(repositories, roots, base.join("cache"));
+        Fixture { base, service }
+    }
+
+    fn app_with(view: RepositoryView) -> App {
+        let registry = Registry::from_tools(Vec::new());
+        let mut app = App::new(registry, PathBuf::from("/tmp/bin"), ReloadReport::default());
+        app.repository = Some(view);
+        app
+    }
+
+    #[test]
+    fn every_panel_draws_something_useful() {
+        let fixture = fixture();
+        let mut app = app_with(RepositoryView::open(fixture.service.clone()).expect("open"));
+
+        // 发现：包名、版本、信任、状态、三个面板名都要看得见
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("工具仓库"), "{text}");
+        assert!(text.contains("发现"), "{text}");
+        assert!(text.contains("已安装"), "{text}");
+        assert!(text.contains("hello-tool"), "{text}");
+        assert!(text.contains("1.0.0"), "{text}");
+        assert!(text.contains("官方"), "信任等级要显示：{text}");
+
+        // 已安装（空的）：要有话说，而不是一片空白
+        app.repository
+            .as_mut()
+            .expect("view")
+            .set_mode(RepoMode::Installed);
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("还没装任何工具包"), "{text}");
+
+        // 仓库面板：id / 索引地址 / 状态
+        app.repository
+            .as_mut()
+            .expect("view")
+            .set_mode(RepoMode::Repositories);
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("official"), "{text}");
+        assert!(text.contains("在线"), "要显示缓存状态：{text}");
+    }
+
+    /// 安装确认面板必须把「装什么、从哪来、有没有哈希」摆出来 ——
+    /// 这一屏是安全模型的第一道门，画不全就等于没有。
+    #[test]
+    fn the_install_confirmation_shows_source_and_integrity() {
+        let fixture = fixture();
+        let mut app = app_with(RepositoryView::open(fixture.service.clone()).expect("open"));
+        app.repository.as_mut().expect("view").ask_install();
+        assert!(
+            app.repository.as_ref().expect("view").confirm.is_some(),
+            "应当出现确认面板"
+        );
+
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("安装"), "{text}");
+        assert!(text.contains("ToolHubOfficial"), "来源要写清楚：{text}");
+        assert!(text.contains("SHA-256"), "完整性要写清楚：{text}");
+        assert!(text.contains("Enter确认"), "要告诉用户怎么确认：{text}");
+        assert!(
+            text.contains("scripts/hello-tool"),
+            "装哪些文件要看得到：{text}"
+        );
+    }
+
+    #[test]
+    fn the_add_repository_input_line_draws() {
+        let fixture = fixture();
+        let mut app = app_with(RepositoryView::open(fixture.service.clone()).expect("open"));
+        app.repository.as_mut().expect("view").start_add();
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("添加仓库"), "{text}");
+        assert!(text.contains("索引地址"), "{text}");
+    }
+
+    /// 没有可用索引时，「发现」面板要给一句能让人继续往下走的话。
+    #[test]
+    fn an_empty_discover_panel_explains_what_to_do() {
+        let fixture = fixture();
+        let mut service = fixture.service.clone();
+        service.repositories.repositories.clear();
+        let mut app = app_with(RepositoryView::open(service).expect("open"));
+
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("还没有可用的索引"), "{text}");
+        assert!(
+            text.contains("离线"),
+            "要说明离线时本地工具照常可用：{text}"
+        );
     }
 }

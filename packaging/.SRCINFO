@@ -28,6 +28,7 @@ pkgbase = toolbox-hub
 	optdepends = sing-box: 本机代理运维动作
 	optdepends = wl-clipboard: Wayland 剪贴板复制
 	optdepends = xclip: X11 剪贴板复制
+	optdepends = bash: tbx-pkgbuild（「打包」域）跑的是 bash 脚本
 	options = !debug
 	source = toolbox-hub-0.1.0.tar.gz
 	sha256sums = SKIP

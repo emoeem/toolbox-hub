@@ -6,11 +6,14 @@
 mod input;
 pub mod package_view;
 mod picker;
+pub mod repo_view;
 mod text_input;
+mod update_check;
 
 pub use input::{handle_key, handle_mouse, handle_paste};
 pub use picker::Picker;
 pub use text_input::TextInput;
+pub use update_check::UpdateCheck;
 
 use std::{
     collections::VecDeque,
@@ -423,6 +426,20 @@ pub struct FormState {
     pub error: Option<String>,
     /// 危险动作是否已经确认过一次；改任何参数都会把它清掉。
     pub confirm: bool,
+    /// 动态参数（kind = dynamic）已经解析出来的候选，按字段 key 归属。
+    ///
+    /// 解析在后台线程跑（见 crate::dynamic::Resolver），所以表单会先是"空的"，
+    /// 过一会儿才填上 —— 这比"打开表单时卡一下"好得多。
+    pub candidates: std::collections::BTreeMap<String, Vec<String>>,
+    /// 候选解析失败的原因（按字段 key），显示在表单里。
+    pub candidate_errors: std::collections::BTreeMap<String, String>,
+}
+
+impl FormState {
+    /// 这个字段有没有候选可挑。
+    pub fn candidates_for(&self, key: &str) -> &[String] {
+        self.candidates.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 pub struct App {
@@ -461,6 +478,9 @@ pub struct App {
     pub state_path: PathBuf,
     /// 执行历史落在哪；`None` = 默认位置（测试可以指到临时文件）。
     pub history_path: Option<PathBuf>,
+    /// 安装队列落在哪；`None` = 默认位置（测试可以指到临时文件，
+    /// 免得并行测试互相踩真实的安装队列）。
+    pub queue_path: Option<PathBuf>,
     /// 需要整屏重画（接管过终端以后必须，见 [`App::take_full_redraw`]）。
     pub needs_full_redraw: bool,
     /// 工具在哪个目录里执行。扫目录的脚本（FFTools 那批）也正是**在这里**找输入文件，
@@ -482,6 +502,12 @@ pub struct App {
     pub preview: crate::preview::Preview,
     /// 原生包管理视图；`Some` 表示开着。
     pub packages: Option<PackageView>,
+    /// 工具仓库界面（发现 / 已安装 / 仓库）；Some 表示开着。
+    pub repository: Option<repo_view::RepositoryView>,
+    /// 启动时的「有没有新版」后台检查（只查，不动手）。
+    pub update_check: Option<UpdateCheck>,
+    /// 动态参数候选的后台解析器（懒启动：只有真的出现 dynamic 字段才起线程）。
+    pub resolver: Option<crate::dynamic::Resolver>,
     /// 正在跑的后台任务。
     pub running: Option<RunningJobView>,
     /// 排队等着跑的任务（批量执行时用）。
@@ -515,6 +541,7 @@ impl App {
             state: state::load(),
             state_path: state::path(),
             history_path: None,
+            queue_path: None,
             needs_full_redraw: false,
             work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             dir_input: None,
@@ -525,6 +552,9 @@ impl App {
             files: None,
             preview: crate::preview::Preview::new(),
             packages: None,
+            repository: None,
+            update_check: None,
+            resolver: None,
             running: None,
             job_queue: VecDeque::new(),
             job_results: Vec::new(),
@@ -712,15 +742,10 @@ impl App {
             format!("{} · {} 个工具", current.label(), count)
         };
 
-        // 包管理域的「主界面」就是软件包中心：切进去直接打开它，
-        // 而不是先给一张 14 个 CLI 动作的列表（那正是「按 Enter 得到表单」的来源）。
-        // 想看动作列表就按 Esc —— 它就在中心底下。
-        if current == Domain::Packages && self.packages.is_none() {
-            self.open_packages();
-            self.message = String::from(
-                "软件包中心：打字过滤（全库）· Enter 上网搜 · Space 排队 · Esc 回动作列表",
-            );
-        }
+        // 这里**故意不再自动打开软件包中心**：进域就是动作列表，和其它六个域一致。
+        // 那个域的列表现在是四个「进中心」的入口（搜索并安装 / 已安装·卸载 /
+        // Arch 新闻 / 系统维护）+ 三个只有命令行能做的查询，不再是十几个和中心
+        // 重复的包装动作 —— 所以不需要再用「自动开中心」把列表藏起来。
     }
 
     /// 切换二级筛选。
@@ -802,9 +827,85 @@ impl App {
             editing: false,
             error: None,
             confirm: false,
+            candidates: std::collections::BTreeMap::new(),
+            candidate_errors: std::collections::BTreeMap::new(),
         });
         self.message = String::from("填写参数 · Ctrl-E 执行 · Esc 返回");
+        // 动态候选现在就去问，但**在后台线程里**问：用户马上就能开始填别的字段。
+        self.request_dynamic_candidates();
         true
+    }
+
+    /// 把表单里所有动态字段的候选问一遍（后台线程）。
+    ///
+    /// 线程懒启动：没有 dynamic 字段的工具连一个线程都不会起。
+    pub fn request_dynamic_candidates(&mut self) {
+        if self.form.is_none() {
+            return;
+        }
+        let work_dir = self.work_dir.clone();
+        let jobs: Vec<crate::dynamic::Job> = self
+            .form_arguments()
+            .iter()
+            .filter(|argument| argument.kind == ArgKind::Dynamic)
+            .filter_map(|argument| {
+                let spec = argument.source.clone()?;
+                Some(crate::dynamic::Job {
+                    key: argument.key.clone(),
+                    spec,
+                    work_dir: work_dir.clone(),
+                })
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+
+        if self.resolver.is_none() {
+            match crate::dynamic::Resolver::start() {
+                Ok(resolver) => self.resolver = Some(resolver),
+                Err(problem) => {
+                    if let Some(form) = self.form.as_mut() {
+                        for job in jobs {
+                            form.candidate_errors.insert(job.key, problem.clone());
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some(resolver) = self.resolver.as_ref() {
+            for job in jobs {
+                let key = job.key.clone();
+                if let Err(problem) = resolver.request(job)
+                    && let Some(form) = self.form.as_mut()
+                {
+                    form.candidate_errors.insert(key, problem);
+                }
+            }
+        }
+    }
+
+    /// 收候选（每帧一次）。返回「有没有变化」。
+    pub fn poll_dynamic(&mut self) -> bool {
+        let Some(resolver) = self.resolver.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some((key, outcome)) = resolver.try_recv() {
+            changed = true;
+            if let Some(form) = self.form.as_mut() {
+                match outcome {
+                    Ok(candidates) => {
+                        form.candidates.insert(key, candidates);
+                    }
+                    Err(problem) => {
+                        form.candidate_errors.insert(key, problem);
+                    }
+                }
+            }
+        }
+        changed
     }
 
     pub fn close_form(&mut self) {
@@ -879,6 +980,22 @@ impl App {
                 };
                 form.values.set(&argument.key, next);
             }
+            // 动态字段有候选时就是「可左右换」；没有就退化成普通文本框。
+            ArgKind::Dynamic => {
+                let candidates = form.candidates_for(&argument.key).to_vec();
+                if candidates.is_empty() {
+                    return;
+                }
+                let current = form.values.get(&argument.key).unwrap_or("").to_string();
+                let index = candidates
+                    .iter()
+                    .position(|candidate| *candidate == current)
+                    .unwrap_or(0) as isize;
+                let len = candidates.len() as isize;
+                let next = (index + delta).rem_euclid(len) as usize;
+                let value = candidates[next].clone();
+                form.values.set(&argument.key, value);
+            }
             ArgKind::Text | ArgKind::Path => {}
         }
     }
@@ -890,7 +1007,17 @@ impl App {
             return;
         };
         match argument.kind {
-            ArgKind::Text | ArgKind::Path => {
+            // 动态字段有候选时和 Choice 一样「左右换」；没候选（或还没解析出来）
+            // 就是普通文本框 —— 用户不该因为命令行慢半拍就没法打字。
+            ArgKind::Dynamic
+                if self
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| !form.candidates_for(&argument.key).is_empty()) =>
+            {
+                self.form_adjust(1);
+            }
+            ArgKind::Text | ArgKind::Path | ArgKind::Dynamic => {
                 if let Some(form) = self.form.as_mut() {
                     form.editing = true;
                     form.error = None;
@@ -1091,6 +1218,76 @@ impl App {
     // ── 原生包管理视图 ───────────────────────────────────────────────────
 
     /// 按 `p`：打开原生包管理（搜索 / 信息 / 排队 / 安装）。
+    /// 起一次「有没有新版」的后台检查。
+    ///
+    /// 刻意**不**自动应用：升级 = 下载并执行别人新写的代码，不该在你不知情的
+    /// 时候发生。这里只负责把答案摆到你眼前。
+    pub fn start_update_check(&mut self) {
+        if self.update_check.is_some() {
+            return;
+        }
+        self.update_check = UpdateCheck::start();
+    }
+
+    /// 收更新检查的回应。返回「有没有变化」。
+    pub fn poll_update_check(&mut self) -> bool {
+        let Some(check) = self.update_check.as_mut() else {
+            return false;
+        };
+        let before = (check.upgradable(), check.problem().map(str::to_string));
+        let changed = check.poll();
+        let after = (check.upgradable(), check.problem().map(str::to_string));
+        if !changed || before == after {
+            return changed;
+        }
+        match after.0 {
+            // 都是最新的：不用打扰。
+            Some(0) => {}
+            Some(count) => {
+                self.message = format!(
+                    "有 {count} 个工具包可升级 · 进「发现」面板按 U 升级（或 toolbox-hub update）"
+                );
+            }
+            // 还没算出数（刷新失败之类）：把原因说出来，别让状态行一直空着。
+            None => {
+                if let Some(problem) = after.1 {
+                    self.message = format!("没法检查工具包更新（本机工具照常可用）：{problem}");
+                }
+            }
+        }
+        changed
+    }
+
+    /// 打开工具仓库界面（「发现」域的第一项，或 repository-center 界面）。
+    ///
+    /// 打开本身**不联网**：只读缓存与账本，索引刷新由界面里的 u 键触发。
+    pub fn open_repository(&mut self) {
+        self.close_help();
+        // 第一次跑就写一份带注释的 repositories.toml —— 不写没人知道有它。
+        crate::repository::config::ensure_template();
+        let service = crate::repository::Service::from_config();
+        match repo_view::RepositoryView::open(service) {
+            Ok(view) => {
+                self.message =
+                    String::from("工具仓库：/ 搜索 · Enter 安装 · 1-3 切面板 · u 刷新索引");
+                self.repository = Some(view);
+            }
+            Err(problem) => self.message = format!("仓库界面打不开：{problem}"),
+        }
+    }
+
+    pub fn close_repository(&mut self) {
+        self.repository = None;
+    }
+
+    /// 收仓库界面的后台回应。返回「有没有变化」。
+    pub fn poll_repository(&mut self) -> bool {
+        match self.repository.as_mut() {
+            Some(view) => view.poll(),
+            None => false,
+        }
+    }
+
     pub fn open_packages(&mut self) {
         let history = packages::load_searches_from(&packages::searches_path());
         // 常驻取数线程：libalpm 句柄与 HTTP 连接都活在它里面（见 packages::worker）。
@@ -1208,12 +1405,16 @@ impl App {
     }
 
     /// 关闭包管理视图（历史与队列都落盘）。
+    ///
+    /// **队列为空也要写文件。** 只在非空时写的话，「我把队列清空了」这件事不会
+    /// 被记住：下次打开又把上一次的旧队列原样读回来。实测报障就是这个 ——
+    /// 在队列面板里 Del 删完、按 Esc 退出，重新进来那些包全都在。
     pub fn close_packages(&mut self) {
         if let Some(view) = self.packages.take() {
             view.persist_history();
-            if !view.queue.is_empty() {
-                let _ = packages::save_queue_to(&packages::queue_path(), &view.queue);
-            }
+            let path = self.queue_path.clone().unwrap_or_else(packages::queue_path);
+            // 写不进去也不该拦住关界面：队列丢了只是少省一次手，能再选一次。
+            let _ = packages::save_queue_to(&path, &view.queue);
         }
     }
 
@@ -1378,101 +1579,26 @@ impl App {
     }
 
     /// `Ctrl+X`：把 AUR 的 PKGBUILD 拉下来，用输出视图看（装之前该瞄一眼）。
+    ///
+    /// 取的动作**不在这里做**：`paru -Gp` 是网络操作，冷连接要几秒，同步跑会把
+    /// 整个界面冻住（不能滚动、按 `q` 也不响应）。丢给工作线程，回来再开输出视图。
     pub fn show_pkgbuild(&mut self, cwd: &Path) -> io::Result<()> {
-        let Some(view) = self.packages.as_ref() else {
-            return Ok(());
-        };
-        let Some(name) = view.selected_hit().map(|hit| hit.name.clone()) else {
-            return Ok(());
-        };
-
-        let program = PathBuf::from("paru");
-        let argv = vec![String::from("-Gp"), name.clone()];
-        let captured = runtime::run_captured(&program, &argv, cwd, &format!("PKGBUILD {name}"))?;
-        self.request_full_redraw();
-
-        if let Some(viewer) = Viewer::from_captured(std::slice::from_ref(&captured)) {
-            self.open_viewer(viewer);
-        } else if let Some(view) = self.packages.as_mut() {
-            view.message = format!("没拿到 {name} 的 PKGBUILD（{name} 是 AUR 包吗）");
-        }
-        Ok(())
+        self.request_pkgbuild(false, cwd)
     }
 
-    /// `Ctrl+K`：PKGBUILD 检查 —— `paru -Gp` 取下来，再过一遍 shellcheck 与 namcap，
+    /// `Ctrl+K`：PKGBUILD 检查 —— 取下来之后再过一遍 shellcheck 与 namcap，
     /// 三段一起丢进输出视图（pacsea 的 Show PKGBUILD / ShellCheck / Namcap 就是这个）。
+    ///
+    /// 和 `Ctrl+X` 一样交给工作线程：这一步要联网取文件，同步跑就是几秒钟的假死。
+    /// 真正的流程在 `packages::worker::pkgbuild_report`。
     pub fn check_pkgbuild(&mut self, cwd: &Path) -> io::Result<()> {
-        let Some(name) = self
-            .packages
-            .as_ref()
-            .and_then(|view| view.selected_hit().map(|hit| hit.name.clone()))
-        else {
-            return Ok(());
-        };
+        self.request_pkgbuild(true, cwd)
+    }
 
+    /// 取 PKGBUILD（`check` 决定要不要顺带检查）—— 两条快捷键共用这一份。
+    fn request_pkgbuild(&mut self, check: bool, cwd: &Path) -> io::Result<()> {
         if let Some(view) = self.packages.as_mut() {
-            view.message = format!("正在取 {name} 的 PKGBUILD 并检查…");
-        }
-
-        let paru = PathBuf::from("paru");
-        let fetched = runtime::run_captured(
-            &paru,
-            &[String::from("-Gp"), name.clone()],
-            cwd,
-            &format!("PKGBUILD {name}"),
-        )?;
-        self.request_full_redraw();
-
-        if !fetched.success || fetched.stdout.trim().is_empty() {
-            if let Some(view) = self.packages.as_mut() {
-                view.message = format!("没拿到 {name} 的 PKGBUILD（它是 AUR 包吗？网络通吗？）");
-            }
-            return Ok(());
-        }
-
-        // 写到临时文件：检查工具要的是文件，不是管道。
-        let path = std::env::temp_dir().join(format!("toolbox-hub-{name}-PKGBUILD"));
-        let _ = std::fs::write(&path, &fetched.stdout);
-
-        let mut captures = vec![fetched];
-        for (program, label) in [("shellcheck", "shellcheck"), ("namcap", "namcap")] {
-            let captured = runtime::run_captured(
-                &PathBuf::from(program),
-                &[path.display().to_string()],
-                cwd,
-                label,
-            );
-            match captured {
-                Ok(mut captured) => {
-                    // shellcheck 发现问题是**退出码 1**：那是检查成功、有告警，
-                    // 不是「命令失败」（不然头部会写着「失败 N 个」，误导）。
-                    if program == "shellcheck" && captured.status == Some(1) {
-                        captured.success = true;
-                        captured.label = format!("{program}（有告警）");
-                    }
-                    captures.push(captured);
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    // 没装就明说，别装作检查过了 —— 但也不算「失败」
-                    captures.push(runtime::Captured {
-                        label: format!("{program}（没装）"),
-                        command: format!("{program}（没装：pacman -S {program}）"),
-                        stdout: format!(
-                            "没装 {program}，这一步跳过了。\n装上它：pacman -S {program}"
-                        ),
-                        stderr: String::new(),
-                        status: Some(0),
-                        success: true,
-                        elapsed: std::time::Duration::ZERO,
-                        cancelled: false,
-                    });
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        if let Some(viewer) = Viewer::from_captured(&captures) {
-            self.open_viewer(viewer);
+            view.request_pkgbuild(check, cwd.to_path_buf());
         }
         Ok(())
     }
@@ -1755,6 +1881,44 @@ impl App {
             let cwd = self.work_dir.clone();
             self.start_next_job(&cwd);
         }
+    }
+
+    /// 重跑一条历史记录：排进**同一个后台队列**，不再同步阻塞界面。
+    ///
+    /// 之前这条路走的是 `run_captured`，而那是同步阻塞的。历史里存的 argv 什么都
+    /// 有（转码、打包 —— 恰恰是跑得最久的那批），一按 Enter 就把整个界面冻住：
+    /// 没有实时输出、没有已用时、按 `q` 也取消不了。走队列之后，这三件事由
+    /// 后台执行那条路免费提供：实时输出尾巴 + 随时取消 + 跑完自动开输出视图。
+    ///
+    /// 返回 `false` 表示这条记录没法重跑（没存下参数）。
+    pub fn replay_from_history(&mut self, entry: &history::Entry, cwd: &Path) -> bool {
+        let Some((program, argv)) = entry.argv.split_first() else {
+            self.message = String::from("这条记录没有参数，重跑不了");
+            return false;
+        };
+
+        self.job_queue.push_back(PendingJob {
+            tool_id: entry.tool_id.clone(),
+            tool_name: entry.tool_name.clone(),
+            program: PathBuf::from(program),
+            argv: argv.to_vec(),
+            // 历史里的 argv **本来就带程序名**（记录时补过），这里别再插一次 ——
+            // 插了会变成 `cmd cmd args`，重跑一条错一条。
+            record_argv: entry.argv.clone(),
+            values: entry
+                .values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            // 历史没存退出码白名单：重跑按最严的来，不替用户放宽。
+            ok_exit_codes: vec![0],
+            total_seconds: None,
+        });
+
+        if self.running.is_none() {
+            self.start_next_job(cwd);
+        }
+        true
     }
 
     /// 起队列里的下一件。
@@ -2639,7 +2803,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::Path, path::PathBuf};
 
     use super::{App, CaptureRequest, Scope, Viewer};
     use crate::{
@@ -2678,6 +2842,216 @@ mod tests {
             tool("shorin", Domain::Tools, &[]),
         ]);
         App::new(registry, PathBuf::from("/tmp/bin"), ReloadReport::default())
+    }
+
+    /// 回归：把安装队列删空、按 Esc 退出，**空队列也必须落盘**。
+    ///
+    /// 以前 close_packages 只在队列非空时才写文件，于是「我把队列清空了」这件事
+    /// 不会被记住：下次打开又把上一次的旧队列原样读回来。实测报障就是这个 ——
+    /// 在队列面板里用 Del 删完、按 Esc 退出，重新进来包全都在。
+    #[test]
+    fn closing_the_package_center_remembers_an_emptied_queue() {
+        use crate::{
+            app::package_view::{PackageView, Pane},
+            config::PackagePrefs,
+            packages::{self, QueuedPackage},
+        };
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("toolbox-hub-closequeue-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("install-queue.txt");
+
+        // 上一次会话留下的队列（就是会被「读回来」的那两个）
+        let stale = vec![
+            QueuedPackage {
+                name: String::from("fzf"),
+                origin: String::from("extra"),
+                version: String::from("0.74.4-1"),
+            },
+            QueuedPackage {
+                name: String::from("daed"),
+                origin: String::from("archlinuxcn"),
+                version: String::from("2.1.1-1"),
+            },
+        ];
+        packages::save_queue_to(&path, &stale).expect("写旧队列");
+        assert_eq!(packages::load_queue_from(&path).len(), 2);
+
+        let mut app = app();
+        app.queue_path = Some(path.clone());
+
+        // 打开界面 → 读回旧队列 → Tab 到队列面板 → Del 删光 → Esc 退出
+        let mut view = PackageView::new(Vec::new(), None, PackagePrefs::default());
+        view.queue = packages::load_queue_from(&path);
+        assert_eq!(view.queue.len(), 2, "打开时读到上一次的队列");
+        view.pane = Pane::Queue;
+        view.queue_selected = 0;
+        view.remove_from_queue();
+        view.remove_from_queue();
+        assert!(
+            view.queue.is_empty(),
+            "Del 删两下应当清空: {:?}",
+            view.queue
+        );
+        app.packages = Some(view);
+
+        app.close_packages();
+
+        assert_eq!(
+            packages::load_queue_from(&path).len(),
+            0,
+            "空队列必须覆盖旧文件 —— 否则下次打开旧队列原样回来"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 同一个回归，但这次**走真实的按键路径**（Esc 真的进 handle_key）。
+    ///
+    /// 上面那个测试直接调 close_packages；这个盯的是「Esc 确实接到了它」——
+    /// 以后有人把 Esc 改接到别处，这里会立刻红。
+    #[test]
+    fn pressing_esc_in_the_package_center_persists_the_emptied_queue() {
+        use crate::{
+            app::package_view::{PackageView, Pane},
+            config::PackagePrefs,
+            packages::{self, QueuedPackage},
+        };
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("toolbox-hub-escesc-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("install-queue.txt");
+
+        packages::save_queue_to(
+            &path,
+            &[
+                QueuedPackage {
+                    name: String::from("fzf"),
+                    origin: String::from("extra"),
+                    version: String::from("0.74.4-1"),
+                },
+                QueuedPackage {
+                    name: String::from("daed"),
+                    origin: String::from("archlinuxcn"),
+                    version: String::from("2.1.1-1"),
+                },
+            ],
+        )
+        .expect("写旧队列");
+
+        let mut app = app();
+        app.queue_path = Some(path.clone());
+        let mut view = PackageView::new(Vec::new(), None, PackagePrefs::default());
+        view.queue = packages::load_queue_from(&path);
+        view.pane = Pane::Queue;
+        app.packages = Some(view);
+
+        // 队列面板里 Del 两下删光，然后 Esc —— 就是报障的操作顺序
+        for _ in 0..2 {
+            crate::app::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+                Path::new("/tmp"),
+            )
+            .expect("Del 不该报错");
+        }
+        assert!(
+            app.packages.as_ref().expect("界面还开着").queue.is_empty(),
+            "Del 应当把两条都移出去"
+        );
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Path::new("/tmp"),
+        )
+        .expect("Esc 不该报错");
+
+        assert!(app.packages.is_none(), "Esc 应当关掉包管理界面");
+        assert_eq!(
+            packages::load_queue_from(&path).len(),
+            0,
+            "Esc 退出后队列文件必须反映「已经空了」"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 一条能重跑的历史记录。
+    fn history_entry(argv: Vec<String>) -> crate::history::Entry {
+        crate::history::Entry {
+            epoch: 0,
+            tool_id: String::from("test:replay"),
+            tool_name: String::from("重跑样本"),
+            argv,
+            success: true,
+            millis: 1,
+            values: BTreeMap::new(),
+        }
+    }
+
+    /// 重跑历史必须**排进后台队列**（有实时输出、能取消），而不是同步阻塞跑。
+    ///
+    /// 顺带守住「程序名不能插两次」这个坑：历史里的 argv 在记录时就已经补过
+    /// 程序名了，这里再补一次就会重跑成 `cmd cmd args`。
+    #[test]
+    fn replay_from_history_enqueues_instead_of_blocking() {
+        let mut app = app();
+        let entry = history_entry(vec![String::from("/bin/true"), String::from("--flag")]);
+
+        assert!(app.replay_from_history(&entry, Path::new("/tmp")));
+        assert!(app.is_running(), "排完队应该立刻开跑第一件");
+
+        let running = app.running.as_ref().expect("刚判过在跑");
+        assert_eq!(
+            running.record_argv, entry.argv,
+            "记录写进历史的 argv 必须和原记录一致（程序名只该有一个）"
+        );
+        // 执行的那条命令行里程序名只该出现一次 —— 出现两次就是「插重了」。
+        assert_eq!(
+            running.job.command.matches("/bin/true").count(),
+            1,
+            "程序名重复了：{}",
+            running.job.command
+        );
+        assert_eq!(running.tool_id, "test:replay");
+    }
+
+    /// 排队时前面还有活：只入队，不抢跑，也不丢。
+    #[test]
+    fn replay_from_history_queues_behind_a_running_job() {
+        let mut app = app();
+        let first = history_entry(vec![String::from("/bin/true")]);
+        let second = history_entry(vec![String::from("/bin/true"), String::from("a")]);
+
+        assert!(app.replay_from_history(&first, Path::new("/tmp")));
+        assert!(app.replay_from_history(&second, Path::new("/tmp")));
+
+        assert_eq!(app.job_queue.len(), 1, "第二件该在后面排队");
+        assert_eq!(
+            app.job_queue.front().map(|job| job.argv.clone()),
+            Some(vec![String::from("a")])
+        );
+    }
+
+    /// 没存参数的历史不能装作能重跑。
+    #[test]
+    fn replay_from_history_refuses_empty_argv() {
+        let mut app = app();
+
+        assert!(!app.replay_from_history(&history_entry(Vec::new()), Path::new("/tmp")));
+        assert!(app.running.is_none(), "没参数就不该起进程");
+        assert!(
+            app.message.contains("重跑不了"),
+            "得说清楚为什么：{}",
+            app.message
+        );
     }
 
     /// 一件普通脚本 + 一件**真实的**带参数动作（取自 Curated Provider）。
@@ -2744,6 +3118,49 @@ mod tests {
             "无参数动作把 base_argv 丢了，实际跑的是：{command}"
         );
         app.cancel_job();
+    }
+
+    /// 列表上按 Enter 也要能把「内置界面」类动作派发出去。
+    ///
+    /// 这条抓到过真 bug：`RunMode::Native` 只在**表单提交**那条路上被处理过，
+    /// 而 native 动作全都没有参数（不需要表单）→ 按 Enter 掉进
+    /// `RunMode::Native => {}`，什么都不发生（`软件包中心` 就是这种）。
+    ///
+    /// 这里故意把 `program` 换成一个不存在的界面名：真去开软件包中心会起
+    /// 包数据库线程（libalpm 的句柄不 Send，进程退出时会让测试崩），
+    /// 而这条测试要钉的只是「有没有走到派遣那一步」。
+    #[test]
+    fn enter_on_a_native_action_dispatches_to_its_view() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut tool = crate::providers::manifest::bundled_tools()
+            .into_iter()
+            .find(|tool| tool.mode == RunMode::Native)
+            .expect("内置动作里该有 native 的（软件包中心）");
+        tool.domain = Domain::Media; // 默认停在第一个域，域不对列表就是空的
+        tool.ready = true;
+        tool.missing_deps.clear();
+        tool.action.as_mut().expect("带动作").program = String::from("probe-view");
+
+        let mut app = App::new(
+            Registry::from_tools(vec![tool]),
+            PathBuf::from("/tmp/bin"),
+            ReloadReport::default(),
+        );
+        let cwd = app.work_dir.clone();
+
+        crate::app::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &cwd,
+        )
+        .expect("按下 Enter");
+
+        assert!(
+            app.message.contains("probe-view"),
+            "native 动作该被派发到 open_native_view，实际状态行是：{}",
+            app.message
+        );
     }
 
     #[test]
@@ -3438,6 +3855,7 @@ mod tests {
                 sensitive: false,
                 repeatable: false,
                 repeat_flag: false,
+                source: None,
                 separator: String::from(","),
                 dir_only: false,
                 help: Some("跑多久".to_string()),
@@ -3628,6 +4046,7 @@ mod tests {
                     sensitive: false,
                     repeatable,
                     repeat_flag: false,
+                    source: None,
                     separator: String::from(","),
                     dir_only: false,
                     help: Some(String::from("测试用")),
@@ -3769,6 +4188,7 @@ mod tests {
     #[test]
     fn a_whitelisted_exit_code_counts_as_success() {
         let argument = |key: &str, label: &str, flag: &str| crate::model::Argument {
+            source: None,
             key: key.to_string(),
             label: label.to_string(),
             kind: crate::model::ArgKind::Toggle,
@@ -4161,8 +4581,14 @@ mod tests {
         assert_eq!(app.selected, 0);
     }
 
+    /// 包管理中心的键位：`1`-`4` 切面板、`[` `]` 选标签、`/` 进输入。
+    ///
+    /// 这一条是**交互契约**：输入改模态之后，字母和数字都回来了 ——
+    /// 以前它们全被常驻输入框吃掉，命令只能挂 `Ctrl+`，那套键位是挤出来的。
     #[test]
-    fn package_center_numbers_switch_modes_and_alt_numbers_filter() {
+    fn package_center_keys_switch_modes_move_chips_and_type() {
+        use crate::app::package_view::{PackageMode, RepoChip};
+        use crate::packages::InstalledFilter;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut app = action_app();
@@ -4171,53 +4597,106 @@ mod tests {
             None,
             crate::config::PackagePrefs::default(),
         );
-        packages.repos = vec![crate::app::package_view::RepoChip {
-            name: String::from("extra"),
-            enabled: true,
-            count: 1,
-        }];
+        packages.repos = vec![
+            RepoChip {
+                name: String::from("extra"),
+                enabled: true,
+                count: 1,
+            },
+            RepoChip {
+                name: String::from("aur"),
+                enabled: true,
+                count: 1,
+            },
+        ];
         app.packages = Some(packages);
         let cwd = app.work_dir.clone();
-
-        for (digit, expected) in [
-            ('1', crate::app::package_view::PackageMode::Search),
-            ('2', crate::app::package_view::PackageMode::Installed),
-            ('3', crate::app::package_view::PackageMode::News),
-            ('4', crate::app::package_view::PackageMode::Health),
-        ] {
-            crate::app::handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE),
-                &cwd,
-            )
-            .expect("handle key");
-            assert_eq!(app.packages.as_ref().map(|view| view.mode), Some(expected));
+        /// 直接读包中心的当前状态（借用，不克隆）。
+        fn view(app: &App) -> &crate::app::package_view::PackageView {
+            app.packages.as_ref().expect("包中心开着")
         }
 
-        crate::app::handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
-            &cwd,
-        )
-        .expect("search mode");
-        crate::app::handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
-            &cwd,
-        )
-        .expect("toggle repo");
-        assert!(!app.packages.as_ref().expect("package view").repos[0].enabled);
+        let press = |app: &mut App, code: KeyCode, modifiers: KeyModifiers| {
+            crate::app::handle_key(app, KeyEvent::new(code, modifiers), &cwd).expect("按键");
+        };
 
-        crate::app::handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
-            &cwd,
-        )
-        .expect("type search digit");
+        // ① `1`-`4` 直达四种模式
+        for (digit, expected) in [
+            ('1', PackageMode::Search),
+            ('2', PackageMode::Installed),
+            ('3', PackageMode::News),
+            ('4', PackageMode::Health),
+        ] {
+            press(&mut app, KeyCode::Char(digit), KeyModifiers::NONE);
+            assert_eq!(view(&app).mode, expected, "「{digit}」该切到 {expected:?}");
+        }
+
+        // ② `[` / `]` 在标签行上移动焦点，`Space` 开关它（不再是 Alt+数字）
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE); // 回搜索模式看仓库标签
+        press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        let view_now = view(&app);
         assert_eq!(
-            app.packages.as_ref().map(|view| view.query.text()),
-            Some("7"),
-            "普通数字仍可输入搜索词"
+            view_now.pane,
+            crate::app::package_view::Pane::Tabs,
+            "`]` 该把焦点带到标签行"
+        );
+        assert_eq!(view_now.chip_focus, 1, "`]` 该走到第二个标签");
+
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!view(&app).repos[1].enabled, "Space 该开关焦点上的那个标签");
+        assert_eq!(
+            view(&app).pane,
+            crate::app::package_view::Pane::Tabs,
+            "焦点留在标签行"
+        );
+
+        // ③ `/` 进输入态：数字与字母都进过滤框，不再被当命令
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(view(&app).typing, "`/` 该进输入态");
+        for ch in ['7', 'i', 'r'] {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert_eq!(view(&app).query.text(), "7ir", "输入态里字母数字都是文字");
+        assert_eq!(
+            view(&app).mode,
+            PackageMode::Search,
+            "输入态里 `1`-`4` 不该切模式"
+        );
+
+        // `Enter` 收工但**保留**筛选词
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!view(&app).typing, "Enter 该退出输入态");
+        assert_eq!(view(&app).query.text(), "7ir", "Enter 不该清掉筛选词");
+
+        // `Esc` 清空并退出输入态
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!view(&app).typing);
+        assert!(view(&app).query.is_empty(), "Esc 该清空筛选并退出输入");
+
+        // ④ 非输入态下 `Esc` 才是「回上层」
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.packages.is_none(),
+            "非输入态的 Esc 该关掉包中心回动作列表"
+        );
+
+        // ⑤ 已安装模式里 `[` `]` 换预过滤（和仓库标签同一套键）
+        let mut app2 = action_app();
+        let mut packages = crate::app::package_view::PackageView::new(
+            Vec::new(),
+            None,
+            crate::config::PackagePrefs::default(),
+        );
+        packages.set_mode(PackageMode::Installed);
+        app2.packages = Some(packages);
+        press(&mut app2, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(view(&app2).chip_focus, 1, "`]` 先把焦点移到第二个标签");
+        press(&mut app2, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(
+            view(&app2).installed_filter,
+            InstalledFilter::Explicit,
+            "Space 才把预过滤真正切过去"
         );
     }
 

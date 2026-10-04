@@ -36,6 +36,7 @@ optdepends=(
   'sing-box: 本机代理运维动作'
   'wl-clipboard: Wayland 剪贴板复制'
   'xclip: X11 剪贴板复制'
+  'bash: tbx-pkgbuild（「打包」域）跑的是 bash 脚本'
 )
 # options：不生成 debug 包（Rust 的调试符号很大，对使用者没用）。
 options=('!debug')
@@ -81,6 +82,12 @@ package() {
   # manifest 的 program 写的是**裸命令名**、走 PATH 解析，所以必须放在 PATH 上的目录：
   # 放 /usr/bin 而不是 /usr/local/bin —— 后者是留给用户自己覆盖系统文件的地方。
   install -m755 scripts/sing-box/sing-box-* "$pkgdir/usr/bin/"
+
+  # 「打包」域唯一的转发脚本（manifests/pkgbuild-source.toml 里 program = "tbx-pkgbuild"）。
+  # 它只负责找私人软件仓库（$TOOLBOX_HUB_PKGBUILD_SRC > ~/pkgbuild-source），
+  # 找到之后把参数原样转给那个仓库的 manage.sh。
+  install -Dm755 scripts/pkgbuild-source/tbx-pkgbuild \
+    "$pkgdir/usr/bin/tbx-pkgbuild"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

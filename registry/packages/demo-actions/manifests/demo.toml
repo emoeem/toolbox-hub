@@ -1,0 +1,83 @@
+# demo-actions 的动作定义 —— ToolHub manifest 的最小完整示例。
+#
+# 这份文件随 demo-actions 包安装，落到包自己的目录里，由 Manifest Provider 读取。
+# `program` 写的是**命令名**：demo-echo 由同一个包一起装到 ~/.local/bin。
+#
+# 字段速查：
+#   id / name / summary / domain / program   必填
+#   tags / base_argv / install / input / output / features / mode / danger   可选
+#   [[action.argument]] 里 key / label / kind 必填，kind 取 text / path / choice / toggle
+
+# ── 打招呼：演示「必填位置参数 + 开关 + 带 flag 的文本」 ────────────────────
+
+[[action]]
+id = "demo-echo-greet"
+name = "demo-echo 打个招呼"
+summary = "把名字回显成一句问候，可以加标题、可以转大写"
+domain = "工具"
+tags = ["示例", "demo"]
+program = "demo-echo"
+install = "toolbox-hub install demo-actions"
+input = "一个名字"
+output = "一句问候"
+features = "必填位置参数；大写开关；自定义标题"
+
+[[action.argument]]
+key = "upper"
+label = "转成大写"
+kind = "toggle"
+flag = "-u"
+default = "false"
+help = "打开之后标题和名字都会变成大写"
+
+[[action.argument]]
+key = "banner"
+label = "标题行"
+kind = "text"
+flag = "-b"
+help = "留空就不打标题；带空格直接填，不用加引号"
+
+[[action.argument]]
+key = "name"
+label = "名字"
+kind = "text"
+required = true
+help = "要问候谁。这里没有 flag，所以它作为位置参数排在最后"
+
+# ── 列成一串：演示「多值参数（repeatable）」 ────────────────────────────────
+
+[[action]]
+id = "demo-echo-list"
+name = "demo-echo 列成一串"
+summary = "把多个词各回显一行，可以编号、可以转大写"
+domain = "工具"
+tags = ["示例", "demo"]
+program = "demo-echo"
+install = "toolbox-hub install demo-actions"
+input = "若干词"
+output = "逐行输出"
+features = "多值参数（逗号分隔）；编号开关；大写开关"
+
+[[action.argument]]
+key = "items"
+label = "词"
+kind = "text"
+required = true
+repeatable = true
+help = "多个用逗号隔开，每个词各占一行；想改分隔符可以写 separator"
+
+[[action.argument]]
+key = "numbered"
+label = "加编号"
+kind = "toggle"
+flag = "-n"
+default = "true"
+help = "每行前面加上序号"
+
+[[action.argument]]
+key = "upper"
+label = "转成大写"
+kind = "toggle"
+flag = "-u"
+default = "false"
+help = "打开之后输出全大写"

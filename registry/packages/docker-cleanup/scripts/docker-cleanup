@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+#
+# docker-cleanup —— Docker 的「先预览、再动手」清理器。
+#
+# 为什么默认只预览：prune 系列没有撤销键，删掉的镜像层和卷不会自己回来。
+# 除非显式加 --yes，这里只列出「会被删掉的东西」和当前占用，不动任何东西。
+#
+# 另外，本机没装 docker、或者守护进程没起来的时候，这里给的是人话（怎么装、
+# 怎么起、权限不够怎么办），而不是一句 command not found。
+set -euo pipefail
+
+PROG="${0##*/}"
+APPLY=0
+TARGET=""
+
+usage() {
+    cat <<'EOF'
+用法: docker-cleanup [选项] <目标>
+
+目标:
+  images       悬空镜像（dangling：没有标签、也没有人引用）
+  volumes      没有任何容器在用的卷
+  containers   已停止 / 创建了但没跑起来的容器
+  networks     没人用的网络
+  builder      构建缓存
+  all          上面全部（不含卷 —— 卷要单独选，删了就是删了）
+  doctor       环境自检：docker 在不在、守护进程通不通
+
+选项:
+  -n, --dry-run  只看会被删掉什么（默认就是它，写出来是为了显式）
+  -y, --yes      真的执行删除
+  -h, --help     显示这份帮助
+
+例子:
+  docker-cleanup images          # 先看看
+  docker-cleanup images --yes    # 看清楚了再删
+  docker-cleanup doctor          # 环境是不是好的
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    exit "${2:-1}"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# docker 缺了 / 守护进程连不上，都在这里给人话然后退出 1。
+require_docker() {
+    if ! have docker; then
+        cat >&2 <<EOF
+$PROG: 本机没装 docker（PATH 里找不到 docker 这个命令），所以没东西可清。
+
+  装 Docker（Arch）：
+      sudo pacman -S docker
+  装完把守护进程拉起来：
+      sudo systemctl enable --now docker
+  想让普通用户也能跑 docker（不然每次都要 sudo）：
+      sudo usermod -aG docker \$USER
+      然后注销重新登录一次
+
+  装好之后回来重跑这一条就行。
+EOF
+        exit 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        cat >&2 <<EOF
+$PROG: docker 命令在，但守护进程连不上（docker info 失败了）。
+
+  看一眼服务：  systemctl status docker
+  拉起来：      sudo systemctl start docker
+  如果报 permission denied while trying to connect to the Docker daemon socket：
+      sudo usermod -aG docker \$USER     # 之后要注销再登录
+EOF
+        exit 1
+    fi
+}
+
+section() { printf '\n== %s ==\n' "$1"; }
+
+# 只读地列出候选。空的时候说「没有」，不留一片空白让人猜。
+list_or_none() {
+    local title="$1" empty="$2" out
+    shift 2
+    section "$title"
+    out="$("$@" 2>/dev/null)" || out=""
+    if [ -z "${out//[[:space:]]/}" ]; then
+        printf '（%s）\n' "$empty"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+preview_images() {
+    list_or_none "悬空镜像（dangling）" "没有悬空镜像" \
+        docker images --filter dangling=true --format '{{.ID}}  {{.Repository}}:{{.Tag}}  {{.Size}}'
+    printf '会执行的命令：docker image prune -f\n'
+}
+
+preview_volumes() {
+    list_or_none "没有任何容器在用的卷（dangling）" "没有游离的卷" \
+        docker volume ls --filter dangling=true
+    printf '会执行的命令：docker volume prune -f\n'
+}
+
+preview_containers() {
+    list_or_none "已停止 / 已创建的容器" "没有停着的容器" \
+        docker ps -a --filter status=exited --filter status=created --format '{{.ID}}  {{.Names}}  {{.Status}}'
+    printf '会执行的命令：docker container prune -f\n'
+}
+
+preview_networks() {
+    list_or_none "自定义网络（没人用的会被删掉）" "一个网络都没有" \
+        docker network ls
+    printf '会执行的命令：docker network prune -f\n'
+}
+
+preview_builder() {
+    section "构建缓存"
+    docker system df 2>/dev/null | grep -i 'build cache' \
+        || printf '（表里没有 build cache 一行，多半是没跑过构建）\n'
+    printf '会执行的命令：docker builder prune -f\n'
+}
+
+show_df() {
+    section "当前占用（docker system df）"
+    docker system df || true
+}
+
+do_images()     { printf '→ docker image prune -f\n';     docker image prune -f; }
+do_volumes()    { printf '→ docker volume prune -f\n';    docker volume prune -f; }
+do_containers() { printf '→ docker container prune -f\n'; docker container prune -f; }
+do_networks()   { printf '→ docker network prune -f\n';   docker network prune -f; }
+do_builder()    { printf '→ docker builder prune -f\n';   docker builder prune -f; }
+
+doctor() {
+    section "docker 命令"
+    printf '路径：%s\n' "$(command -v docker)"
+    section "客户端 / 守护进程版本"
+    docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}' 2>/dev/null \
+        || printf '（docker version 读不出服务端版本，但 docker info 是通的）\n'
+    section "当前 context"
+    docker context show 2>/dev/null || printf '（这个 docker 版本没有 context 子命令）\n'
+    section "存储驱动与数据根目录"
+    docker info --format '存储驱动 {{.Driver}} / 数据根目录 {{.DockerRootDir}}' 2>/dev/null \
+        || printf '（docker info 读不出这两项）\n'
+    show_df
+}
+
+main() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--dry-run) APPLY=0 ;;
+            -y|--yes)     APPLY=1 ;;
+            -h|--help)    usage; exit 0 ;;
+            --)
+                shift
+                [ $# -gt 0 ] && TARGET="$1"
+                break
+                ;;
+            -*) usage >&2; die "不认识的选项「$1」" 2 ;;
+            *)
+                if [ -n "$TARGET" ]; then die "只接受一个目标（-h 看用法）" 2; fi
+                TARGET="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$TARGET" ]; then
+        usage >&2
+        die "没说要清什么（-h 看用法）" 2
+    fi
+
+    case "$TARGET" in
+        images|volumes|containers|networks|builder|all|doctor) ;;
+        *) usage >&2; die "不认识的目标「$TARGET」（-h 看用法）" 2 ;;
+    esac
+
+    require_docker
+
+    if [ "$TARGET" = "doctor" ]; then
+        doctor
+        exit 0
+    fi
+
+    if [ "$APPLY" -eq 0 ]; then
+        printf '%s：预览模式（什么都没删；确认无误后加 --yes 再跑一次）\n' "$PROG"
+        case "$TARGET" in
+            images)     preview_images ;;
+            volumes)    preview_volumes ;;
+            containers) preview_containers ;;
+            networks)   preview_networks ;;
+            builder)    preview_builder ;;
+            all)
+                preview_containers
+                preview_images
+                preview_networks
+                preview_builder
+                ;;
+        esac
+        show_df
+        printf '\n想清哪一类，就把上面那条命令加 --yes 跑一次。\n'
+        exit 0
+    fi
+
+    printf '%s：真的要删了（--yes）\n' "$PROG"
+    show_df
+    case "$TARGET" in
+        images)     do_images ;;
+        volumes)    do_volumes ;;
+        containers) do_containers ;;
+        networks)   do_networks ;;
+        builder)    do_builder ;;
+        all)
+            do_containers
+            do_images
+            do_networks
+            do_builder
+            ;;
+    esac
+    section "清理之后"
+    docker system df || true
+}
+
+main "$@"

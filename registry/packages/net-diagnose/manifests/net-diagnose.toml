@@ -1,0 +1,204 @@
+# net-diagnose 的动作定义。
+#
+# 前四条直接把参数拼给系统里已有的命令：
+#   dig / ping / traceroute / nc —— program 是裸命令名、不是本包 scripts/ 提供的，
+#   所以依赖会被自动记成它们，缺了界面按 install 提示怎么装。
+# 第五、六条走本包的 scripts/net-diagnose（装到 ~/.local/bin）。
+#
+# 端口那条写了 ok_exit_codes = [0, 1]：端口关闭时 nc 返回 1，那是**诊断结果**，
+# 不是「命令跑挂了」，所以两种退出码都算成功。
+
+# ── DNS 解析 ────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "net-dns"
+name = "解析域名（DNS）"
+summary = "dig 查一个域名，默认只看结果；关掉「只看结果」就是完整应答"
+domain = "网络"
+tags = ["网络", "dns"]
+program = "dig"
+base_argv = ["+time=3", "+tries=1"]
+mode = "capture"
+install = "sudo pacman -S bind"
+input = "一个域名"
+output = "解析结果（关掉 +short 时是完整应答）"
+features = "记录类型可选（A/AAAA/MX/NS/TXT/CNAME/SOA）；超时 3 秒、重试 1 次，不会卡住"
+
+[[action.argument]]
+key = "short"
+label = "只看结果（+short）"
+kind = "toggle"
+flag = "+short"
+default = "true"
+help = "打开只输出解析出来的地址；关掉就是 dig 的完整应答，能看到状态码和 TTL"
+
+[[action.argument]]
+key = "domain"
+label = "域名"
+kind = "text"
+required = true
+default = "example.com"
+help = "要查的域名。别带 http:// 和路径，dig 只认主机名"
+
+[[action.argument]]
+key = "type"
+label = "记录类型"
+kind = "choice"
+default = "A"
+help = "A 是 IPv4 地址；查邮件服务器用 MX，查 DNS 服务器本身用 NS"
+choices = [
+  { label = "A（IPv4 地址）", value = "A" },
+  { label = "AAAA（IPv6 地址）", value = "AAAA" },
+  { label = "MX（邮件服务器）", value = "MX" },
+  { label = "NS（权威 DNS 服务器）", value = "NS" },
+  { label = "TXT（备注 / SPF / 验证记录）", value = "TXT" },
+  { label = "CNAME（别名）", value = "CNAME" },
+  { label = "SOA（区域起始记录）", value = "SOA" },
+]
+
+# ── 连通性 ──────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "net-ping"
+name = "ping 连通性"
+summary = "ping 一个域名或 IP，发几个包可填"
+domain = "网络"
+tags = ["网络", "连通性"]
+program = "ping"
+mode = "capture"
+install = "sudo pacman -S iputils"
+input = "一个域名或 IP"
+output = "丢包率与延迟统计"
+features = "次数可填（默认 4）；不用 Ctrl-C，跑完自己退出"
+
+[[action.argument]]
+key = "count"
+label = "发几个包"
+kind = "text"
+flag = "-c"
+required = true
+default = "4"
+help = "建议 3~10 个。太多会等很久，尤其对端不回包的时候"
+
+[[action.argument]]
+key = "host"
+label = "目标"
+kind = "text"
+required = true
+default = "1.1.1.1"
+help = "域名或 IP 都行。域名的话会先解析，解析失败就是这个动作失败"
+
+# ── 路由 ────────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "net-traceroute"
+name = "看路由（traceroute）"
+summary = "包到目标中间经过哪些路由器，最多跳几跳可填"
+domain = "网络"
+tags = ["网络", "路由"]
+program = "traceroute"
+mode = "capture"
+install = "sudo pacman -S traceroute"
+input = "一个域名或 IP"
+output = "逐跳的路由表"
+features = "跳数可填（默认 15）；普通用户就能跑，用的是 UDP 探测"
+
+[[action.argument]]
+key = "hops"
+label = "最多几跳"
+kind = "text"
+flag = "-m"
+required = true
+default = "15"
+help = "跨洲的连接可能要 20 跳以上；只想看第一段出口填 5 就够"
+
+[[action.argument]]
+key = "wait"
+label = "每跳等几秒"
+kind = "text"
+flag = "-w"
+required = true
+default = "2"
+help = "跳数多的时候，这个值乘以跳数大致就是最长等待时间"
+
+[[action.argument]]
+key = "host"
+label = "目标"
+kind = "text"
+required = true
+default = "1.1.1.1"
+help = "域名或 IP。中间某几跳显示 * 是正常的，说明那台路由器不回探测包"
+
+# ── 端口 ────────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "net-port-check"
+name = "端口通不通"
+summary = "nc -z 连一下目标的某个端口，看是开着还是被挡了"
+domain = "网络"
+tags = ["网络", "端口"]
+program = "nc"
+base_argv = ["-z", "-v"]
+mode = "capture"
+ok_exit_codes = [0, 1]
+install = "sudo pacman -S openbsd-netcat"
+input = "主机 + 端口"
+output = "succeeded（通）/ failed（不通或被挡）"
+features = "端口可填；超时可填；端口关闭时 nc 返回 1，那也算诊断成功，不会报成错误"
+
+[[action.argument]]
+key = "timeout"
+label = "超时（秒）"
+kind = "text"
+flag = "-w"
+required = true
+default = "5"
+help = "被防火墙丢包的地址不会回任何东西，只能靠这个超时收场"
+
+[[action.argument]]
+key = "host"
+label = "主机"
+kind = "text"
+required = true
+default = "1.1.1.1"
+help = "域名或 IP。想测本机服务就填 127.0.0.1"
+
+[[action.argument]]
+key = "port"
+label = "端口"
+kind = "text"
+required = true
+default = "443"
+help = "1~65535。常见：22 SSH、80 HTTP、443 HTTPS、3306 MySQL、5432 PostgreSQL"
+
+# ── 本机体检 ────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "net-local-info"
+name = "本机出口 IP 与 DNS 配置"
+summary = "本机地址、默认路由、内核选出来的出口源地址，以及 DNS 到底是谁在答"
+domain = "网络"
+tags = ["网络", "dns", "本机"]
+program = "net-diagnose"
+base_argv = ["local"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "本机地址 / 路由 / 出口源地址 / DNS 配置"
+features = "只读；出口 IP 走内核路由查询，不真的发包；DNS 优先读 resolvectl"
+
+# ── 依赖自检 ────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "net-tools-check"
+name = "网络诊断工具自检"
+summary = "dig / ping / traceroute / nc / ip 装没装、各自在哪"
+domain = "网络"
+tags = ["网络", "体检"]
+program = "net-diagnose"
+base_argv = ["tools"]
+mode = "capture"
+allow_empty = true
+input = "没有"
+output = "每个命令的 ✓ / ✗ 与绝对路径"
+features = "只读；别的动作报「命令找不到」时先跑这一条"

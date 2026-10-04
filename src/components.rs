@@ -6,18 +6,30 @@
 //!
 //! ## 三条约定（破坏任何一条，这东西在脚本里就没法用）
 //!
-//! 1. **stdout 只放结果，界面一律画到 stderr。** 否则
+//! 1. **stdout 只放结果，界面一律画到 `/dev/tty`。** 否则
 //!    `path=$(toolbox-hub ui pick)` 会被转义序列污染 —— 这是最重要的一条。
+//!    （stdout 常常是管道，stderr 也可能被重定向，只有 `/dev/tty` 一定还在。）
 //! 2. **退出码固定**：`0` 选了/确认，`1` 用户取消（Esc/n），`2` 参数错或环境不支持
 //!    （不是终端、模板读不出来）。脚本里 `if p=$(tbx_pick); then … fi` 直接可用。
 //! 3. **键位与主界面一致**：`↑↓`/`jk` 选择、`g`/`G` 首末、`PgUp/PgDn` 翻页、
-//!    `Esc` 取消、`Tab` 多选、打字即过滤。学一次就够。
+//!    `Esc` 取消、`Tab` 多选、打字即过滤（组件里输入框是常驻的，和主界面不同）。
+//!
+//! ## `ui pick` 的分工：外部文件管理器优先
+//!
+//! **选文件优先交给外部文件管理器（默认 yazi）**：它自带预览、书签、多选与批量
+//! 操作，浏览体验比内置那个好得多；把这件事交给它，也就不用再维护一套浏览逻辑。
+//! 内置选择器只在外部程序**用不了**时顶上（没装 / 没有控制终端 / 起不来），
+//! 保证脚本不会因为少一个外部程序就跑不动。
+//!
+//! 换程序用 [`crate::app::FILE_MANAGER_ENV`]（和主界面按 `y` 浏览目录共用同一个
+//! 变量），设成 `builtin` / `none` 则明确要求用内置的。
 //!
 //! 组件不做任何录制/历史/状态落盘：它们是"一次性"的界面，跑完就退。
 
 use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -26,7 +38,7 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
             MouseButton, MouseEventKind,
         },
         execute,
@@ -241,9 +253,13 @@ fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, options: &Confirm, yes: 
         .alignment(Alignment::Center),
         buttons,
     );
+    let confirm_keys = crate::ui::fit_hints(
+        "←→ 选择 · Enter 确认当前 · y / n 直达 · Esc 取消",
+        hint.width as usize,
+    );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "←→ 选择 · Enter 确认 · y / n 直达 · Esc 取消",
+            confirm_keys,
             Style::default().fg(theme::FAINT),
         ))
         .alignment(Alignment::Center),
@@ -287,7 +303,15 @@ pub fn pager(options: &Pager, file: Option<&Path>) -> Result<Outcome, String> {
     let mut viewer = Viewer::from_text(options.title.clone(), body);
 
     loop {
-        session.draw(|frame, area| crate::ui::viewer::draw(frame, &viewer, area))?;
+        session.draw(|frame, area| {
+            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            if let Some(body) = rows.first().copied() {
+                crate::ui::viewer::draw(frame, &viewer, body);
+            }
+            if let Some(hint) = rows.get(1).copied() {
+                draw_hint(frame, hint, PAGER_KEYS);
+            }
+        })?;
         if !session.poll(100)? {
             continue;
         }
@@ -317,10 +341,101 @@ pub fn pager(options: &Pager, file: Option<&Path>) -> Result<Outcome, String> {
 
 // ── 选文件 ──────────────────────────────────────────────────────────────────
 
+/// 选文件器按下一个键之后的结论。
+#[derive(Debug, PartialEq, Eq)]
+enum PickStep {
+    Continue,
+    Chosen(Vec<PathBuf>),
+    Cancelled,
+}
+
+/// 选文件器的一键处理。
+///
+/// 抽成独立函数是为了能测：这里最容易犯的错是**抢走字母键**（`g`/`j`/`k`），
+/// 结果打字过滤就废了 —— 主界面的选文件器只映射方向键、`Home`/`End` 和 Ctrl 组合，
+/// 这里必须一模一样。
+fn pick_key(picker: &mut Picker, key: KeyEvent, options: &Pick) -> PickStep {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => return PickStep::Cancelled,
+        KeyCode::Char('q') if ctrl => return PickStep::Cancelled,
+        KeyCode::Up => picker.move_selection(-1),
+        KeyCode::Down => picker.move_selection(1),
+        KeyCode::PageUp => picker.move_selection(-10),
+        KeyCode::PageDown => picker.move_selection(10),
+        KeyCode::Home => picker.select_first(),
+        KeyCode::End => picker.select_last(),
+        // 这里**故意不映射 `g`/`G`/`j`/`k`**：选文件器里打字永远是过滤，
+        // 抢走这些字母就没法筛文件名了（和主界面的选文件器保持一致）。
+        KeyCode::Left => {
+            picker.go_to_parent();
+        }
+        KeyCode::Tab => picker.toggle_mark(),
+        KeyCode::Backspace => {
+            picker.backspace();
+            picker.refilter();
+        }
+        KeyCode::Char('u') if ctrl => {
+            picker.filter.clear();
+            picker.refilter();
+        }
+        KeyCode::Char('d') if ctrl => {
+            // 「就用当前目录」——给 `--dir-only` 的字段省一次 Enter。
+            return PickStep::Chosen(vec![picker.dir().to_path_buf()]);
+        }
+        KeyCode::Enter => match picker.selected_entry() {
+            // 目录：进去（`--dir-only` 时 Enter 是"选中它"）
+            Some(entry) if entry.is_dir && !options.dir_only => {
+                let path = entry.path.clone();
+                picker.enter_dir(&path);
+            }
+            // `--dir-only` 时文件不算答案。
+            Some(entry) if options.dir_only && !entry.is_dir => {}
+            Some(entry) => {
+                return PickStep::Chosen(if options.multi && picker.marked_count() > 0 {
+                    picker.marked_files()
+                } else {
+                    vec![entry.path.clone()]
+                });
+            }
+            None => {}
+        },
+        KeyCode::Char(ch) if !ctrl && !ch.is_control() => {
+            picker.push_char(ch);
+            picker.refilter();
+        }
+        _ => {}
+    }
+    PickStep::Continue
+}
+
+/// 选文件：**优先交给外部文件管理器**（默认 yazi），内置的只当替补。
+///
+/// 为什么以外部程序为主：它自带预览、书签、多选与批量操作，浏览体验比内置那个
+/// 好得多；把选文件交给它，也就不用再维护一套浏览逻辑。只有当它**用不了**
+/// （没装 / 没有控制终端 / 起不来）时才退回内置 —— 脚本不会因为少一个外部程序
+/// 就跑不动。
 pub fn pick(options: &Pick) -> Result<Outcome, String> {
     if !options.dir.is_dir() {
         return Err(format!("不是目录：{}", options.dir.display()));
     }
+
+    if let Some(program) = file_manager_program() {
+        match pick_external(&program, options)? {
+            ExternalPick::Chosen(paths) => {
+                write_paths(&paths)?;
+                return Ok(Outcome::Ok);
+            }
+            ExternalPick::Cancelled => return Ok(Outcome::Cancelled),
+            ExternalPick::Unavailable => {}
+        }
+    }
+
+    pick_builtin(options)
+}
+
+/// 内置选择器：外部文件管理器用不了时的替补。
+fn pick_builtin(options: &Pick) -> Result<Outcome, String> {
     let Some(mut session) = Session::open()? else {
         return Err(String::from(
             "不是交互式终端：选文件要有人点。脚本里请把路径当参数传进来",
@@ -336,67 +451,26 @@ pub fn pick(options: &Pick) -> Result<Outcome, String> {
     // 单选：Enter 直接收工；多选：Enter 收集已标记的（没标记就用当前项）。
     let mut chosen: Option<Vec<PathBuf>> = None;
 
+    let keys = pick_keys(options);
     loop {
-        session.draw(|frame, area| crate::ui::picker::draw(frame, &picker, area))?;
+        session.draw(|frame, area| {
+            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            if let Some(body) = rows.first().copied() {
+                crate::ui::picker::draw(frame, &picker, body);
+            }
+            if let Some(hint) = rows.get(1).copied() {
+                draw_hint(frame, hint, &keys);
+            }
+        })?;
         if !session.poll(200)? {
             continue;
         }
         match session.read()? {
-            Event::Key(key) => {
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                match key.code {
-                    KeyCode::Esc => return Ok(Outcome::Cancelled),
-                    KeyCode::Char('q') if ctrl => return Ok(Outcome::Cancelled),
-                    KeyCode::Up => picker.move_selection(-1),
-                    KeyCode::Down => picker.move_selection(1),
-                    KeyCode::PageUp => picker.move_selection(-10),
-                    KeyCode::PageDown => picker.move_selection(10),
-                    KeyCode::Home => picker.select_first(),
-                    KeyCode::End => picker.select_last(),
-                    KeyCode::Char('g') if !ctrl => picker.select_first(),
-                    KeyCode::Char('G') if !ctrl => picker.select_last(),
-                    KeyCode::Left => {
-                        picker.go_to_parent();
-                    }
-                    KeyCode::Tab => picker.toggle_mark(),
-                    KeyCode::Backspace => {
-                        picker.backspace();
-                        picker.refilter();
-                    }
-                    KeyCode::Char('u') if ctrl => {
-                        picker.filter.clear();
-                        picker.refilter();
-                    }
-                    KeyCode::Char('d') if ctrl => {
-                        // 只让选目录的字段：用「当前目录」交差。
-                        chosen = Some(vec![picker.dir().to_path_buf()]);
-                    }
-                    KeyCode::Enter => {
-                        match picker.selected_entry() {
-                            // 目录：进去（多选时也一样，`Ctrl-D` 才是"就用这个目录"）
-                            Some(entry) if entry.is_dir && !options.dir_only => {
-                                let path = entry.path.clone();
-                                picker.enter_dir(&path);
-                            }
-                            // `--dir-only` 时文件不算答案（Enter 落在文件上就什么也不做）。
-                            Some(entry) if options.dir_only && !entry.is_dir => {}
-                            Some(entry) => {
-                                if options.multi && picker.marked_count() > 0 {
-                                    chosen = Some(picker.marked_files());
-                                } else {
-                                    chosen = Some(vec![entry.path.clone()]);
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    KeyCode::Char(ch) if !ctrl && !ch.is_control() => {
-                        picker.push_char(ch);
-                        picker.refilter();
-                    }
-                    _ => {}
-                }
-            }
+            Event::Key(key) => match pick_key(&mut picker, key, options) {
+                PickStep::Continue => {}
+                PickStep::Chosen(paths) => chosen = Some(paths),
+                PickStep::Cancelled => return Ok(Outcome::Cancelled),
+            },
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => picker.move_selection(-3),
                 MouseEventKind::ScrollDown => picker.move_selection(3),
@@ -407,17 +481,160 @@ pub fn pick(options: &Pick) -> Result<Outcome, String> {
         }
 
         if let Some(paths) = chosen.take() {
-            // stdout 只放结果：一行一个路径。
-            let mut out = io::stdout();
-            for path in &paths {
-                writeln!(out, "{}", path.display())
-                    .map_err(|error| format!("写不出去了：{error}"))?;
-            }
-            out.flush()
-                .map_err(|error| format!("写不出去了：{error}"))?;
+            write_paths(&paths)?;
             return Ok(Outcome::Ok);
         }
     }
+}
+
+// ── 外部文件管理器 ──────────────────────────────────────────────────────────
+
+/// stdout 只放结果：一行一个路径。
+///
+/// 外部文件管理器（yazi）**绝不写 stdout** —— 它的三条标准流都接到 `/dev/tty`，
+/// 见 [`pick_external`]。这条约定是 `path=$(toolbox-hub ui pick)` 能用的前提。
+fn write_paths(paths: &[PathBuf]) -> Result<(), String> {
+    let mut out = io::stdout();
+    for path in paths {
+        writeln!(out, "{}", path.display()).map_err(|error| format!("写不出去了：{error}"))?;
+    }
+    out.flush().map_err(|error| format!("写不出去了：{error}"))
+}
+
+/// 外部文件管理器交回来的结论。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExternalPick {
+    /// 用不了（没装 / 没有控制终端 / 起不来）：调用方该退回替补。
+    Unavailable,
+    /// 用户在里面取消了。**和 `Unavailable` 必须分开**：取消是用户的明确决定，
+    /// 再弹一个内置选择器问一遍就等于把「取消」吃掉。
+    Cancelled,
+    Chosen(Vec<PathBuf>),
+}
+
+/// 环境变量读出来之后，到底用哪个程序（`None` = 明确要求用内置的）。
+///
+/// 抽成纯函数是为了能测：改 `std::env` 在 edition 2024 里是 `unsafe`，
+/// 而且并行跑的测试互相会踩。
+fn file_manager_program_from(raw: Option<&str>) -> Option<String> {
+    let name = raw.unwrap_or_default().trim();
+    if name.is_empty() {
+        // 没配过就用 yazi：它是这个项目的默认文件管理器。
+        return Some(String::from("yazi"));
+    }
+    if name == "builtin" || name == "none" {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// 用哪个程序当文件管理器。
+///
+/// 和主界面按 `y` 浏览目录共用同一个变量（[`crate::app::FILE_MANAGER_ENV`]）：
+/// 一处配置管两件事，不会出现「浏览用 yazi、选文件用别的」这种分裂。
+fn file_manager_program() -> Option<String> {
+    let raw = std::env::var(crate::app::FILE_MANAGER_ENV).ok();
+    file_manager_program_from(raw.as_deref())
+}
+
+/// 把终端整个交给 `program`，把它报告的文件/目录读回来。
+///
+/// ## 为什么三条标准流都接 `/dev/tty`
+///
+/// 脚本这边多半是 `path=$(toolbox-hub ui pick)` —— stdout 是**管道**，里面只允许
+/// 有结果。外部程序会画满整个屏幕，它要是照着默认的三条流走，那些转义序列就全
+/// 进了 `$path`。所以 stdin/stdout/stderr 一律换成控制终端。
+///
+/// ## 它用两份报告回答我们
+///
+/// * `--chooser-file`：在里面**打开**过的文件（`Enter` 触发），一行一个；
+/// * `--cwd-file`：退出时所在的目录。
+///
+/// 目录只认后者：在 yazi 里「打开」一个目录是**进去**，不会触发 chooser。
+/// 这和 ranger 的 `--choosedir` 是同一套路 —— 进到目标目录再退出，它就是答案。
+fn pick_external(program: &str, options: &Pick) -> Result<ExternalPick, String> {
+    let Some(program_path) = crate::runtime::find_on_path(program) else {
+        return Ok(ExternalPick::Unavailable);
+    };
+    let Some(tty) = open_tty() else {
+        // 没有控制终端（cron / CI / 三条流全被重定向）就没东西可交出去，
+        // 退回替补，由它统一给「这里没人可以点」的报错。
+        return Ok(ExternalPick::Unavailable);
+    };
+
+    if !options.filter.is_empty() {
+        // yazi 没有「预填过滤词」这个能力（它是进去之后按 `/` 现打）。与其悄悄
+        // 丢掉用户明确要求的过滤词，不如说一声 —— 写 stderr，不碰 stdout。
+        let _ = writeln!(
+            io::stderr(),
+            "toolbox-hub: --filter 只有内置选择器认；在 {program} 里请按 / 现打过滤词"
+        );
+    }
+
+    let stamp = std::process::id();
+    let dir = std::env::temp_dir();
+    let chooser = dir.join(format!("toolbox-hub-{stamp}-pick.chosen"));
+    let cwd_file = dir.join(format!("toolbox-hub-{stamp}-pick.cwd"));
+    // 上一轮的残留会让「它到底写没写」变得不可信。
+    let _ = std::fs::remove_file(&chooser);
+    let _ = std::fs::remove_file(&cwd_file);
+
+    let spawned = {
+        let stdin = tty
+            .try_clone()
+            .map_err(|error| format!("拿不到终端：{error}"))?;
+        let stdout = tty
+            .try_clone()
+            .map_err(|error| format!("拿不到终端：{error}"))?;
+        Command::new(&program_path)
+            // 位置参数就是「打开时所在的位置」：只设 current_dir 不够，实测
+            // yazi 仍会开在进程启动目录（这条在 browse_directories 里踩过）。
+            .arg(&options.dir)
+            .arg("--cwd-file")
+            .arg(&cwd_file)
+            .arg("--chooser-file")
+            .arg(&chooser)
+            .current_dir(&options.dir)
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(tty))
+            .status()
+    };
+
+    let chosen = std::fs::read_to_string(&chooser)
+        .map(|text| crate::runtime::parse_chooser_file(&text))
+        .unwrap_or_default();
+    let cwd = std::fs::read_to_string(&cwd_file)
+        .ok()
+        .and_then(|text| crate::runtime::parse_cwd_file(&text));
+    let _ = std::fs::remove_file(&chooser);
+    let _ = std::fs::remove_file(&cwd_file);
+
+    if spawned.is_err() {
+        // 起不来就退回替补：别把脚本堵死在一个起不来的程序上。这里**不能**
+        // 把错误往回抛 —— 那会把「yazi 没装好」变成硬失败，而替补其实还能干活。
+        return Ok(ExternalPick::Unavailable);
+    }
+
+    if options.dir_only {
+        if let Some(dir) = cwd.filter(|path| path.is_dir()) {
+            return Ok(ExternalPick::Chosen(vec![dir]));
+        }
+        // 万一某个 keymap 把「打开」绑到了目录上，也认。
+        if let Some(dir) = chosen.into_iter().find(|path| path.is_dir()) {
+            return Ok(ExternalPick::Chosen(vec![dir]));
+        }
+        return Ok(ExternalPick::Cancelled);
+    }
+
+    let mut files: Vec<PathBuf> = chosen.into_iter().filter(|path| path.is_file()).collect();
+    if files.is_empty() {
+        return Ok(ExternalPick::Cancelled);
+    }
+    if !options.multi {
+        files.truncate(1);
+    }
+    Ok(ExternalPick::Chosen(files))
 }
 
 // ── 终端会话 ────────────────────────────────────────────────────────────────
@@ -537,10 +754,41 @@ fn attach_tty_to_stdin() -> Result<(), String> {
     Ok(())
 }
 
-/// 一行提示：这些组件的键位与主界面一致（`?` 就不另做一层了）。
-#[allow(dead_code)]
-pub fn key_hint() -> &'static str {
-    "↑↓ 选择 · Enter 确认 · Esc 取消"
+/// 翻页器的键位（它没有输入框，`j`/`k`/`h`/`l` 可以放心用）。
+const PAGER_KEYS: &str = "↑↓ 滚动 · ←→ 横移 · PgUp/PgDn 翻页 · g/G 顶/底 · q 退出";
+
+/// 选文件器的键位。**不含 `j`/`k`/`g`/`G`** —— 那些字母要留给过滤框
+/// （和主界面的选文件器一致）。`--multi` / `--dir-only` 会多出对应的一两条。
+fn pick_keys(options: &Pick) -> String {
+    let mut keys =
+        String::from("↑↓ 选择 · Enter 进目录/选中 · ← 上级 · 打字过滤 · Ctrl+U 清空 · Esc 取消");
+    if options.multi {
+        keys.push_str(" · Tab 标记");
+    }
+    if options.dir_only {
+        keys.push_str(" · Ctrl+D 用当前目录");
+    }
+    keys
+}
+
+/// 组件底部的键位提示行。
+///
+/// 主界面靠 footer 显示这些；组件是独立开的会话，**没有 footer** ——
+/// 不画出来的话，`ui pager` 打开后你根本不知道按什么退出。
+fn draw_hint(frame: &mut ratatui::Frame, area: Rect, keys: &str) {
+    // 不带边框：这一行只有一行高，加个 `Borders::TOP` 就把仅有的空间吃光了
+    // （面板自己已经有下边框，够当分隔）。
+    //
+    // 宽了要**整条整条地丢**：硬裁出来的「Ctrl+D 用当前」比不显示更糟 ——
+    // 看着像有个键叫这个名字。
+    let fitted = crate::ui::fit_hints(keys, area.width.saturating_sub(1) as usize);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {fitted}"),
+            Style::default().fg(theme::DIM),
+        )),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -552,6 +800,54 @@ mod tests {
         assert_eq!(Outcome::Ok.code(), 0);
         assert_eq!(Outcome::Cancelled.code(), 1);
         assert_eq!(UNSUPPORTED_CODE, 2);
+    }
+
+    /// 文件管理器默认是 yazi；builtin / none 才是「用内置那个」。
+    ///
+    /// 抽成纯函数就是为了能这样测：edition 2024 里改 std::env 是 unsafe，
+    /// 而且并行跑的测试互相会踩到对方设的值。
+    #[test]
+    fn the_file_manager_defaults_to_yazi_and_can_be_switched_off() {
+        assert_eq!(file_manager_program_from(None).as_deref(), Some("yazi"));
+        assert_eq!(file_manager_program_from(Some("")).as_deref(), Some("yazi"));
+        assert_eq!(
+            file_manager_program_from(Some("   ")).as_deref(),
+            Some("yazi")
+        );
+        assert_eq!(
+            file_manager_program_from(Some("  yazi ")).as_deref(),
+            Some("yazi")
+        );
+
+        // 明确要求用内置的
+        assert_eq!(file_manager_program_from(Some("builtin")), None);
+        assert_eq!(file_manager_program_from(Some("none")), None);
+
+        // 换别的文件管理器也认（主界面按 y 浏览目录用的是同一个变量）
+        assert_eq!(file_manager_program_from(Some("lf")).as_deref(), Some("lf"));
+        assert_eq!(
+            file_manager_program_from(Some("ranger")).as_deref(),
+            Some("ranger")
+        );
+    }
+
+    /// 外部程序没装要报「用不了」，不能报「取消」。
+    ///
+    /// 这两个必须分开：Unavailable 会让调用方退回内置选择器继续服务，而
+    /// Cancelled 直接就是最终答案 —— 报错了就会把「没装 yazi」变成「用户取消了」，
+    /// 脚本静悄悄地什么也没拿到。
+    #[test]
+    fn a_missing_file_manager_falls_back_instead_of_cancelling() {
+        let options = Pick {
+            dir: std::env::temp_dir(),
+            filter: String::new(),
+            multi: false,
+            dir_only: false,
+        };
+
+        let outcome = pick_external("toolbox-hub-no-such-file-manager", &options)
+            .expect("没装不该是错误：它只是「用不了」");
+        assert_eq!(outcome, ExternalPick::Unavailable);
     }
 
     #[test]
@@ -614,6 +910,91 @@ mod tests {
         };
         let error = confirm(&options).expect_err("没有默认值就不该猜");
         assert!(error.contains("--default"), "{error}");
+    }
+
+    /// 字母键必须进过滤框，不能被导航抢走。
+    ///
+    /// 这条抓到过真错：`g`/`G` 一开始被映射成「首项 / 末项」，结果在选文件器里
+    /// 打 `g` 是跳列表、**没法用它筛文件名**（主界面的选文件器故意不映射它们）。
+    #[test]
+    fn pick_lets_letters_reach_the_filter() {
+        let dir = std::env::temp_dir().join(format!("tbx-pick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        for name in ["alpha.txt", "gamma.txt", "beta.txt"] {
+            std::fs::write(dir.join(name), b"x").expect("写测试文件");
+        }
+
+        let options = Pick {
+            dir: dir.clone(),
+            filter: String::new(),
+            multi: false,
+            dir_only: false,
+        };
+        let mut picker = Picker::open(&dir, 0, false, false);
+
+        for ch in "gamma".chars() {
+            let step = pick_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &options,
+            );
+            assert_eq!(step, PickStep::Continue, "「{ch}」不该被当成导航键");
+        }
+        assert_eq!(picker.filter.text(), "gamma");
+        assert_eq!(picker.len(), 1, "过滤该只剩 gamma.txt");
+        assert_eq!(
+            picker.selected_entry().map(|entry| entry.name.as_str()),
+            Some("gamma.txt")
+        );
+
+        // Enter 收工，拿到的就是过滤后选中的那个。
+        assert_eq!(
+            pick_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &options
+            ),
+            PickStep::Chosen(vec![dir.join("gamma.txt")])
+        );
+
+        // Esc 是取消，不是「选中当前项」。
+        assert_eq!(
+            pick_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &options
+            ),
+            PickStep::Cancelled
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--dir-only` 时文件不算答案（Enter 落在文件上什么也不做）。
+    #[test]
+    fn pick_dir_only_ignores_files() {
+        let dir = std::env::temp_dir().join(format!("tbx-pick-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        std::fs::write(dir.join("note.txt"), b"x").expect("写测试文件");
+
+        let options = Pick {
+            dir: dir.clone(),
+            filter: String::new(),
+            multi: false,
+            dir_only: true,
+        };
+        let mut picker = Picker::open(&dir, 0, false, true);
+        assert_eq!(
+            pick_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &options
+            ),
+            PickStep::Continue,
+            "只让选目录时，Enter 落在文件上不该交出答案"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

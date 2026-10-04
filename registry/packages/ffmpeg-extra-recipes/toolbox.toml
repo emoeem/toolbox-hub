@@ -1,0 +1,21 @@
+# ffmpeg-extra-recipes 的包元数据。
+#
+# 这个包里**一个可执行文件都没有**：产物里只有 manifests/ffmpeg-extra.toml，
+# 动作直接调用系统里已经装好的 ffmpeg / ffprobe。外部依赖由 manifest 里的
+# program（裸命令名）+ install 字段自动登记，不用在这里抄一遍。
+# id 与 version 必须和索引逐字一致。
+
+[package]
+id = "ffmpeg-extra-recipes"
+name = "FFmpeg Extra Recipes"
+version = "1.0.0-1"
+summary = "只放动作、不放脚本：给 ffmpeg / ffprobe 补几条常用 recipe"
+description = "演示「仓库里的包可以只是一个 manifest」。产物里只有 manifests/ffmpeg-extra.toml，没有任何可执行文件；动作直接调用你自己装好的 ffmpeg 与 ffprobe：抽帧、取封面图、按比例裁画面、响度归一、按清单拼接、列出每条流。"
+categories = ["media"]
+tags = ["ffmpeg", "manifest", "recipe", "媒体"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+requires_root = false
+danger = "safe"
+install = "sudo pacman -S ffmpeg"

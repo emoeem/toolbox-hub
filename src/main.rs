@@ -14,6 +14,7 @@ mod app;
 mod cli;
 mod components;
 mod config;
+mod dynamic;
 mod history;
 mod media;
 mod model;
@@ -21,6 +22,7 @@ mod packages;
 mod preview;
 mod providers;
 mod registry;
+mod repository;
 mod runtime;
 mod state;
 mod ui;
@@ -46,6 +48,16 @@ use crate::{app::App, registry::Registry};
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 管道被下游关掉时（`toolbox-hub search | head`）安静退出，别 panic。
+    //
+    // Rust 默认把 SIGPIPE 设成忽略，于是 write 会返回 EPIPE，而 println! 遇到
+    // 写失败就 panic —— 一个「可以写进脚本」的命令行工具不该这样。恢复成默认
+    // 处置（进程被信号杀掉）是标准做法，代价只有一个 libc 调用。
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     install_panic_hook();
 
     // 先看这次是「命令行模式」还是「进 TUI」：带动作参数时干完就退，
@@ -61,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::Invocation::Tui { bin_dir, dirs } => {
             // 目录必须在**任何人读路径之前**定下来（state / tools.d / 队列都在后面读）
             config::configure(dirs.config, dirs.data);
+            config::configure_cache(None);
             // 第一次跑就写一份带注释的 packages.toml —— 不写的话没人知道有它
             config::ensure_packages_template();
             resolve_bin_dir(bin_dir)
@@ -80,6 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 工作目录决定工具在哪儿找文件（FFTools 那批脚本尤其依赖它），
     // 顺序：TOOLBOX_HUB_WORKDIR > 上次记住的 > 启动时所在目录。
     app.resolve_work_dir();
+    // 顺手看一眼有没有新版：索引过期就在后台刷新，查完把结果挂到状态行上。
+    // 只查不用 —— 升级要你自己按下去（发现面板的 U，或 toolbox-hub update）。
+    app.start_update_check();
 
     let mut terminal = setup_terminal()?;
     // 崩了也要把终端还回去（不然留在 raw + 备用屏幕里，终端会花）。
@@ -202,7 +218,17 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
         if app.poll_packages() {
             dirty = true;
         }
+        if app.poll_repository() {
+            dirty = true;
+        }
+        if app.poll_update_check() {
+            dirty = true;
+        }
         if app.poll_preview() {
+            dirty = true;
+        }
+        // 动态参数候选：解析在后台线程，这里每帧收一次。
+        if app.poll_dynamic() {
             dirty = true;
         }
     }

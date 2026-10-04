@@ -1,0 +1,18 @@
+# image-batch 的包元数据。
+#
+# 客户端解包后会读这个文件，拿它和索引核对 id / version（必须逐字一致）。
+
+[package]
+id = "image-batch"
+name = "批量图片处理"
+version = "1.0.0"
+summary = "批量转格式 / 缩放 / 去元数据：目录 + 通配 + 输出目录"
+description = "给一个目录、一个通配符、一个输出目录，剩下的交给 ImageMagick：批量转格式（jpg / png / webp / avif / tiff / gif / bmp）、批量缩放（限制在框内 / 填满后裁剪 / 强行拉伸，可只给宽或高）、批量去元数据（-strip）。支持递归子目录并保持相对结构，默认跳过已存在的输出，不会默默覆盖；有 --dry-run 可以先看会执行哪些命令。会往输出目录写文件，所以 danger 标了 caution。"
+categories = ["image"]
+tags = ["imagemagick", "magick", "图片", "批量", "缩放", "转格式"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+requires_root = false
+danger = "caution"
+install = "sudo pacman -S imagemagick"

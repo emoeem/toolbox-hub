@@ -14,11 +14,11 @@
 //! | `Ctrl-R` | 重新发现 Provider |
 //! | `q` / `Esc` | 退出（搜索状态下 `Esc` 只清空搜索） |
 
-use std::{path::Path, path::PathBuf, time::Instant};
+use std::{path::Path, time::Instant};
 
 use crate::{
     app::{
-        App, Viewer,
+        App,
         package_view::{ConfirmAction, PackageMode, Pane},
     },
     model::{Domain, RunMode},
@@ -44,6 +44,10 @@ pub fn handle_mouse(
             app.close_help();
         }
         return Ok(());
+    }
+
+    if app.repository.is_some() {
+        return handle_repository_mouse(app, mouse);
     }
 
     if app.packages.is_some() {
@@ -308,7 +312,7 @@ fn handle_packages_mouse(
         if let Some(view) = app.packages.as_mut() {
             if wide_enough {
                 view.pane = Pane::Rows;
-                view.message = String::from("打字即时过滤，Enter 上网搜");
+                view.message = String::from("按 / 过滤（打字即筛）· Enter 上网搜");
             } else {
                 view.open_sort_menu();
             }
@@ -394,6 +398,19 @@ pub fn handle_key(
             KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_help(10),
             KeyCode::Home | KeyCode::Char('g') => app.help = Some(0),
             _ => {}
+        }
+        return Ok(false);
+    }
+
+    // 工具仓库界面开着时它吃掉所有按键（它自己有三个面板）。
+    if app.repository.is_some() {
+        let open = match app.repository.as_mut() {
+            Some(view) => view.handle_key(key)?,
+            None => true,
+        };
+        if !open {
+            app.close_repository();
+            app.message = String::from("已离开工具仓库");
         }
         return Ok(false);
     }
@@ -634,31 +651,19 @@ fn handle_history_key(
 /// 重跑历史里的那条命令。
 ///
 /// 参数**原样复用记录里的 argv**（不经 shell，也不用再填一遍表单）。
+///
+/// 这件事**不在这里同步做**：历史里的 argv 可能是转码那种长任务，阻塞执行会把
+/// 整个界面冻住。排进后台队列，实时输出/取消/收尾都由 `App::replay_from_history`
+/// 那条路管。
 fn replay_history(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let Some(entry) = app.history_selected() else {
         return Ok(());
     };
-    let Some((program, argv)) = entry.argv.split_first() else {
-        app.message = String::from("这条记录没有参数，重跑不了");
-        return Ok(());
-    };
 
-    let started = Instant::now();
-    let captured = runtime::run_captured(&PathBuf::from(program), argv, cwd, &entry.tool_name)?;
-    app.message = format!("重跑 · {}", captured.summary());
-
-    // 重跑也算一次执行，照样进历史（id / name / 取值沿用原记录）。
-    let values: Vec<(String, String)> = entry.values.clone().into_iter().collect();
-    app.record_history(
-        &entry.tool_id,
-        &entry.tool_name,
-        &entry.argv,
-        &values,
-        captured.success,
-        started.elapsed().as_millis(),
-    );
-    if let Some(viewer) = Viewer::from_captured(std::slice::from_ref(&captured)) {
-        app.open_viewer(viewer);
+    if app.replay_from_history(&entry, cwd) {
+        // 关掉历史浮层，让「执行中」面板露出来 —— 不然实时输出画在浮层后面，
+        // 看起来就像什么都没发生。
+        app.close_history();
     }
     Ok(())
 }
@@ -887,19 +892,9 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// 上一个模式（`[` 用；`←` 那套反过来是 `←` 从搜索跳到维护，这里保持一致）。
-fn previous_mode(mode: PackageMode) -> PackageMode {
-    match mode {
-        PackageMode::Search => PackageMode::Health,
-        PackageMode::Installed => PackageMode::Search,
-        PackageMode::News => PackageMode::Installed,
-        PackageMode::Health => PackageMode::News,
-    }
-}
-
 /// 软件包中心的按键。
 ///
-/// ## 模型：输入框**始终**在输入态（照 paru）
+/// ## 模型：输入是**模态**的（`/` 进，`Enter` 收工，`Esc` 清空退出）
 ///
 /// 以前是「按 i 才进输入态」，于是搜完一次之后 `editing` 被置回 false，
 /// 用户再打字**毫无反应** —— 看起来像界面卡死（实拍反馈）。
@@ -993,8 +988,8 @@ fn handle_packages_key(
         return Ok(false);
     }
 
-    // ── 搜索历史（Alt+↑↓）：输入框常驻了，所以历史挪到 Alt 上 ──
-    if key.modifiers.contains(KeyModifiers::ALT) {
+    // ── 搜索历史（Alt+↑↓）：`↑↓` 归列表，所以历史留在 Alt 上 ──
+    if alt {
         match key.code {
             KeyCode::Up => {
                 if let Some(view) = app.packages.as_mut() {
@@ -1014,73 +1009,97 @@ fn handle_packages_key(
         }
     }
 
-    // ── 光标与筛选词（打字永远有效）──
-    match key.code {
-        KeyCode::Backspace => {
-            if let Some(view) = app.packages.as_mut() {
-                view.query.backspace();
-                view.refilter();
+    // ── 输入态：只有编辑键，其余一律不抢 ──
+    //
+    // 输入改模态是这一版键位的**前提**。以前输入框常驻，字母和数字都得让给过滤框，
+    // 命令只能全挤在 `Ctrl+` 上（`Ctrl+S/M/T/O/X/K/N/A/E/I/W`）—— 那不是设计出来的
+    // 键位，是被输入框挤出来的。现在 `/` 进来、`Enter` 收工、`Esc` 清空并退出。
+    if app.packages.as_ref().is_some_and(|view| view.typing) {
+        match key.code {
+            // `Enter` 收工但**保留**筛选词；`Esc` 清空并退出 —— voicefox 的 `/` 也这样
+            KeyCode::Enter => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.typing = false;
+                    view.message = if view.query.is_empty() {
+                        String::from("没填过滤词 · `/` 再进输入")
+                    } else {
+                        format!("筛选「{}」· `/` 再改", view.query.text())
+                    };
+                }
             }
-            return Ok(false);
-        }
-        KeyCode::Left => {
-            if let Some(view) = app.packages.as_mut() {
-                view.query.left();
+            KeyCode::Esc => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.clear_query();
+                    view.typing = false;
+                    view.message = String::from("已清空筛选");
+                }
             }
-            return Ok(false);
-        }
-        KeyCode::Right => {
-            if let Some(view) = app.packages.as_mut() {
-                view.query.right();
+            KeyCode::Backspace => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.backspace();
+                    view.refilter();
+                }
             }
-            return Ok(false);
-        }
-        KeyCode::Home => {
-            if let Some(view) = app.packages.as_mut() {
-                view.query.home();
+            KeyCode::Delete => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.delete();
+                    view.refilter();
+                }
             }
-            return Ok(false);
-        }
-        KeyCode::End => {
-            if let Some(view) = app.packages.as_mut() {
-                view.query.end();
+            KeyCode::Left => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.left();
+                }
             }
-            return Ok(false);
-        }
-        KeyCode::Char('u') if ctrl => {
-            if let Some(view) = app.packages.as_mut() {
-                view.clear_query();
+            KeyCode::Right => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.right();
+                }
             }
-            return Ok(false);
-        }
-        _ => {}
-    }
-
-    // ── Esc：先清筛选词，空了才关界面 ──
-    if key.code == KeyCode::Esc {
-        let has_text = app
-            .packages
-            .as_ref()
-            .is_some_and(|view| !view.query.is_empty());
-        if has_text {
-            if let Some(view) = app.packages.as_mut() {
-                view.clear_query();
+            KeyCode::Home => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.home();
+                }
             }
-        } else {
-            app.close_packages();
+            KeyCode::End => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.end();
+                }
+            }
+            // 输入态里也认 Ctrl-U：清空这个词（Ctrl 组合键不会插字符）
+            KeyCode::Char('u') if ctrl => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.clear_query();
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(view) = app.packages.as_mut() {
+                    view.query.insert(ch);
+                    view.refilter();
+                }
+            }
+            _ => {}
         }
         return Ok(false);
     }
 
-    // ── Ctrl 命令 ──
+    // ── Esc：非输入态就是「回上层」（动作列表）──
+    if key.code == KeyCode::Esc {
+        app.close_packages();
+        return Ok(false);
+    }
+
+    // ── Ctrl 命令：只留没有对应字母键的那些 ──
     if ctrl {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('c') => app.close_packages(),
+            // 强制重搜（字母键里没有「重新上网找一遍」这个动作）
             KeyCode::Char('r') => {
                 if let Some(view) = app.packages.as_mut() {
                     view.start_search();
                 }
             }
+            // 结果区里是翻页；别的面板上是清空队列
             KeyCode::Char('d') => {
                 if let Some(view) = app.packages.as_mut() {
                     if view.pane == Pane::Rows {
@@ -1090,30 +1109,12 @@ fn handle_packages_key(
                     }
                 }
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('u') => {
                 if let Some(view) = app.packages.as_mut() {
-                    view.open_sort_menu();
+                    view.move_selection(-10);
                 }
             }
-            KeyCode::Char('m') => {
-                if let Some(view) = app.packages.as_mut() {
-                    view.cycle_operation();
-                }
-            }
-            KeyCode::Char('t') => {
-                if let Some(view) = app.packages.as_mut() {
-                    view.toggle_dry_run();
-                }
-            }
-            KeyCode::Char('o') => app.arm_orphans(),
-            KeyCode::Char('n') => {
-                if let Some(view) = app.packages.as_mut() {
-                    view.start_news();
-                }
-            }
-            KeyCode::Char('x') => app.show_pkgbuild(cwd)?,
-            KeyCode::Char('k') => app.check_pkgbuild(cwd)?,
-            KeyCode::Char('a') => app.open_aur_page(),
+            // 清单的导出 / 导入（字母键不够用了，留在 Ctrl 上）
             KeyCode::Char('e') => {
                 let path = crate::app::package_view::default_queue_path();
                 if let Some(view) = app.packages.as_mut() {
@@ -1126,36 +1127,22 @@ fn handle_packages_key(
                     view.import_queue(&path);
                 }
             }
-            // 新闻里的已读标记
-            KeyCode::Char('w') => {
-                if let Some(view) = app.packages.as_mut() {
-                    if shift {
-                        view.mark_visible_news_read();
-                    } else {
-                        view.toggle_news_read();
-                    }
-                }
-            }
             _ => {}
         }
         return Ok(false);
     }
 
-    // ── 其余的键 ──
+    // ── 其余的键：非输入态下，字母就是命令 ──
     match key.code {
-        // Alt+数字切筛选，数字键本身留给搜索词。
-        KeyCode::Char(digit @ '1'..='9') if alt => {
-            let index = digit as usize - '1' as usize;
+        // `/`：进过滤（唯一入口）
+        KeyCode::Char('/') => {
             if let Some(view) = app.packages.as_mut() {
-                view.toggle_chip(index);
+                view.typing = true;
+                view.message = String::from("过滤：打字即筛 · Enter 收工 · Esc 清空");
             }
         }
-        KeyCode::Char('0') if alt => {
-            if let Some(view) = app.packages.as_mut() {
-                view.enable_all_chips();
-            }
-        }
-        // 1-4 直达四种模式。
+
+        // `1`-`4`：直达四种模式（标签上就写着数字）
         KeyCode::Char(digit @ '1'..='4') => {
             let index = digit as usize - '1' as usize;
             if let Some(mode) = PackageMode::ALL.get(index).copied()
@@ -1164,23 +1151,37 @@ fn handle_packages_key(
                 view.set_mode(mode);
             }
         }
-        // 切模式（输入态下 `←→` 归光标，所以模式放这两个键上）
-        KeyCode::Char('[') => {
+
+        // 焦点：结果 → 队列 → 包信息 → 标签
+        KeyCode::Tab => {
             if let Some(view) = app.packages.as_mut() {
-                view.set_mode(previous_mode(mode));
+                if shift {
+                    view.toggle_focus_back();
+                } else {
+                    view.toggle_focus();
+                }
             }
         }
-        KeyCode::Char(']') => {
+
+        // 标签行：`[` `]` 与 `←→`（`h` `l`）都走这里 —— 和主界面「h/l 切分类」一个手感
+        KeyCode::Char('[') | KeyCode::Left | KeyCode::Char('h') => {
             if let Some(view) = app.packages.as_mut() {
-                view.cycle_mode();
+                view.move_chip_focus(-1);
             }
         }
-        KeyCode::Up => {
+        KeyCode::Char(']') | KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.move_chip_focus(1);
+            }
+        }
+
+        // 上下移动（焦点在哪块就动哪块）
+        KeyCode::Up | KeyCode::Char('k') => {
             if let Some(view) = app.packages.as_mut() {
                 view.move_selection(-1);
             }
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             if let Some(view) = app.packages.as_mut() {
                 view.move_selection(1);
             }
@@ -1195,23 +1196,78 @@ fn handle_packages_key(
                 view.move_selection(10);
             }
         }
-        KeyCode::Tab => {
+        KeyCode::Home | KeyCode::Char('g') => {
             if let Some(view) = app.packages.as_mut() {
-                view.toggle_focus();
+                view.select_first();
             }
         }
-        // 多选：加进队列 / 再按一次移出
+        KeyCode::End | KeyCode::Char('G') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.select_last();
+            }
+        }
+
+        // `Space`：结果里排队 / 再按取消；标签行开关标签；队列里移出
         KeyCode::Char(' ') => {
             if let Some(view) = app.packages.as_mut() {
-                view.toggle_queue();
+                match view.pane {
+                    Pane::Tabs => view.toggle_focused_chip(),
+                    Pane::Queue => view.remove_from_queue(),
+                    _ => view.toggle_queue(),
+                }
             }
         }
-        // 删除：把选中的那行移出队列（焦点在哪都一样）
         KeyCode::Delete => {
             if let Some(view) = app.packages.as_mut() {
                 view.remove_from_queue();
             }
         }
+
+        // ── 动作：字母键 ──
+        // `i` 装 / `r` 卸：都先把要跑的命令摆出来，再按一次才动系统
+        KeyCode::Char('i') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.operation = crate::packages::PackageOperation::Install;
+            }
+            app.arm_queue();
+        }
+        KeyCode::Char('r') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.operation = crate::packages::PackageOperation::Remove;
+            }
+            app.arm_queue();
+        }
+        KeyCode::Char('u') => app.arm_upgrade(),
+        KeyCode::Char('c') => app.arm_cache(),
+        KeyCode::Char('o') => app.arm_orphans(),
+        KeyCode::Char('D') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_dry_run();
+            }
+        }
+        KeyCode::Char('s') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.open_sort_menu();
+            }
+        }
+        // AUR 那三件事：检查（namcap + shellcheck）、看 PKGBUILD、开 AUR 页面
+        KeyCode::Char('K') => app.check_pkgbuild(cwd)?,
+        KeyCode::Char('X') => app.show_pkgbuild(cwd)?,
+        KeyCode::Char('A') => app.open_aur_page(),
+        // 新闻的已读标记
+        KeyCode::Char('m') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.toggle_news_read();
+            }
+        }
+        KeyCode::Char('M') => {
+            if let Some(view) = app.packages.as_mut() {
+                view.mark_visible_news_read();
+            }
+        }
+        KeyCode::Char('?') => app.open_help(),
+        KeyCode::Char('q') => app.close_packages(),
+
         // Enter：上网搜 / 摆出要跑的命令 / 处理维护项
         KeyCode::Enter => match mode {
             PackageMode::Search => {
@@ -1250,24 +1306,10 @@ fn handle_packages_key(
             }
             PackageMode::Health => app.run_health_action(cwd)?,
         },
-        // 其它可打印字符：进筛选词（打字永远有效）
-        KeyCode::Char(ch) if !ch.is_control() => {
-            if let Some(view) = app.packages.as_mut() {
-                view.query.insert(ch);
-                view.refilter();
-                // `q` 在这里是**打字**（输入框常驻），所以顺手教一句怎么退出 ——
-                // 顶栏那句「q 退出」在这个界面里是错的，实拍有人按 q 想退出。
-                if ch == 'q' {
-                    view.message =
-                        String::from("在包管理里打字就是过滤；退出按 Esc（筛选清空时）或 Ctrl+Q");
-                }
-            }
-        }
         _ => {}
     }
     Ok(false)
 }
-
 /// 处理一次粘贴（终端开了 bracketed paste 才会有这个事件）。
 ///
 /// 交给当前**正在输入**的那个框：软件包中心 > 全局搜索 > 文件选择器。
@@ -1276,8 +1318,12 @@ fn handle_packages_key(
 pub fn handle_paste(app: &mut App, text: &str) {
     if app.packages.is_some() {
         if let Some(view) = app.packages.as_mut() {
+            // 粘进来的东西几乎一定是想过滤 —— 顺手进输入态，
+            // 否则这些字会掉进命令里（输入改模态之后，字母键是命令）。
+            view.typing = true;
             view.query.insert_str(text);
             view.refilter();
+            view.message = String::from("过滤：打字即筛 · Enter 收工 · Esc 清空");
         }
         return;
     }
@@ -1295,11 +1341,33 @@ pub fn handle_paste(app: &mut App, text: &str) {
 
 /// 打开一个内置界面（`program` 就是界面名）。
 fn open_native_view(app: &mut App, view: &str) {
-    match view {
+    // `package-center[:模式]` —— 冒号后面是打开时停在哪个模式
+    // （`package-center:installed` 就是「已安装 · 卸载」那个入口）。
+    let (name, argument) = match view.split_once(':') {
+        Some((name, argument)) => (name, Some(argument)),
+        None => (view, None),
+    };
+
+    match name {
+        "repository-center" => {
+            app.open_repository();
+            if let Some(mode) = argument.and_then(crate::app::repo_view::RepoMode::from_id)
+                && let Some(view) = app.repository.as_mut()
+            {
+                view.set_mode(mode);
+            }
+        }
         "package-center" => {
             app.close_help();
             app.open_packages();
-            app.message = String::from("软件包中心：打字过滤 · Space 排队 · Enter 摆出要跑的命令");
+            if let Some(mode) = argument.and_then(PackageMode::from_id)
+                && let Some(view) = app.packages.as_mut()
+            {
+                view.set_mode(mode);
+            }
+            app.message = String::from(
+                "软件包中心：`/` 进过滤 · `1-4` 切面板 · Space 排队 · Enter 摆出要跑的命令",
+            );
         }
         other => app.message = format!("不认识的界面「{other}」"),
     }
@@ -1309,6 +1377,27 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
     let targets = app.execution_targets();
     if targets.is_empty() {
         app.message = String::from("没有可执行的工具");
+        return Ok(());
+    }
+
+    // 内置界面（`RunMode::Native`）：不起进程、不要参数，直接开对应视图。
+    //
+    // 这一段以前**只在「表单提交」那条路上有**（`execute_form`），于是无参数的
+    // native 动作在列表上按 Enter 什么都不发生 —— 它没有表单可开，掉进下面那个
+    // `RunMode::Native => {}` 就没了。`软件包中心` 正是这种动作。
+    let native_view = if targets.len() == 1 {
+        app.registry
+            .tools()
+            .get(targets[0])
+            .filter(|tool| tool.mode == RunMode::Native)
+            .and_then(|tool| tool.action.as_ref())
+            .map(|action| action.program.clone())
+    } else {
+        None
+    };
+    if let Some(view) = native_view {
+        open_native_view(app, &view);
+        app.clear_marks(&targets);
         return Ok(());
     }
 
@@ -1327,7 +1416,8 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
         match tool.mode {
             RunMode::Capture => capture.push(tool.clone()),
             RunMode::Interactive => interactive.push(tool.clone()),
-            RunMode::Native => {} // 上面已经单独处理过了
+            // 单个 native 动作上面已经开完视图了；混在批量里没有意义，跳过。
+            RunMode::Native => {}
         }
     }
 
@@ -1353,11 +1443,8 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
                     // 这类动作的参数全在 base_argv 里，丢了就变成光跑 `journalctl`：
                     // 实测会 dump 整个日志；`systemctl` / `lsblk` / `lspci` 那几个
                     // 则是**静默**给出错误结果（列出全部单元、丢掉 -f / -k 的信息）。
-                    let argv = tool
-                        .action
-                        .as_ref()
-                        .and_then(|action| action.build_argv(&action.default_values()).ok())
-                        .unwrap_or_default();
+                    // 和 interactive 路径共用同一个函数：两条路都得把 base_argv 带上
+                    let argv = runtime::default_argv(&tool);
                     crate::app::CaptureRequest {
                         tool: tool.clone(),
                         ok_exit_codes: tool
@@ -1394,6 +1481,46 @@ fn execute(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> 
 
     app.clear_marks(&targets);
     app.message = parts.join(" · ");
+    Ok(())
+}
+
+/// 工具仓库界面的鼠标：滚轮滚动，左键整行选中。
+fn handle_repository_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (width, height) = size().unwrap_or((80, 24));
+    let screen = Rect::new(0, 0, width, height);
+    let areas = crate::ui::main_layout(app, screen);
+    if areas.too_small {
+        return Ok(());
+    }
+    let content = areas.list.union(areas.detail);
+    let point = Position::new(mouse.column, mouse.row);
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if let Some(view) = app.repository.as_mut() {
+                view.handle_scroll(-3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(view) = app.repository.as_mut() {
+                view.handle_scroll(3);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let rows = crate::ui::repository::rows_rect(content);
+            if rows.contains(point) {
+                let visible = rows.height as usize;
+                let row = (mouse.row.saturating_sub(rows.y)) as usize;
+                if let Some(view) = app.repository.as_mut() {
+                    view.click_viewport_row(row, visible);
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 

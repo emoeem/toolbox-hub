@@ -54,12 +54,17 @@ impl PackageMode {
         }
     }
 
-    pub fn next(self) -> Self {
-        match self {
-            Self::Search => Self::Installed,
-            Self::Installed => Self::News,
-            Self::News => Self::Health,
-            Self::Health => Self::Search,
+    /// 界面上写英文 id（`package-center:installed` 里的那截）。
+    ///
+    /// 和中文标签分开是有意的：标签是给人看的，id 是 manifest 里写的，
+    /// 以后改标签文案不会把动作配错。
+    pub fn from_id(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "search" => Some(Self::Search),
+            "installed" => Some(Self::Installed),
+            "news" => Some(Self::News),
+            "health" => Some(Self::Health),
+            _ => None,
         }
     }
 }
@@ -70,6 +75,8 @@ pub enum Pane {
     Rows,
     Queue,
     Info,
+    /// 顶部那一行：模式标签（`1 搜索`）与筛选标签（仓库 / 分类 / 已读）。
+    Tabs,
 }
 
 impl Pane {
@@ -77,7 +84,18 @@ impl Pane {
         match self {
             Self::Rows => Self::Queue,
             Self::Queue => Self::Info,
-            Self::Info => Self::Rows,
+            Self::Info => Self::Tabs,
+            Self::Tabs => Self::Rows,
+        }
+    }
+
+    /// `Tab`：结果 → 队列 → 包信息 → 标签 → 结果。
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Rows => Self::Tabs,
+            Self::Queue => Self::Rows,
+            Self::Info => Self::Queue,
+            Self::Tabs => Self::Info,
         }
     }
 
@@ -86,6 +104,7 @@ impl Pane {
             Self::Rows => "结果",
             Self::Queue => "队列",
             Self::Info => "包信息",
+            Self::Tabs => "标签",
         }
     }
 }
@@ -128,6 +147,14 @@ pub struct PackageView {
     // ── 公共状态 ──
     pub mode: PackageMode,
     pub pane: Pane,
+    /// 是不是在输入态（`/` 进入，`Enter` 收工 / `Esc` 清空退出）。
+    ///
+    /// 输入改模态是这一版键位的**前提**：输入框常驻时，字母和数字都得让给过滤框，
+    /// 命令只能全挤在 `Ctrl+` 上（`Ctrl+S/M/T/O/X/K/A…`）—— 那套键位不是设计出来的，
+    /// 是被输入框挤出来的。
+    pub typing: bool,
+    /// 焦点在标签行（[`Pane::Tabs`]）时，选中的是第几个标签。
+    pub chip_focus: usize,
     /// 演练模式：确认后只把命令写进消息，不动系统（pacsea 的 `--dry-run`）。
     pub dry_run: bool,
     /// 队列的默认操作：安装 / 卸载 / 仅下载。
@@ -201,6 +228,8 @@ pub struct PackageView {
     pub health_loaded: bool,
     /// 文件完整性检查在跑（那一步要几秒，界面上要说清楚）。
     pub health_checking_files: bool,
+    /// 正在取 PKGBUILD（Ctrl+X / Ctrl+K）：网络操作，结果回来之前不接第二次。
+    pub pkgbuild_loading: bool,
     /// 有明细要交给 App 打开输出视图（`(标题, 行)`）：由 `App::poll_packages` 取走。
     pub pending_view: Option<(String, Vec<String>)>,
 
@@ -234,6 +263,8 @@ impl PackageView {
         let mut view = Self {
             mode: PackageMode::Search,
             pane: Pane::Rows,
+            typing: false,
+            chip_focus: 0,
             dry_run: prefs.dry_run,
             operation: PackageOperation::Install,
             message: String::new(),
@@ -278,6 +309,7 @@ impl PackageView {
             health_loading: false,
             health_loaded: false,
             health_checking_files: false,
+            pkgbuild_loading: false,
             pending_view: None,
             cache_keep: prefs.cache_keep(),
             wanted_repos: prefs.repos.clone(),
@@ -318,10 +350,6 @@ impl PackageView {
         }
         // 输入框里的词跟着模式走：切过去就该按新列表重筛一次
         self.refilter();
-    }
-
-    pub fn cycle_mode(&mut self) {
-        self.set_mode(self.mode.next());
     }
 
     /// 浏览模式：把整个同步库铺上（这是 paru 的第一屏：`< 38869/38869`）。
@@ -458,6 +486,32 @@ impl PackageView {
         self.health_checking_files = true;
         self.message = String::from("正在查文件完整性（pacman -Qk，要几秒）…");
         worker.file_integrity();
+    }
+
+    /// 取一份 PKGBUILD（Ctrl+X 只取，Ctrl+K 再顺带检查）。
+    ///
+    /// 走 `Worker::pkgbuild` 的独立线程：这件事以前在 UI 线程上同步做，
+    /// 界面会**整块冻住**几秒 —— 没有输出、不能滚动、按 q 也不响应。
+    pub fn request_pkgbuild(&mut self, check: bool, cwd: PathBuf) {
+        if self.pkgbuild_loading {
+            self.message = String::from("上一份 PKGBUILD 还在取，等它回来");
+            return;
+        }
+        let Some(name) = self.selected_hit().map(|hit| hit.name.clone()) else {
+            self.message = String::from("先选中一个包");
+            return;
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            self.message = String::from("取数线程没起来，取不了 PKGBUILD");
+            return;
+        };
+        worker.pkgbuild(name.clone(), check, cwd);
+        self.pkgbuild_loading = true;
+        self.message = if check {
+            format!("正在取 {name} 的 PKGBUILD 并检查…（界面照常能用）")
+        } else {
+            format!("正在取 {name} 的 PKGBUILD…（界面照常能用）")
+        };
     }
 
     /// 每帧把两个常驻线程攒下的回答取干净。
@@ -631,6 +685,15 @@ impl PackageView {
             Response::FileIntegrity(Err(error)) => {
                 self.health_checking_files = false;
                 self.message = format!("文件完整性检查失败：{error}");
+            }
+            Response::Pkgbuild(Ok(report)) => {
+                self.pkgbuild_loading = false;
+                self.message = format!("PKGBUILD {} 取回来了", report.name);
+                self.pending_view = Some((format!("PKGBUILD {}", report.name), report.lines));
+            }
+            Response::Pkgbuild(Err(error)) => {
+                self.pkgbuild_loading = false;
+                self.message = error;
             }
             Response::OrphanNames(Ok(names)) => {
                 if names.is_empty() {
@@ -1093,13 +1156,6 @@ impl PackageView {
         }
     }
 
-    /// 切换队列的执行方式：安装 → 卸载 → 仅下载。
-    pub fn cycle_operation(&mut self) {
-        self.operation = self.operation.next();
-        self.confirm = None;
-        self.message = format!("队列操作：{}", self.operation.label());
-    }
-
     // ── 各模式的可见行 ───────────────────────────────────────────────────
 
     /// 结果区当前有多少行（跟着模式走）。
@@ -1190,28 +1246,6 @@ impl PackageView {
         }
     }
 
-    /// 全部打开（数字键 `0`）。
-    pub fn enable_all_chips(&mut self) {
-        match self.mode {
-            PackageMode::Search => {
-                for chip in self.repos.iter_mut() {
-                    chip.enabled = true;
-                }
-                self.apply_filter();
-                self.message = String::from("仓库标签全开");
-            }
-            PackageMode::Installed => {
-                self.installed_filter = InstalledFilter::All;
-                self.apply_installed_filter();
-            }
-            PackageMode::News => {
-                self.news_filter = NewsFilter::All;
-                self.rebuild_news();
-            }
-            PackageMode::Health => {}
-        }
-    }
-
     /// 搜索框里按 ↑↓：拿历史里的词填进来（最新的在上）。
     pub fn history_step(&mut self, delta: isize) {
         if self.history.is_empty() {
@@ -1264,6 +1298,43 @@ impl PackageView {
             Pane::Queue => self.move_queue(delta),
             Pane::Info => self.scroll_info(delta),
             Pane::Rows => self.move_row(delta),
+            // 上下键落在标签行上时也当左右用（一行里滑过去很自然）
+            Pane::Tabs => self.move_chip_focus(delta),
+        }
+    }
+
+    /// `g` / `Home`：跳到当前面板的第一项。
+    pub fn select_first(&mut self) {
+        match self.pane {
+            Pane::Queue => self.queue_selected = 0,
+            Pane::Info => self.info_scroll = 0,
+            Pane::Tabs => self.chip_focus = 0,
+            Pane::Rows => self.select_row_edge(false),
+        }
+    }
+
+    /// `G` / `End`：跳到当前面板的最后一项。
+    pub fn select_last(&mut self) {
+        match self.pane {
+            Pane::Queue => self.queue_selected = self.queue.len().saturating_sub(1),
+            Pane::Info => self.info_scroll = MAX_INFO_SCROLL,
+            Pane::Tabs => self.chip_focus = self.chips().len().saturating_sub(1),
+            Pane::Rows => self.select_row_edge(true),
+        }
+    }
+
+    /// 结果区的首 / 末行（四个模式各存一份选中下标）。
+    fn select_row_edge(&mut self, last: bool) {
+        let index = if last {
+            self.rows_len().saturating_sub(1)
+        } else {
+            0
+        };
+        match self.mode {
+            PackageMode::Search => self.selected = index,
+            PackageMode::Installed => self.installed_selected = index,
+            PackageMode::News => self.news_selected = index,
+            PackageMode::Health => self.health_selected = index,
         }
     }
 
@@ -1273,10 +1344,48 @@ impl PackageView {
         self.info_scroll = next.clamp(0, MAX_INFO_SCROLL as isize) as usize;
     }
 
-    /// 焦点在结果 / 队列 / 包信息之间循环。
+    /// 焦点在结果 / 队列 / 包信息 / 标签之间循环。
     pub fn toggle_focus(&mut self) {
         self.pane = self.pane.next();
-        self.message = format!("焦点：{}", self.pane.label());
+        self.announce_focus();
+    }
+
+    /// `Shift+Tab`：反着来。
+    pub fn toggle_focus_back(&mut self) {
+        self.pane = self.pane.previous();
+        self.announce_focus();
+    }
+
+    fn announce_focus(&mut self) {
+        self.message = match self.pane {
+            Pane::Tabs => String::from("焦点：标签 · ←→ 选 · Enter/Space 开关 · Tab 下一个"),
+            other => format!("焦点：{}", other.label()),
+        };
+    }
+
+    /// 焦点跳到标签行并左右移动（`[` `]` 与 `←→` 都走这里）。
+    pub fn move_chip_focus(&mut self, delta: isize) {
+        self.pane = Pane::Tabs;
+        let chips = self.chips();
+        if chips.is_empty() {
+            self.message = String::from("这个模式没有标签");
+            return;
+        }
+        self.chip_focus =
+            (self.chip_focus as isize + delta).rem_euclid(chips.len() as isize) as usize;
+        let (name, on, count) = &chips[self.chip_focus];
+        self.message = format!(
+            "标签：{name} {count} 个 · {} · Enter/Space 开关",
+            if *on { "开着" } else { "关着" }
+        );
+    }
+
+    /// 开关焦点所在的那个标签。
+    pub fn toggle_focused_chip(&mut self) {
+        let index = self.chip_focus;
+        self.toggle_chip(index);
+        // 焦点留在标签行：连着开关几个标签才顺（`toggle_chip` 本身不动焦点）。
+        self.pane = Pane::Tabs;
     }
 
     // ── 安装队列 ─────────────────────────────────────────────────────────
@@ -1647,7 +1756,7 @@ impl PackageView {
                 } else if self.all_hits.is_empty() {
                     String::from("输入关键词回车搜索（官方源 + AUR）")
                 } else {
-                    format!("全部 {} 个包 · 打字即时过滤", self.all_hits.len())
+                    format!("全部 {} 个包 · 按 / 过滤", self.all_hits.len())
                 }
             }
             PackageMode::Installed => {
@@ -1729,10 +1838,20 @@ impl PackageView {
     }
 
     /// 模式标签（带当前高亮）给 UI 画。
-    pub fn mode_tabs(&self) -> Vec<(&'static str, bool)> {
+    /// 模式标签：`1 搜索` / `2 已安装` / `3 新闻` / `4 维护`。
+    ///
+    /// 数字是**按键提示**，所以写在标签里 —— 渲染和鼠标命中都读这个函数，
+    /// 命中区自动跟着它走（见 `ui::packages::tab_hits`）。
+    pub fn mode_tabs(&self) -> Vec<(String, bool)> {
         PackageMode::ALL
             .iter()
-            .map(|mode| (mode.label(), *mode == self.mode))
+            .enumerate()
+            .map(|(index, mode)| {
+                (
+                    format!("{} {}", index + 1, mode.label()),
+                    *mode == self.mode,
+                )
+            })
             .collect()
     }
 
@@ -1926,16 +2045,20 @@ mod tests {
         assert_eq!(view.sort_menu, None);
     }
 
+    /// `i` / `r` / 仅下载：操作是**直接定**的（以前是 `Ctrl+M` 轮换），
+    /// 这里钉住「赋值真的生效」。
     #[test]
-    fn package_operation_cycles_through_install_remove_download() {
+    fn the_queue_operation_can_be_set_directly() {
+        use crate::packages::PackageOperation;
+
         let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
-        assert_eq!(view.operation, PackageOperation::Install);
-        view.cycle_operation();
-        assert_eq!(view.operation, PackageOperation::Remove);
-        view.cycle_operation();
+        assert_eq!(view.operation, PackageOperation::Install, "默认是装");
+
+        view.operation = PackageOperation::Remove;
+        assert_eq!(view.operation, PackageOperation::Remove, "`r` 该换成卸载");
+
+        view.operation = PackageOperation::Download;
         assert_eq!(view.operation, PackageOperation::Download);
-        view.cycle_operation();
-        assert_eq!(view.operation, PackageOperation::Install);
     }
 
     /// 队列：加入、去重、导出导入、清空。
@@ -2170,25 +2293,42 @@ mod tests {
         assert_eq!(view.rows_len(), 1);
     }
 
-    /// 模式标签：搜索/已安装/新闻都能切，且切过去会自动带上该有的数据。
+    /// 四个模式都能直达（`1`-`4` 走的就是 `set_mode`），
+    /// 切过去会自动带上该有的数据 —— 没取数线程时必须说人话。
     #[test]
-    fn mode_tabs_cycle() {
+    fn every_mode_can_be_selected_directly() {
         let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
         assert_eq!(view.mode, PackageMode::Search);
-        view.cycle_mode();
-        assert_eq!(view.mode, PackageMode::Installed);
+
+        for mode in PackageMode::ALL {
+            view.set_mode(mode);
+            assert_eq!(view.mode, mode, "{mode:?} 该切过去");
+        }
+
         // 测试里没有取数线程：这时**不许装样子**（显示「正在读…」却没人在读），
         // 要老老实实说清楚 —— 这条钉住的就是「失败要说人话」。
+        view.set_mode(PackageMode::Installed);
         assert!(!view.installed_loading);
         assert!(view.message.contains("取数线程"), "{}", view.message);
-        view.cycle_mode();
-        assert_eq!(view.mode, PackageMode::News);
-        view.cycle_mode();
-        assert_eq!(view.mode, PackageMode::Health);
-        // 同上：没有取数线程时要说实话，而不是显示「检查中…」却没人检查
+
+        view.set_mode(PackageMode::Health);
         assert!(!view.health_loading);
         assert!(view.message.contains("取数线程"), "{}", view.message);
-        view.cycle_mode();
-        assert_eq!(view.mode, PackageMode::Search);
+    }
+
+    /// 取 PKGBUILD 是异步的：没选中包、已经在取，都要**说人话**而不是装样子 ——
+    /// 尤其是「已经在取」这一条：不拦住的话，连按两下 Ctrl+X 会起两条线程。
+    #[test]
+    fn request_pkgbuild_says_why_it_cannot() {
+        let mut view = PackageView::new(Vec::new(), None, crate::config::PackagePrefs::default());
+
+        view.request_pkgbuild(false, PathBuf::from("/tmp"));
+        assert!(view.message.contains("先选中一个包"), "{}", view.message);
+
+        view.pkgbuild_loading = true;
+        view.message.clear();
+        view.request_pkgbuild(false, PathBuf::from("/tmp"));
+        assert!(view.message.contains("还在取"), "{}", view.message);
+        assert!(view.pkgbuild_loading, "守卫不该把状态清掉");
     }
 }

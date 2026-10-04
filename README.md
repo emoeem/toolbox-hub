@@ -9,7 +9,7 @@
 维护者文档：[项目说明与实现记录](docs/project-overview-and-work-log.md)，包含项目边界、模块分工、本轮改动和验证方式。
 
 ```text
-媒体 44 │ 图像 3 │ 系统 5 │ 网络 2 │ 开发 4 │ 工具 2 │ 包管理 13
+媒体 44 │ 图像 3 │ 系统 11 │ 网络 8 │ 开发 4 │ 工具 2 │ 包管理 7 │ 打包 20
 ──────────────────────────────────────────────────────
  全部 · 转码 · 编辑 · 媒体 · 字幕 · 分析 · 工具 · 下载
 ──────────────────────────────────────────────────────
@@ -36,8 +36,8 @@ cargo build --release && ./target/release/toolbox-hub    # 更快
 
 | 场景 | 键 |
 | --- | --- |
-| 列表 | `↑↓`/`jk` 选择 · `g`/`Home` 首项 · `G`/`End` 末项 · `PgUp/PgDn` 或 `Ctrl+U/D` 翻页 · **鼠标左键选择 / 双击执行 / 滚轮滚动** · `Enter` 执行 · `/` 搜索（跨域） · `←→`/`1-7` 域 · `h`/`l` 分类 · `Tab` 标记 · `f` 收藏 · `v` 视图 · `H` 历史 · **`F` 看文件** · **`y` 文件管理器** · **`p` 包管理** · **鼠标点击包结果 / 双击加入队列** · `d` 改工作目录 · `Ctrl-R` 重扫 · `?`/`F1` 帮助 · `q` 退出 |
-| 软件包中心（`p`） | `1-4` 切模式 · `←→`/鼠标切模式：搜索 · 已安装 · 新闻 · 维护 · 打字即本地模糊筛 · `Enter` 上网搜 / 读本地 / 抓新闻 · `↑↓` 选择 · `Tab` 换面板（结果→安装清单→包信息） · `Alt+1-9`/`Alt+0` 标签开关 · `s` 排序菜单 · `Space` 排队 · **`Enter` 先看命令、再按一次才执行** · `m` 安装/卸载/仅下载 · `U` 更新 · `c` 清缓存 · `O` 清孤儿 · `D` 演练模式 · `Ctrl+X` PKGBUILD · `Ctrl+K` 检查 · `Ctrl+E`/`Ctrl+I` 导出/导入 · 结果面板 `Ctrl+D` 翻页，其他面板 `Ctrl+D` 清空队列 |
+| 列表 | `↑↓`/`jk` 选择 · `g`/`Home` 首项 · `G`/`End` 末项 · `PgUp/PgDn` 或 `Ctrl+U/D` 翻页 · **鼠标左键选择 / 双击执行 / 滚轮滚动** · `Enter` 执行 · `/` 搜索（跨域） · `←→`/`1-8` 域 · `h`/`l` 分类 · `Tab` 标记 · `f` 收藏 · `v` 视图 · `H` 历史 · **`F` 看文件** · **`y` 文件管理器** · **`p` 包管理** · **鼠标点击包结果 / 双击加入队列** · `d` 改工作目录 · `Ctrl-R` 重扫 · `?`/`F1` 帮助 · `q` 退出 |
+| 软件包中心（`p`，或「包管理」域的入口） | `1-4` 切面板（搜索/已安装/新闻/维护） · `/` 进过滤（打字即筛 · `Enter` 收工 · `Esc` 清空并退出） · `↑↓`/`jk` 选择 · `PgUp/PgDn` 翻页 · `g`/`G` 首末 · `Tab` 焦点（结果→队列→包信息→标签） · `[`/`]` 或 `←→` 选标签 · `Space` 排队/开关标签 · `Enter` 执行 · `i`/`r` 装/卸 · `u` 更新 · `c` 清缓存 · `o` 清孤儿 · `s` 排序 · `D` 演练 · `K`/`X`/`A` 检查 / 看 PKGBUILD / AUR 页 · `m`/`M` 新闻标记已读 · `Ctrl+E`/`Ctrl+I` 导出/导入 · `Esc`/`q` 回动作列表 |
 | 表单 | `↑↓` 换字段 · `←→` 改选项 · `Enter` 编辑 · **`Ctrl-F` 挑文件** · `Ctrl-E` 执行（危险动作按两次） · `Esc` 返回 |
 | 输出视图 | `↑↓` 滚动 · `←→` 横向滚动（长行不换行） · `g`/`G` 顶底 · `s` 保存 · `c` 复制 · `q` 关闭 |
 | 文件视图（`F`） | `↑↓` 选文件 · 右半边**预览图片** · `Enter` 切到该文件所在目录 · 打字过滤 |
@@ -122,7 +122,8 @@ foreach = "input"                          # 每个输入各跑一次
 
 环境变量（都可选）：`TOOLBOX_HUB_PATH`（脚本目录）、`TOOLBOX_HUB_MANIFEST_PATH`（manifest 目录）、
 `TOOLBOX_HUB_WORKDIR`（启动工作目录）、`TOOLBOX_HUB_FILE_MANAGER`（默认 `yazi`）、
-`TOOLBOX_HUB_CONFIG`（配置目录）、`TOOLBOX_HUB_DATA`（数据目录）、`TOOLBOX_HUB_STATE`（状态文件）。
+`TOOLBOX_HUB_CONFIG`（配置目录）、`TOOLBOX_HUB_DATA`（数据目录）、`TOOLBOX_HUB_STATE`（状态文件）、
+`TOOLBOX_HUB_PKGBUILD_SRC`（「打包」域要管的私人软件仓库在哪，见下）。
 
 ## 配置：两个目录，别混
 
@@ -153,17 +154,23 @@ mode = "搜索"        # 打开时停在哪个模式：搜索 / 已安装 / 新�
 
 ## 软件包中心（`p`，或直接进「包管理」域）
 
-Hub 自己的统一包入口。**进「包管理」域（`7` 或 `←→`）会自动打开它** —— Esc 回到
-那一域的 14 个 CLI 动作（单条查询之类）。列表里按 `p` 也是同一个界面。
+Hub 自己的统一包入口，三个地方进得来：列表里按 `p`、进「包管理」域（`7` 或 `←→`）
+之后选那四个入口之一、或者命令行 `-s`。
+
+**进「包管理」域不再自动打开中心**：和其它六个域一样，进域是动作列表，
+选中才进视图。那个列表现在是 **4 个进中心的入口**（搜索并安装 / 已安装·卸载 /
+Arch 新闻 / 系统维护）+ **3 个只有命令行能做的查询**（正则搜官方源 / 这个文件
+属于哪个包 / 这个包装了哪些文件）—— 以前那十几个包装动作和中心完全重复，
+只能靠「进域自动开中心」把列表藏起来，层级就乱了。
 
 版式照 `paru` 来：**整行列表在上、整行包信息在下**，状态行是
 `结果 30172/30172 (n 已选)` + 右端键提示。一进来**全库（三万个包）就铺好了**，
-打字即时本地过滤，`Enter` 才上网搜 AUR —— 不用对着空屏想关键词。
+按 `/` 就能过滤，`Enter` 才上网搜 AUR —— 不用对着空屏想关键词。
 
 ```text
 ┌ 软件包中心 ─────────────────────────────────────────────────────────────────┐
-│ 结果 30172/30172  (2 已选)   筛选 fzf▏      全部 30172 个包 · 打字即时过滤   Tab:队列 · Enter:执行 · Space:多选 · s:排序 · Esc:退出 │
-│ [ 搜索 ][ 已安装 ][ 新闻 ][ 维护 ] │ [extra 7299✓][aur 4600✓][blackarch 4907✓] │
+│ 结果 30172/30172  (2 已选)   过滤 fzf▏      全部 30172 个包 · 按 / 过滤   /:过滤 · 1-4:面板 · Space:排队 · Enter:执行 · i:装 · q:退出 │
+│ 1 搜索  2 已安装  3 新闻  4 维护 │ [extra 7299✓][aur 4600✓][blackarch 4907✓] │
 │ ➤ cachyos-extra-v3  0ad       0.28.0-3.1   Cross-platform, 3D and historically-based …  │
 │   extra             0ad-data  0.28.0-1     Cross-platform, 3D and historically-based …  │
 │ ╭ 包信息 · 0ad ────────────────────────────────────────────────────────────╮ │
@@ -190,10 +197,22 @@ Hub 自己的统一包入口。**进「包管理」域（`7` 或 `←→`）会�
 | **新闻** | 未读 / 已读 / 全部，`★` 标出「上次升级之后发布的」 | `archlinux.org/feeds/news/` + `pacman.log` |
 | **维护** | 孤儿包 / 依赖完整性 / `.pacnew` / 缓存占用 / 可更新 / 上次升级 / 文件完整性 | libalpm · `pacman -Dk` · 扫 `/etc` 与缓存目录 |
 
-`←→` 切模式（**输入态下用 `[` `]`** —— 那时光标归 ←→ 管）、鼠标点标签也行。
+`1`-`4` 直接切面板（标签上就写着数字），鼠标点标签也行。
 
-**打字就是过滤**，不用先按键进输入态：一进来全库（三万个包）已经铺好了，
-打 `vlc` 光标就落在 `vlc` 上。要换一个搜就 `Esc` 清空（或 `Ctrl+U`），接着打。
+**输入是模态的**：按 `/` 进过滤态，打字即筛（全库三万个包已经在本地了），
+`Enter` 收工但**留着**筛选词、`Esc` 清空并退出。为什么要这样而不是「打字永远有效」：
+常驻输入框会把字母和数字全吃掉，命令就只能全挂在 `Ctrl+S/M/T/O/X/K/A…` 上 ——
+那套键位不是设计出来的，是被输入框挤出来的。改成模态之后：
+
+| 用途 | 键 |
+| --- | --- |
+| 过滤 | `/` 进 · 打字即筛 · `Enter` 收工 · `Esc` 清空退出 |
+| 面板 | `1` `2` `3` `4` 直达（搜索 / 已安装 / 新闻 / 维护） |
+| 焦点 | `Tab` / `Shift+Tab`：结果 → 队列 → 包信息 → 标签 |
+| 标签 | `[` `]`（或 `←→`）选 · `Space` 开关（焦点那个带下划线） |
+| 动作 | `Enter` 执行 · `i` 装 · `r` 卸 · `u` 更新 · `c` 清缓存 · `o` 清孤儿 · `s` 排序 · `D` 演练 |
+| AUR | `K` 检查（namcap + shellcheck）· `X` 看 PKGBUILD · `A` 开 AUR 页面 |
+
 停手 400ms 而本地一个都没匹配上时，会自动去 AUR 问一次 —— 官方源的包本地全库
 就有，AUR 的包自动补上，不用记得按什么键（`Ctrl+R` 是手动重搜）。
 
@@ -202,7 +221,7 @@ Hub 自己的统一包入口。**进「包管理」域（`7` 或 `←→`）会�
 `Ctrl+D` 清空整个队列。`Tab` 切到队列面板能一眼看全，
 `Enter` 则是「装」——它先把要跑的命令摆出来，**再按一次才真的动系统**。
 
-**维护模式**（`←→` 或 `[` `]` 切到第四个标签）把「该看一眼」的东西凑成一屏，
+**维护面板**（`4`，或 `Tab` 走到）把「该看一眼」的东西凑成一屏，
 每项都能直接按 Enter 处理：
 
 ```text
@@ -293,8 +312,17 @@ ls -l | toolbox-hub ui pager --title "文件列表"                          # �
    `/dev/tty`」，不是「stdout/stderr 是不是 tty」；
 2. **退出码固定**：`0` 选了/确认，`1` 用户取消（`Esc`/`n`），`2` 没终端或参数错。
    于是 `if p=$(tbx_pick); then` 直接可用；
-3. **键位与主界面一致**：`↑↓`/`jk`、`g`/`G`、`PgUp/PgDn`、`Esc` 取消、`Tab` 多选、
-   打字即过滤。学一次就够。
+3. **键位与主界面一致**，而且组件**底部一直显示着这一行**（组件是独立开的会话，
+   没有主界面那个 footer，不画出来你根本不知道按什么退出）：
+
+| 组件 | 键 |
+| --- | --- |
+| `ui confirm` | `←→` / `hl` / `Tab` 换按钮 · `Enter` 确认当前那个 · `y` / `n` 直达 · `Esc` 取消 |
+| `ui pick` | `↑↓` 选择 · `Enter` 进目录 / 选中 · `←` 上级 · `Tab` 标记（`--multi`）· 打字过滤 · `Ctrl+U` 清空 · `Ctrl+D` 用当前目录（`--dir-only`）· `Esc` 取消 |
+| `ui pager` | `↑↓` / `jk` 滚动 · `←→` / `hl` 横移 · `PgUp`/`PgDn`/`Space` 翻页 · `g`/`G`/`Home`/`End` 顶底 · `q` / `Esc` 退出 |
+
+注意 `ui pick` **没有** `j`/`k`/`g`/`G` —— 那几个字母要留给过滤框，抢走就没法筛文件名了
+（主界面的选文件器也是这么定的）。`ui pager` 没有输入框，所以 `jkhl` 可以放心用。
 
 没有终端时**不猜**：`ui confirm` 不给 `--default` 就报错退出（`2`），
 `ui pick` 直接说「选文件要有人点」，只有 `ui pager` 会原样透传 ——
@@ -338,6 +366,106 @@ main ─► cli ──► packages ──► libalpm       （命令行模式：
 | `cli` | 命令行模式：`-s/-i/-r/-u/-n/-l/--clear-cache`，与 TUI 共用同一份命令翻译 |
 | `runtime` | 交互式接管终端；捕获式后台任务（实时输出 / 进度 / 取消） |
 | `media` | 工作目录里的媒体文件扫描 |
+
+## 工具仓库（搜索 / 安装 / 更新远程工具包）
+
+除了本机已有的工具，工具箱还可以从**工具仓库**里装东西 —— 一个仓库就是一个静态
+JSON 索引加一堆产物文件，不需要服务器、不需要账号。
+
+\`\`\`bash
+toolbox-hub repo add https://raw.githubusercontent.com/emoeem/toolbox-hub/main/registry/index.json
+toolbox-hub search ffmpeg          # 本地工具 + 仓库里的包一起搜
+toolbox-hub info ffmpeg-extra-recipes
+toolbox-hub install ffmpeg-extra-recipes
+toolbox-hub update                 # 升级已装的工具包
+toolbox-hub uninstall ffmpeg-extra-recipes
+\`\`\`
+
+TUI 里在「发现」域（数字键 9），三个面板：发现 / 已安装 / 仓库。
+
+装来的东西只落在你自己的目录里（\`~/.local/bin\` 与数据目录），**一次也不 sudo**；
+来源没有声明 SHA-256 时必须你显式接受；你改过的文件卸载时不会被删。
+完整说明（索引格式、安全模型、怎么做自己的仓库、动态参数）见
+[docs/repository.md](docs/repository.md)。
+
+## 安装 / 卸载 / 更新工具包
+
+给**用的人**看的一页。工具包 = 从工具仓库装来的工具（例子：`disk-report` 看谁占了
+你的磁盘、`system-cleanup` 先体检再清理、`net-diagnose` 查 DNS/连通/路由）。它和
+pacman/AUR 那套**没有任何关系**，卸掉一个工具包只会删掉几个文件，不会动系统。
+
+### 装
+
+    toolbox-hub repo add https://raw.githubusercontent.com/emoeem/toolbox-hub/main/registry/index.json
+    toolbox-hub search 磁盘          # 本地工具 + 仓库里的包一起搜
+    toolbox-hub info disk-report     # 先看安装计划：来源 / 依赖 / 装哪些文件 / 哈希
+    toolbox-hub install disk-report  # 确认无误再装
+
+装之前它会把**来源信任等级、依赖是否齐、要落哪些文件的绝对路径、SHA-256** 摆出来；
+哈希对不上直接拒绝安装。装来的脚本落在 `~/.local/bin`，其余文件落在数据目录，
+**一次也不 sudo**。
+
+装完就能用：`toolbox-hub run disk-report-dirs --path ~/Downloads --depth 2`，
+或者在 TUI 里找它（数字键 9 进「发现」域，或它自己声明的域）。
+
+### 卸
+
+    toolbox-hub list                  # 看看装了什么
+    toolbox-hub uninstall disk-report # 卸掉它
+
+账本记着每个文件装好时的哈希：**你改过的文件不会被删**，只会告诉你「这几个我保留
+了」。真要连它们一起删就加 `--purge`。
+
+### 更新
+
+    toolbox-hub update --check   # 只检查：有更新退出码 10，没有 0，出错 1
+    toolbox-hub update           # 真的升级（会先列出来）
+
+TUI 启动时会顺手看一眼：索引过期就在后台刷新，查完在状态行提示「有 N 个工具包可
+升级」。**自动只到「检查」为止** —— 升级等于下载并执行别人新写的代码，那一步必须你
+自己按下去（发现面板的 `U`，或者上面那条命令）。
+
+想让它每天自动检查，装这两个用户单元（随包提供在 `packaging/`）：
+
+    mkdir -p ~/.config/systemd/user
+    cp packaging/toolbox-hub-update.service packaging/toolbox-hub-update.timer ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    systemctl --user enable --now toolbox-hub-update.timer
+    systemctl --user list-timers toolbox-hub-update     # 看下次什么时候跑
+
+默认那条单元是 `update --check`（只查）。想让机器**无人值守地自动升级**，把
+`ExecStart` 换成 `toolbox-hub update` —— 那是你的选择，不是默认。看结果：
+`journalctl --user -u toolbox-hub-update`。
+
+### 装到哪儿了 / 怎么彻底清干净
+
+| 位置 | 内容 |
+| --- | --- |
+| `~/.local/bin/` | 包里带的可执行脚本（`TOOLBOX_HUB_BIN_DIR` 可以改） |
+| `<数据目录>/packages/<包 id>/` | 动作定义、文档、数据，以及账本 `installed.toml` |
+| `<缓存目录>/repositories/<仓库 id>/` | 索引缓存（删了没关系，下次刷新重建） |
+
+`uninstall` 会把账本与这些文件一起清掉；缓存目录整个删掉也只是让下次多刷一次索引。
+
+## 写一个插件（插件生态）
+
+插件就是一个**仓库包**：一份 °toolbox.toml° + 若干动作定义 + 可选的自带脚本。
+索引是构建产物，所以作者不用手算哈希、也不用自己写 tar：
+
+    toolbox-hub new my-tool --description "把文件里的大写换成小写" --domain 工具
+    cd my-tool && $EDITOR manifests/my-tool.toml scripts/my-tool
+    toolbox-hub check .          # 校验（符号链接、路径穿越、忘重打包……都会拦）
+    toolbox-hub build .          # 可复现地打包 + 算哈希
+    toolbox-hub repo add "$PWD"  # 自己先装一遍
+    toolbox-hub install my-tool
+
+两种形状：°--kind script°（自带脚本）和 °--kind recipe°（只给已经装好的 CLI
+补一条好用的表单）。参数可以用 °kind = "dynamic"° 让候选来自命令输出 ——
+「有哪些分支 / 容器 / ffmpeg 编码器」由机器回答，不用用户背。
+
+完整教程（字段参考、动态参数、校验规则、发布与托管、常见错误速查）见
+[docs/plugin-authoring.md](docs/plugin-authoring.md)；官方样例仓库见
+[registry/](registry/)。
 
 ## 已知局限（诚实清单）
 
@@ -383,6 +511,33 @@ PKGBUILD 已经把它们放进 `/usr/bin`。细节与踩过的坑见 [`scripts/s
 （实跑报 `register TC eBPF TCP listener: operation not supported`）；注意预检
 `--mode local` 全绿**并不代表** TC 可用（那 28 项要 `--mode all` 才涉及，结果是 inconclusive）。
 所以脚本会在动配置**之前**先拦下这两条路，并提示容器改用 `--network=host`。
+
+## 「打包」域：给你自己的 Arch 软件仓库用
+
+第八个域，专门管**你自己的软件包仓库**（那种「一堆 PKGBUILD + CI 自动构建 + repo 分支发布」
+的私人仓库）。二十个动作覆盖它的日常：状态总览、环境自检、审计包、构建计划与 DAG、
+并行构建、构建时序、修复中心、同步 AUR 源、跟踪/排查 CI、从仓库安装…
+
+它们全都经一个几行的转发脚本 `tbx-pkgbuild` 走，那个脚本只干一件事 —— **找仓库**：
+
+```text
+$TOOLBOX_HUB_PKGBUILD_SRC  >  ~/pkgbuild-source  >  ~/code/pkgbuild-source
+```
+
+仓库在哪儿只有你知道，所以没法写死在随包发布的 manifest 里：
+
+| 你是什么用户 | 怎么让这些动作可用 |
+| --- | --- |
+| 装 Arch 包 | 什么都不用做，`tbx-pkgbuild` 已经装到 `/usr/bin`；把仓库放到上面任一位置即可 |
+| 源码用户 | `./scripts/pkgbuild-source/install.sh`（装到 `~/.local/bin`），仓库同上或用环境变量指定 |
+
+那个仓库自己的 `manage.sh` 得先支持「点名执行」（`manage.sh <动作代号>`）；
+不支持的话这些动作会显示「依赖缺失」并给出上面的安装办法 —— **不装也不影响别的域**，
+这个域本来就是可选的（空着时显示「Provider 待接入」）。
+
+**它是怎么接的**（和 sing-box 那套一模一样，可以照着抄）：真正的逻辑全在那个仓库里，
+toolbox 这边只有「manifest 写裸命令名 + 一个转发脚本 + PKGBUILD 装到 `/usr/bin`」三件东西，
+所以仓库随便改，工具箱不用重编译。
 
 ## 打包与分发
 

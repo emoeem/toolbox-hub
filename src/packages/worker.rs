@@ -23,6 +23,7 @@
 
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         mpsc::{self, Receiver, Sender},
@@ -36,6 +37,7 @@ use super::{
     libalpm::Db,
     probe::{InfoOutcome, Net},
 };
+use crate::runtime;
 
 /// 发给数据库线程的请求。
 pub enum DbRequest {
@@ -104,7 +106,15 @@ pub enum Response {
     Health(Result<Vec<HealthItem>, String>),
     /// 文件完整性检查的输出（已经整理成行）。
     FileIntegrity(Result<Vec<String>, String>),
+    /// PKGBUILD 抓取（Ctrl+X）或抓取 + 检查（Ctrl+K）的结果。
+    Pkgbuild(Result<PkgbuildReport, String>),
     News(Result<NewsChunk, String>),
+}
+
+/// paru -Gp 之后的产物：已经整理成能直接丢进输出视图的行。
+pub struct PkgbuildReport {
+    pub name: String,
+    pub lines: Vec<String>,
 }
 
 /// 新闻线程回来的一整包东西。
@@ -119,6 +129,8 @@ pub struct Worker {
     db_tx: Sender<DbRequest>,
     net_tx: Sender<NetRequest>,
     rx: Receiver<Response>,
+    /// 一次性任务（PKGBUILD 这类）用它起**独立**线程，见 Worker::pkgbuild。
+    tx: Sender<Response>,
     /// 本地已装包的 名字 → 版本：数据库线程写，网络线程读（给 AUR 命中标状态）。
     /// 界面自己不需要它，所以这里只留一个名字占位，避免字段被当成没用的东西删掉。
     _local: Arc<RwLock<HashMap<String, String>>>,
@@ -134,12 +146,13 @@ impl Worker {
         let local: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
         let db_tx = spawn_db(tx.clone(), Arc::clone(&local))?;
-        let net_tx = spawn_net(tx, Arc::clone(&local))?;
+        let net_tx = spawn_net(tx.clone(), Arc::clone(&local))?;
 
         Ok(Self {
             db_tx,
             net_tx,
             rx,
+            tx,
             _local: local,
         })
     }
@@ -206,6 +219,22 @@ impl Worker {
     /// 文件完整性（慢，用户按了才跑）。
     pub fn file_integrity(&self) {
         self.db(DbRequest::FileIntegrity);
+    }
+
+    /// 取 PKGBUILD：只取原文，或再顺带过一遍 shellcheck 与 namcap。
+    ///
+    /// **起一条独立线程**跑，这是有意为之的两头不靠：
+    /// * 扔在 UI 线程上跑（原来的做法）会把整个界面冻住 —— 没有输出、不能滚动、
+    ///   按 q 也不响应；而它偏偏是网络操作，冷连接要几秒；
+    /// * 扔进常驻的网络线程则会让同时进行的 AUR 搜索排在它后面。
+    pub fn pkgbuild(&self, name: String, check: bool, cwd: PathBuf) {
+        let tx = self.tx.clone();
+        let _ = thread::Builder::new()
+            .name(String::from("pkg-pkgbuild"))
+            .spawn(move || {
+                let report = pkgbuild_report(&name, check, &cwd);
+                let _ = tx.send(Response::Pkgbuild(report));
+            });
     }
 
     pub fn news(&self) {
@@ -347,6 +376,85 @@ fn spawn_net(
 }
 
 /// `pacman -Qk` 的输出整理成行（几秒级，只在用户按了才跑）。
+/// 取一份 PKGBUILD，可选顺带检查（shellcheck / namcap）。
+///
+/// 这里是**唯一**真跑命令的地方；返回的是给人看的行，形状和文件完整性检查
+/// 一致，输出视图那边不需要认识 Captured。
+///
+/// 检查工具没装不算失败：那一段会写明「这一截跳过了」。**检查没做**和
+/// **检查没问题**是两件事，不能让前者看起来像后者。
+fn pkgbuild_report(name: &str, check: bool, cwd: &Path) -> Result<PkgbuildReport, String> {
+    let paru = PathBuf::from("paru");
+    let argv = [String::from("-Gp"), name.to_string()];
+    let fetched = runtime::run_captured(&paru, &argv, cwd, &format!("PKGBUILD {name}"))
+        .map_err(|error| format!("跑不了 paru -Gp：{error}"))?;
+
+    if !fetched.success || fetched.stdout.trim().is_empty() {
+        return Err(format!(
+            "没拿到 {name} 的 PKGBUILD（它是 AUR 包吗？网络通吗？）"
+        ));
+    }
+
+    let mut lines = section(&fetched.command, &fetched.stdout);
+    if !check {
+        return Ok(PkgbuildReport {
+            name: name.to_string(),
+            lines,
+        });
+    }
+
+    // 写到临时文件：检查工具要的是文件，不是管道。
+    let path = std::env::temp_dir().join(format!("toolbox-hub-{name}-PKGBUILD"));
+    std::fs::write(&path, &fetched.stdout)
+        .map_err(|error| format!("写不了临时文件 {}：{error}", path.display()))?;
+
+    for program in ["shellcheck", "namcap"] {
+        let argv = [path.display().to_string()];
+        match runtime::run_captured(&PathBuf::from(program), &argv, cwd, program) {
+            Ok(captured) => {
+                // shellcheck 报「有问题」用的是**退出码 1** —— 那是检查成功、有告警，
+                // 不是命令失败（不然标题会写成「失败」，误导）。
+                let title = match captured.status {
+                    Some(1) if program == "shellcheck" => format!("{program}（有告警）"),
+                    Some(code) if code != 0 => format!("{program}（退出码 {code}）"),
+                    _ => program.to_string(),
+                };
+                let body = format!("{}{}", captured.stdout, captured.stderr);
+                let body = if body.trim().is_empty() {
+                    String::from("（没有发现问题）")
+                } else {
+                    body
+                };
+                lines.extend(section(&title, &body));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                lines.extend(section(
+                    program,
+                    &format!("没装 {program}，这一截跳过了。\n装上它：pacman -S {program}"),
+                ));
+            }
+            Err(error) => lines.extend(section(program, &format!("跑不起来：{error}"))),
+        }
+    }
+
+    Ok(PkgbuildReport {
+        name: name.to_string(),
+        lines,
+    })
+}
+
+/// 输出视图里的一段：一行 `── 标题 ──` 加正文。
+fn section(title: &str, body: &str) -> Vec<String> {
+    let mut out = vec![format!("── {title} ──")];
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        out.push(String::from("（没有输出）"));
+    } else {
+        out.extend(trimmed.lines().map(str::to_string));
+    }
+    out
+}
+
 fn file_integrity_output() -> Result<Vec<String>, String> {
     let output = std::process::Command::new("pacman")
         .args(["-Qk"])
@@ -394,6 +502,19 @@ fn failed_for(request: &DbRequest, error: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 输出视图里的一段：标题行 + 正文。空正文必须说「没有输出」，
+    /// 不能留一段空白让人以为那一截根本没跑。
+    #[test]
+    fn section_labels_the_title_and_never_emits_silence() {
+        let lines = section("shellcheck", "a\nb\n");
+        assert_eq!(lines[0], "── shellcheck ──");
+        assert_eq!(&lines[1..], &["a".to_string(), "b".to_string()]);
+
+        let empty = section("namcap", "   \n");
+        assert_eq!(empty.len(), 2, "{empty:?}");
+        assert!(empty[1].contains("没有输出"), "{empty:?}");
+    }
 
     /// 两个线程都起得来，并且一条请求能得到一条回答。
     ///
@@ -452,6 +573,7 @@ mod tests {
             Response::OrphanNames(_) => "孤儿名单",
             Response::Health(_) => "维护检查",
             Response::FileIntegrity(_) => "文件完整性",
+            Response::Pkgbuild(_) => "PKGBUILD",
             Response::News(_) => "新闻",
         }
     }

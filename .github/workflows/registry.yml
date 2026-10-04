@@ -1,0 +1,101 @@
+# 官方工具仓库（registry/）的门禁：仓库里的索引与产物，必须就是源码构建出来的那一份。
+#
+# 为什么和 ci.yml 一样跑在 Arch 容器里：`toolbox-hub build/check` 用的就是同一个
+# 二进制，而这个二进制链接 libalpm（见 src/packages/libalpm.rs）。ubuntu 上没有它，
+# 连编译都过不去。
+#
+# 「重新构建一遍再比对」之所以可靠，是因为 build 是**可复现**的：同样的源码两次构建
+# 逐字节相同（条目排序、mtime/uid/gid 归零、路径不带 ./ 前缀、gzip 头不带时间戳）。
+# 所以 diff 一红，就只可能是有人没把生成物提交上来。
+name: Registry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "registry/**"
+      - "src/repository/**"
+      - ".github/workflows/registry.yml"
+  pull_request:
+    paths:
+      - "registry/**"
+      - "src/repository/**"
+      - ".github/workflows/registry.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa
+        # chafa 是 ratatui-image 的硬依赖：它的 build.rs 用 pkg-config 探测 chafa >= 1.8.0，
+        # 缺了直接构建失败（和 ci.yml 同一组依赖）。
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-registry-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 构建 toolbox-hub
+        run: cargo build --release
+
+      - name: 工作区归属（容器里的 uid 可能和 checkout 出来的对不上）
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
+      # 先过校验：包本身、索引 ↔ 产物 ↔ 源码三方是否自洽。
+      # 有错时 check 返回 1，这一行就会红。
+      - name: 校验 registry/
+        run: ./target/release/toolbox-hub check registry/
+
+      # 再重建一遍，看仓库里那一份是不是就是源码该产出的那一份。
+      - name: 仓库里的索引与产物必须就是源码构建出来的那一份
+        run: |
+          ./target/release/toolbox-hub build registry/
+
+          # git diff 默认看不见**未跟踪**文件：只提交了 index.json、忘了提交
+          # artifacts/ 的 PR，会被静默放过。先标成「打算加」，新产物才会进 diff。
+          git add -N registry/
+
+          if git diff --exit-code registry/; then
+            echo "✓ registry/index.json 与 registry/artifacts/ 都是源码构建出来的那一份"
+            exit 0
+          fi
+
+          echo "::error::registry/ 里的索引或产物与源码对不上 —— 请在本地跑 toolbox-hub build registry/，然后把 index.json 与 artifacts/ 一起提交。"
+
+          {
+            echo "## registry 与源码对不上"
+            echo
+            echo "请在本地跑 \`toolbox-hub build registry/\`，然后**把 \`registry/index.json\` 与 \`registry/artifacts/\` 一起提交**。"
+            echo
+            echo "构建是可复现的（同样的源码两次构建逐字节相同），所以这份差异只可能来自「产物没提交」或「构建版本不一致」。"
+            echo
+            echo '```'
+            git diff --stat registry/
+            echo '```'
+            echo
+            echo "对不上的文件："
+            echo
+            echo '```'
+            git diff --name-status registry/
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          echo "--- git diff --stat registry/ ---"
+          git diff --stat registry/
+          echo "--- 对不上的文件 ---"
+          git diff --name-status registry/
+          # gzip 的 OS 字节可能随 flate2 版本变；真出现差异时上面已经把文件列出来了，
+          # 别静默失败。
+          exit 1

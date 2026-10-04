@@ -1,6 +1,6 @@
 # Toolbox Hub：项目说明与实现记录
 
-更新日期：2026-10-02
+更新日期：2026-10-03
 
 本文面向项目维护者，说明 Toolbox Hub 要解决的问题、内部结构、扩展方法，以及近期一轮依赖、正确性和 TUI 改进。日常安装和按键说明仍以 [README](../README.md) 为准。
 
@@ -100,21 +100,47 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 - 内置 manifest 的测试动作数和 native 动作列表改为从 TOML 推导，新增动作无需同步维护重复常量。
 - `packaging/PKGBUILD` 增加 AUR、文件管理、媒体、文档、下载、PCI 和剪贴板等 `optdepends`；`makepkg --printsrcinfo` 已验证通过。
 
+### 文件选择：外部文件管理器优先
+
+- `toolbox-hub ui pick` 改为**优先交给外部文件管理器**（默认 yazi）：它自带预览、书签、多选和批量操作，浏览体验比内置选择器好得多，也免去继续维护一套浏览逻辑。内置选择器降级为替补，只在外部程序没装、没有控制终端或起不来时顶上，保证脚本不会因为少一个外部程序就跑不动。
+- 外部程序的 stdin/stdout/stderr 三条标准流全部接到 `/dev/tty`：脚本这边通常是 `path=$(toolbox-hub ui pick)`，stdout 是管道，只允许有结果。
+- 两类答案分开取：文件走 `--chooser-file`（在 yazi 里 Enter 触发），目录走 `--cwd-file`（退出时所在的目录）—— 在 yazi 里「打开」一个目录是*进去*，不会触发 chooser，这和 ranger 的 `--choosedir` 是同一套路。
+- 新增 `ExternalPick::{Unavailable, Cancelled}` 区分「用不了」和「用户取消」：前者要退回替补继续服务，后者是最终答案。混为一谈会让「没装 yazi」变成「用户取消了」，脚本静悄悄地什么也拿不到。
+- 环境变量 `TOOLBOX_HUB_FILE_MANAGER` 与主界面按 `y` 浏览目录共用，设成 `builtin` / `none` 则明确用内置的。`--filter` 只有内置选择器认，走外部程序时会往 stderr 说明一句，而不是悄悄丢掉它。
+
+### 长耗时操作的实时反馈
+
+- 四处仍在 UI 线程上同步执行的地方全部改走既有的「线程 + mpsc + 每帧 poll」通道。此前 `runtime::run_captured` 是同步阻塞的，命中它的调用会让整个 TUI 冻住：没有实时输出、没有已用时、按 `q` 也不响应。
+- 历史记录里的「重跑」改走 `App::replay_from_history`，排进后台队列。这条路上的 argv 什么都有（转码、打包 —— 恰恰是最久的那批），是四处里最危险的一处。
+- AUR 的 PKGBUILD 抓取（`Ctrl+X` / `Ctrl+K`）改走 `Worker::pkgbuild` 的独立线程：它是网络操作，扔在 UI 线程上要冻几秒，扔进常驻网络线程又会让并行的 AUR 搜索排在它后面。
+- 健康视图（系统维护）本身不需要改：`ensure_health()` 每次进入该模式都会重扫，不存在「数据陈旧」的问题。本轮确认后未作改动。
+
+### 「打包」域：接自己的 Arch 软件仓库
+
+- 新增第八个域 `Domain::Packaging`（标签「打包」）：它管的是**自己的软件包仓库**（一堆 PKGBUILD + CI 自动构建 + repo 分支发布）的日常 —— 状态总览、环境自检、审计、构建计划与 DAG、并行构建、构建时序、修复中心、同步 AUR 源、跟踪/排查 CI、从仓库安装。追加在 `Domain::ALL` 最后，所以你记住的 `1`-`7` 一个都没动，新域是 `8`。
+- 域本身只是分类：**空着也是合法的**（UI 显示「Provider 待接入」），所以加一个域不影响没有这类仓库的人。
+- 接法和 sing-box 那套完全一致，只有三件东西在 toolbox 这边：`manifests/pkgbuild-source.toml`（20 个动作，`program` 写**裸命令名** `tbx-pkgbuild`）、`scripts/pkgbuild-source/tbx-pkgbuild`（几行的转发脚本，只负责**找仓库**）、PKGBUILD 里把它装到 `/usr/bin`。真正的逻辑全在那个仓库自己的 `manage.sh` 里，所以那边随便改，工具箱不用重编译。
+- 仓库位置不能写死（那是用户的私有仓库）：`$TOOLBOX_HUB_PKGBUILD_SRC` > `~/pkgbuild-source` > `~/code/pkgbuild-source`。找不到时脚本给一句明确的指引并退 `2`，工具箱里则显示「依赖缺失」+ 安装办法；源码用户跑 `./scripts/pkgbuild-source/install.sh`。
+- `mode` 是**实测**分出来的，不是按感觉标的：逐个函数扫过对 `fzf`/`prompt_value`/`select_one`/`sudo` 的依赖之后，只有 5 个纯只读动作走 `capture`（`dashboard`/`audit`/`timing`/`doctor`/`pull`，输出留在输出视图里），其余 15 个要选包或提权，走 `interactive` 把终端交给它。第一遍扫描漏了间接调用（`check_local_updates` 末尾其实有个 fzf 浏览器），按函数体判定比按印象判定可靠。
+- 这个域暴露了一个**真 bug**：`runtime::execute_tools`（interactive 那条路）把 `argv` 写死成空 `Vec`，于是「本体命令写在 `base_argv` 里」的动作全变成光跑程序名 —— 实测 `manage.sh plan` 变成了光跑 `manage.sh`（弹出它自己的主菜单）。capture 那条路此前踩过同一个坑。现在两条路共用 `runtime::default_argv()`，并有一条测试钉住。
+
 ## 验证记录
 
 本轮验证结果：
 
 - `cargo fmt --all -- --check` 通过。
-- `cargo test`：244 项通过，14 项 ignored。
+- `cargo test`：268 项通过，14 项 ignored。
 - `cargo clippy --all-targets -- -D warnings` 通过。
 - `cargo build --release` 通过；`ldd` 未发现 `libchafa`；`--version` 和 `--help` 正常。
 - `makepkg --printsrcinfo` 通过。
+- `toolbox-hub ui pick` 端到端验证（假文件管理器 + `script` 提供的真 pty，8 个用例）：外部程序写进自己 stdout/stderr 的画面噪音**一个字节都没有**进入调用方的 stdout；单选、多选、多行只取首条、取消（退出码 1）、`--dir-only` 取退出目录、`builtin` 强制内置、外部程序不存在时退回内置，均符合预期；完全没有终端时退出码 2 并给出可读提示。
+- 验证过程踩到一个坑（记下来省下一次）：`script -c` 用的是 `$SHELL`（本机为 fish），而 fish 不认 `$?`，会让整条命令直接不执行、且失败得很安静。验证脚本里必须显式 `SHELL=/bin/sh`。
 
 ignored 测试涉及本机 `/etc`、真实 `$HOME`、pacman/paru 状态、联网或会创建文件的外部命令，不属于当前默认 CI 的稳定测试集合。运行前应先阅读各测试的 `#[ignore]` 说明。
 
 ## 尚待维护者决定
 
-- 在 `packaging/PKGBUILD` 中确定真实许可证并加入许可证文件。目前仍是 `license=('unknown')`，不应由代码修改者替项目选择许可证。
+- ~~确定真实许可证~~：已定为 **MIT**（`LICENSE` + `Cargo.toml` 的 `license` + `PKGBUILD` 的 `license=('MIT')` + `package()` 装到 `/usr/share/licenses/`）。
 - 将 PKGBUILD 的占位 GitHub URL 和本地源码包来源替换为真实仓库/tag 地址，并生成校验和及 `.SRCINFO` 后再发布 AUR。
 - 当前 CLI 支持包管理操作，但还没有通用的 `toolbox-hub run <manifest-id>` 或 JSON 输出接口；这属于独立的 CLI 产品设计，不在本轮修改范围内。
 - 默认 CI 继续运行格式、Clippy 和常规测试；定时真实环境冒烟测试需要先为每个 ignored 测试准备明确的依赖和隔离策略。

@@ -1,0 +1,18 @@
+# git-worktree 的包元数据。
+#
+# 客户端解包后会读这个文件，拿它和索引核对 id / version（必须逐字一致）。
+
+[package]
+id = "git-worktree"
+name = "Worktree 与分支管理"
+version = "1.0.0"
+summary = "git worktree / 分支的日常管理：列出来、开新的、清理已合并的"
+description = "围绕 git worktree 与分支的五件日常事：列出所有 worktree、给某个分支开一个独立工作目录（可从已有分支，也可顺手开新分支并指定起点）、列出已经合并进 main 的分支、删掉这些已合并分支（默认只列出来，加 --delete 才动手）、清掉目录已经没了却还留在 .git 里的 worktree 记录。所有子命令都能用 --repo 换仓库；分支参数在表单里会列出当前仓库的分支当候选。不联网、不需要 root。"
+categories = ["dev"]
+tags = ["git", "worktree", "分支", "开发"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+requires_root = false
+danger = "caution"
+install = "sudo pacman -S git"

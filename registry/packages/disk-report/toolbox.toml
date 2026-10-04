@@ -1,0 +1,18 @@
+# disk-report 的包元数据。
+#
+# 客户端解包后会读这个文件，拿它和索引核对 id / version（必须逐字一致）。
+
+[package]
+id = "disk-report"
+name = "磁盘占用排查"
+version = "1.0.0"
+summary = "看看谁占了你的磁盘：目录汇总、最大的文件、按扩展名统计"
+description = "一个只读的磁盘占用排查壳子：du/find/sort/awk 拼出来的三条命令，做成表单。可以按深度汇总某个目录（看看这一层谁最占地方）、列出最大的文件（可限最小体积）、按扩展名统计文件数与总大小。默认不跨文件系统，扫 / 时不会掉进挂载的移动硬盘。不写文件、不联网、不需要 root。"
+categories = ["system"]
+tags = ["disk", "du", "find", "磁盘", "占用"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+requires_root = false
+danger = "safe"
+install = "sudo pacman -S findutils coreutils"

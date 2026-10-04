@@ -1,0 +1,29 @@
+feat(仓库): 插件生态 —— 作者工具链 + 官方仓库 + 自动更新检查
+
+工具仓库从「能装」补到「能写」：
+
+- 作者工具：new / check / build 三个动词（脚手架、校验、可复现打包）。
+  索引改为**构建产物**：build 扫 packages/*/toolbox.toml，打包 + 算哈希 + 写
+  index.json；要装哪些文件、依赖哪些命令都按目录约定与动作 program 自动推导。
+- 官方仓库 registry/：9 个包 / 40 条动作（docker-cleanup、system-cleanup、
+  net-diagnose、ffmpeg-extra-recipes、git-worktree、disk-report、image-batch、
+  demo-actions、hello-tool）。
+- 自动更新：TUI 启动时后台刷新过期索引并提示可升级数（**只查不用**）；
+  CLI `update --check` 有更新时退出码 10，配 packaging/ 下的 systemd 用户单元
+  可每天自动检查。升级要用户按下去 —— 静默替换本机脚本不该发生。
+- 文档：docs/plugin-authoring.md（作者教程）、CONTRIBUTING.md（怎么提交、提交到哪）、
+  README 补「安装 / 卸载 / 更新工具包」；man 与 fish 补全新动词。
+- CI：.github/workflows/registry.yml 在 archlinux 容器里重建索引与产物，
+  再 git diff 比对，防「改了源码没重打包」。（diff 前先 git add -N —— 裸 diff
+  看不见未跟踪文件，漏提交 artifacts/ 会被静默放过。）
+
+顺带修掉的既有问题：
+
+- 包管理中心的安装队列只在非空时落盘，导致「Del 删完按 Esc 退出」不被记住，
+  下次打开又把旧队列读回来。现在空队列也写盘，并加了两个回归测试。
+- CLI 管道 SIGPIPE 崩溃、tar 里的 ./ 条目被当非法路径、装到一半失败留孤儿文件。
+- 作者最容易踩的三处：manifest 里的 [[dependencies]]（现在两边都收）、
+  `repo add <目录>`（自动找 index.json）、`run <包名>`（列动作让你挑）。
+
+本提交同时包含工作区里此前未提交的「打包」域改动（pkgbuild-source 的 manifest
+与脚本）以及配套的 packaging/、README、work-log 更新。

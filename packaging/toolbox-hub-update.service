@@ -1,0 +1,12 @@
+[Unit]
+Description=Toolbox Hub —— 检查工具包更新
+Documentation=man:toolbox-hub(1) https://github.com/emoeem/toolbox-hub
+
+[Service]
+Type=oneshot
+# 默认**只检查**：退出码 10 = 有更新可升（0 = 无事可做，1 = 出错）。
+#
+# 想让它真的自动升级，就把下面这行换成：
+#     ExecStart=%h/.local/bin/toolbox-hub update
+# 那是你的选择，不是默认 —— 升级 = 下载并执行别人新写的代码。
+ExecStart=/usr/bin/toolbox-hub update --check

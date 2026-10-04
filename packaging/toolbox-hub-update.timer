@@ -1,0 +1,13 @@
+[Unit]
+Description=每天检查一次 Toolbox Hub 工具包更新
+
+[Timer]
+# 每天开机后 15 分钟跑一次；错过的（关机期间）不补跑。
+OnBootSec=15min
+OnUnitActiveSec=1d
+Persistent=false
+# 顺手把随机延迟打开，免得一堆机器在同一秒去敲同一个仓库。
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

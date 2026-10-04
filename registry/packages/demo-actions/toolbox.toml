@@ -1,0 +1,26 @@
+# demo-actions 的包元数据。
+#
+# 客户端在解包之后会读这个文件，拿它和索引里那条记录核对：
+# [package] 的 id 与 version 必须和 index.json 里的**逐字一致**，
+# 对不上就拒绝安装（索引说 1.0.0、包里写着 1.0.1 的时候，
+# 你装到的东西和你以为的不是一回事）。其余字段是写给人看的。
+
+[package]
+id = "demo-actions"
+version = "1.0.0"
+name = "Demo Actions"
+summary = "演示用的一包动作：toolbox.toml + manifest + 脚本"
+description = "ToolHub Repository 里的「完整包裹」示例：一个包里同时带命令（demo-echo）与动作定义（demo.toml）。装完之后 demo-echo 落到 ~/.local/bin，manifest 与文档落到包自己的目录，用来演示「命令 + 动作」怎么写、表单填的值怎么变成命令行。零第三方依赖，只用 bash。"
+categories = ["tools"]
+tags = ["示例", "manifest", "动作"]
+license = "MIT"
+author = "emo"
+source = "https://github.com/emoeem/toolbox-hub"
+requires_root = false
+danger = "safe"
+
+# 包里的东西（对应索引里的 files[]）：
+#   scripts/demo-echo        → ~/.local/bin/demo-echo      （bin）
+#   manifests/demo.toml      → 包自己的目录                （manifest）
+#   README.md                → 包自己的目录                （doc）
+#   toolbox.toml（本文件）    → 包自己的目录                （data）

@@ -1,0 +1,312 @@
+# image-batch 的动作定义 —— 三个子命令，一个脚本。
+#
+# program 是本包 scripts/image-batch；脚本内部调用 ImageMagick 7 的 magick，
+# 所以 [[dependencies]] 里显式声明 magick。
+#
+# 「目录 + 通配 + 输出目录」是三个动作共有的三件套：
+#   --input-dir 从哪读 / --glob 挑哪些 / --output-dir 写到哪。
+# 动作会往输出目录写文件，所以 danger 一律 caution。
+
+# ── 批量转格式 ──────────────────────────────────────────────────────────────
+
+[[action]]
+id = "image-batch-convert"
+name = "批量转格式"
+summary = "把一个目录里的图片批量转成另一种格式（jpg / png / webp / avif / tiff / gif / bmp）"
+domain = "图像"
+tags = ["图片", "imagemagick", "批量", "转格式"]
+program = "image-batch"
+base_argv = ["convert"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S imagemagick"
+input = "一个目录里的图片"
+output = "转好格式的图片，落在输出目录"
+features = "目录 + 通配 + 输出目录；质量可选；可选去元数据；可递归；默认跳过已存在的"
+
+[[action.argument]]
+key = "input_dir"
+label = "输入目录"
+kind = "path"
+flag = "--input-dir"
+required = true
+default = "."
+dir_only = true
+help = "从哪个目录读图片；默认当前目录"
+
+[[action.argument]]
+key = "glob"
+label = "通配"
+kind = "text"
+flag = "--glob"
+required = true
+default = "*.jpg"
+help = "挑哪些文件，可写多个用逗号隔开，例如 *.jpg,*.png；选的是文件名，不含目录"
+
+[[action.argument]]
+key = "output_dir"
+label = "输出目录"
+kind = "path"
+flag = "--output-dir"
+required = true
+default = "./out"
+help = "写到哪个目录；不存在会建出来。它会和输入目录分开，别指到同一个地方"
+
+[[action.argument]]
+key = "format"
+label = "输出格式"
+kind = "choice"
+flag = "--format"
+required = true
+default = "jpg"
+help = "转成哪种格式；扩展名决定实际编码"
+choices = [
+  { label = "JPEG（.jpg）", value = "jpg" },
+  { label = "PNG（.png）", value = "png" },
+  { label = "WebP（.webp）", value = "webp" },
+  { label = "AVIF（.avif）", value = "avif" },
+  { label = "TIFF（.tiff）", value = "tiff" },
+  { label = "GIF（.gif）", value = "gif" },
+  { label = "BMP（.bmp）", value = "bmp" },
+]
+
+[[action.argument]]
+key = "quality"
+label = "有损质量"
+kind = "choice"
+flag = "--quality"
+default = "88"
+help = "只对 jpg / webp / avif 这类有损格式生效；png / bmp 会自动忽略"
+choices = [
+  { label = "95（几乎无损）", value = "95" },
+  { label = "88（均衡，默认）", value = "88" },
+  { label = "75（小一点）", value = "75" },
+  { label = "60（很小，看得出）", value = "60" },
+]
+
+[[action.argument]]
+key = "strip_meta"
+label = "顺便去掉元数据"
+kind = "toggle"
+flag = "--strip"
+default = "false"
+help = "EXIF / ICC / 注释一并删掉，文件更小、也不会带拍摄位置"
+
+[[action.argument]]
+key = "recursive"
+label = "连子目录一起处理"
+kind = "toggle"
+flag = "--recursive"
+default = "false"
+help = "输出目录里保持相同的相对目录结构"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已存在的输出"
+kind = "toggle"
+flag = "--overwrite"
+default = "false"
+help = "关着的时候遇到同名文件就跳过，不会默默盖掉"
+
+[[action.argument]]
+key = "dry_run"
+label = "只预演，不动文件"
+kind = "toggle"
+flag = "--dry-run"
+default = "false"
+help = "把将要执行的 magick 命令打印出来，什么都不写"
+
+# ── 批量缩放 ────────────────────────────────────────────────────────────────
+
+[[action]]
+id = "image-batch-resize"
+name = "批量缩放"
+summary = "把一个目录里的图片批量缩到指定尺寸：限制在框内、强行拉伸、或填满后裁剪"
+domain = "图像"
+tags = ["图片", "imagemagick", "批量", "缩放"]
+program = "image-batch"
+base_argv = ["resize"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S imagemagick"
+input = "一个目录里的图片"
+output = "缩放后的图片，落在输出目录"
+features = "目录 + 通配 + 输出目录；宽高可只给一个；三种适配方式；默认按 EXIF 转正"
+
+[[action.argument]]
+key = "input_dir"
+label = "输入目录"
+kind = "path"
+flag = "--input-dir"
+required = true
+default = "."
+dir_only = true
+help = "从哪个目录读图片；默认当前目录"
+
+[[action.argument]]
+key = "glob"
+label = "通配"
+kind = "text"
+flag = "--glob"
+required = true
+default = "*.jpg"
+help = "挑哪些文件，可写多个用逗号隔开，例如 *.jpg,*.png"
+
+[[action.argument]]
+key = "output_dir"
+label = "输出目录"
+kind = "path"
+flag = "--output-dir"
+required = true
+default = "./out"
+help = "写到哪个目录；不存在会建出来"
+
+[[action.argument]]
+key = "width"
+label = "宽度（像素）"
+kind = "text"
+flag = "--width"
+default = "1600"
+help = "目标宽度；和高度至少给一个。只给一个时另一边按比例走"
+
+[[action.argument]]
+key = "height"
+label = "高度（像素）"
+kind = "text"
+flag = "--height"
+help = "目标高度；留空表示不限"
+
+[[action.argument]]
+key = "fit"
+label = "适配方式"
+kind = "choice"
+flag = "--fit"
+required = true
+default = "inside"
+help = "比例不一致时怎么办"
+choices = [
+  { label = "限制在框内，不放大（>）", value = "inside" },
+  { label = "填满目标框后居中裁剪（^ + extent）", value = "cover" },
+  { label = "强行拉伸到指定尺寸（!）", value = "stretch" },
+]
+
+[[action.argument]]
+key = "quality"
+label = "有损质量"
+kind = "choice"
+flag = "--quality"
+default = "88"
+help = "只对 jpg / webp / avif 这类有损格式生效"
+choices = [
+  { label = "95（几乎无损）", value = "95" },
+  { label = "88（均衡，默认）", value = "88" },
+  { label = "75（小一点）", value = "75" },
+  { label = "60（很小，看得出）", value = "60" },
+]
+
+[[action.argument]]
+key = "no_auto_orient"
+label = "不按 EXIF 方向转正"
+kind = "toggle"
+flag = "--no-auto-orient"
+default = "false"
+help = "默认会按 EXIF Orientation 把照片转正；打开这个开关就保持原始像素方向"
+
+[[action.argument]]
+key = "recursive"
+label = "连子目录一起处理"
+kind = "toggle"
+flag = "--recursive"
+default = "false"
+help = "输出目录里保持相同的相对目录结构"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已存在的输出"
+kind = "toggle"
+flag = "--overwrite"
+default = "false"
+help = "关着的时候遇到同名文件就跳过"
+
+[[action.argument]]
+key = "dry_run"
+label = "只预演，不动文件"
+kind = "toggle"
+flag = "--dry-run"
+default = "false"
+help = "把将要执行的 magick 命令打印出来，什么都不写"
+
+# ── 批量去元数据 ────────────────────────────────────────────────────────────
+
+[[action]]
+id = "image-batch-strip"
+name = "批量去元数据"
+summary = "把图片里的 EXIF / ICC / 注释等元数据整批删掉，文件更小也更干净"
+domain = "图像"
+tags = ["图片", "imagemagick", "批量", "元数据"]
+program = "image-batch"
+base_argv = ["strip"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S imagemagick"
+input = "一个目录里的图片"
+output = "去掉元数据的图片，落在输出目录"
+features = "目录 + 通配 + 输出目录；保持文件名与格式；可递归；默认跳过已存在的"
+
+[[action.argument]]
+key = "input_dir"
+label = "输入目录"
+kind = "path"
+flag = "--input-dir"
+required = true
+default = "."
+dir_only = true
+help = "从哪个目录读图片；默认当前目录"
+
+[[action.argument]]
+key = "glob"
+label = "通配"
+kind = "text"
+flag = "--glob"
+required = true
+default = "*.jpg"
+help = "挑哪些文件，可写多个用逗号隔开，例如 *.jpg,*.png"
+
+[[action.argument]]
+key = "output_dir"
+label = "输出目录"
+kind = "path"
+flag = "--output-dir"
+required = true
+default = "./out"
+help = "写到哪个目录；不存在会建出来。它和输入目录是分开的"
+
+[[action.argument]]
+key = "recursive"
+label = "连子目录一起处理"
+kind = "toggle"
+flag = "--recursive"
+default = "false"
+help = "输出目录里保持相同的相对目录结构"
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已存在的输出"
+kind = "toggle"
+flag = "--overwrite"
+default = "false"
+help = "关着的时候遇到同名文件就跳过"
+
+[[action.argument]]
+key = "dry_run"
+label = "只预演，不动文件"
+kind = "toggle"
+flag = "--dry-run"
+default = "false"
+help = "把将要执行的 magick 命令打印出来，什么都不写"
+
+# ── 外部依赖 ────────────────────────────────────────────────────────────────
+
+[[dependencies]]
+command = "magick"
+hint = "sudo pacman -S imagemagick"

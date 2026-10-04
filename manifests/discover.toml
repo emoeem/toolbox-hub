@@ -1,0 +1,18 @@
+# 「发现」域里唯一的一项：它不是一个命令，而是工具箱自己的界面
+# （mode = "native"，program 写的是界面名而不是可执行文件）。
+#
+# 真正干活的界面在 src/app/repo_view.rs + src/ui/repository.rs，
+# 数据与动作全部走 src/repository/（和 CLI 用的是同一段代码）。
+
+[[action]]
+id = "repository-center"
+name = "工具仓库 · 发现"
+summary = "搜索 / 安装 / 更新 / 卸载远程的 ToolHub 工具包（和 pacman/AUR 无关）"
+domain = "发现"
+tags = ["仓库"]
+program = "repository-center"
+mode = "native"
+pin = 0
+input = "关键词 / 包名"
+output = "搜索与安装结果"
+features = "发现 / 已安装 / 仓库 三个面板；索引带缓存，离线可用"

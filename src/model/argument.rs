@@ -30,6 +30,12 @@ pub enum ArgKind {
     Choice,
     /// 开关：打开时追加 `flag`，关闭时什么都不加。
     Toggle,
+    /// **动态候选**：取值来自命令输出，而不是 manifest 里写死的列表。
+    ///
+    /// 这是从 navi 的 cheatsheet 学来的一条：让用户记住「有哪些编码器 / 哪些分支 /
+    /// 哪些容器」是没道理的，机器自己知道。`source` 说明候选从哪来
+    /// （见 `crate::dynamic`），填法与 `Text` 相同，只是表单里会列出候选。
+    Dynamic,
 }
 
 /// `Choice` 的一个选项：**显示给用户的文字**和**真正进 argv 的值**是两回事。
@@ -111,6 +117,15 @@ pub struct Argument {
     pub repeat_flag: bool,
     /// 多值之间的分隔符，`repeatable` 为真时才有意义。默认逗号。
     pub separator: String,
+    /// `Dynamic` 的候选从哪来。两种写法：
+    ///
+    /// * 内置名字：`git-branches` / `docker-containers` / `ffmpeg-video-codecs` …
+    /// * `command:<命令行>`，或者任何不像名字的字符串 —— 会被当成一条命令跑。
+    ///
+    /// **不经过 shell**：命令串只在空白与引号处切开，然后作为 argv 交给进程。
+    /// 所以管道、重定向、`$VAR` 展开都不会发生 —— 这是刻意的，
+    /// 见 `crate::dynamic::split_command`。
+    pub source: Option<String>,
     /// 这个字段要填的是**目录**（例如 aria2c 的保存目录）：
     /// 选择器里会提示用 `Ctrl-D` 挑当前目录。
     pub dir_only: bool,
@@ -390,6 +405,7 @@ mod tests {
                     flag_join: false,
                     repeatable: false,
                     repeat_flag: false,
+                    source: None,
                     separator: String::from(","),
                     dir_only: false,
                     placement: ArgPlacement::Trailing,
@@ -410,6 +426,7 @@ mod tests {
                     flag_join: false,
                     repeatable: false,
                     repeat_flag: false,
+                    source: None,
                     separator: String::from(","),
                     dir_only: false,
                     placement: ArgPlacement::Middle,
@@ -427,6 +444,7 @@ mod tests {
                     flag_join: false,
                     repeatable: false,
                     repeat_flag: false,
+                    source: None,
                     separator: String::from(","),
                     dir_only: false,
                     placement: ArgPlacement::Middle,

@@ -1,0 +1,399 @@
+# ffmpeg-extra-recipes 的动作定义 —— 只放 recipe，不放脚本。
+#
+# 这个包里**一个可执行文件都没有**：所有动作都直接调用你系统里已经装好的
+# ffmpeg / ffprobe（索引里的 dependencies 声明了 ffmpeg，缺了会提示安装命令）。
+#
+# 这些是内置默认清单里没有的几条：抽帧、封面图、裁画面、响度归一、拼接、列流。
+# 每条命令都按「ffmpeg 全局选项 → 输入 → 输出选项 → 输出文件」的顺序拼出来：
+#   * base_argv 打头（-nostats / -progress 是给工具箱画进度条用的）；
+#   * placement = "leading" 的参数排在输入文件那一段；
+#   * 其余带 flag 的参数落中间；
+#   * 不带 flag 的位置参数（输出文件）落最后。
+
+# ── 抽帧：一段视频变成一串 JPG ──────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-extra-frames"
+name = "视频抽帧成图片"
+summary = "每隔几秒抽一帧存成 JPG，用来做预览图或时间轴"
+domain = "媒体"
+tags = ["转码", "图片"]
+program = "ffmpeg"
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+# 批量：每个输入各跑一次，输出模板里的 {stem} 会把它们区分开。
+foreach = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "一串 JPG（落在输出目录）"
+features = "抽帧间隔可选；JPEG 质量可选；支持一次处理多个视频"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+repeatable = true
+placement = "leading"
+help = "要抽帧的视频；多个用逗号隔开，每个各跑一次"
+
+[[action.argument]]
+key = "rate"
+label = "抽帧间隔"
+kind = "choice"
+flag = "-vf"
+required = true
+default = "fps=1/5"
+help = "fps=1/5 就是每 5 秒一帧；数字越大越稀疏"
+choices = [
+  { label = "每秒 1 帧", value = "fps=1" },
+  { label = "每 2 秒 1 帧", value = "fps=1/2" },
+  { label = "每 5 秒 1 帧", value = "fps=1/5" },
+  { label = "每 10 秒 1 帧", value = "fps=1/10" },
+]
+
+[[action.argument]]
+key = "quality"
+label = "JPEG 质量"
+kind = "choice"
+flag = "-q:v"
+help = "数字越小画质越好、体积越大；2 几乎无损"
+choices = [
+  { label = "2（最好）", value = "2" },
+  { label = "5（均衡）", value = "5" },
+  { label = "10（最小）", value = "10" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会停下来问你"
+
+[[action.argument]]
+key = "output"
+label = "输出"
+kind = "path"
+required = true
+default = "{dir}/{stem}_%04d.jpg"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板；%04d 是帧号占位，别去掉"
+
+# ── 封面图：只取某一刻的一帧 ────────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-extra-thumbnail"
+name = "取一张封面图"
+summary = "在指定时间点抓一帧存成 JPG，当封面或预览图"
+domain = "媒体"
+tags = ["转码", "图片"]
+program = "ffmpeg"
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+foreach = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "一张 JPG"
+features = "时间点可选（快进到该点再解码）；取几帧可调；JPEG 质量可选"
+
+[[action.argument]]
+key = "at"
+label = "时间点"
+kind = "text"
+flag = "-ss"
+default = "00:00:03"
+placement = "leading"
+help = "抓哪一刻的画面，例如 00:00:03 或 12.5；放在 -i 前面所以是快速定位"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+repeatable = true
+placement = "leading"
+help = "要取封面的视频；多个用逗号隔开，每个各跑一次"
+
+[[action.argument]]
+key = "frames"
+label = "取几帧"
+kind = "text"
+flag = "-frames:v"
+default = "1"
+help = "默认只取一帧；想连拍就改成 10 之类"
+
+[[action.argument]]
+key = "quality"
+label = "JPEG 质量"
+kind = "choice"
+flag = "-q:v"
+help = "数字越小画质越好、体积越大"
+choices = [
+  { label = "2（最好）", value = "2" },
+  { label = "5（均衡）", value = "5" },
+  { label = "10（最小）", value = "10" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "true"
+help = "封面图重做一次是常事，所以默认开着"
+
+[[action.argument]]
+key = "output"
+label = "输出图片"
+kind = "path"
+required = true
+default = "{dir}/{stem}.jpg"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板"
+
+# ── 裁画面：不缩放，只把画面裁成某个比例 ────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-extra-crop"
+name = "裁剪画面（按比例）"
+summary = "把画面裁成方形 / 宽银幕 / 竖屏：不拉伸，多出来的边直接切掉"
+domain = "媒体"
+tags = ["转码"]
+program = "ffmpeg"
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+foreach = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频文件"
+output = "裁好的视频"
+features = "几种常用比例；只重编码视频；音频可选直接拷贝"
+
+[[action.argument]]
+key = "input"
+label = "输入视频"
+kind = "path"
+flag = "-i"
+required = true
+repeatable = true
+placement = "leading"
+help = "要裁的视频；多个用逗号隔开，每个各跑一次"
+
+[[action.argument]]
+key = "shape"
+label = "裁成什么形状"
+kind = "choice"
+flag = "-vf"
+required = true
+default = "crop=ih:ih"
+help = "crop=宽:高，省略偏移就是居中裁"
+choices = [
+  { label = "1:1 方形（居中）", value = "crop=ih:ih" },
+  { label = "16:9 宽银幕", value = "crop=iw:iw*9/16" },
+  { label = "9:16 竖屏", value = "crop=ih*9/16:ih" },
+  { label = "2.35:1 电影画幅", value = "crop=iw:iw/2.35" },
+  { label = "21:9 超宽", value = "crop=iw:iw*9/21" },
+]
+
+[[action.argument]]
+key = "codec"
+label = "视频编码"
+kind = "choice"
+flag = "-c:v"
+required = true
+default = "libx264"
+help = "显式指定，别靠 ffmpeg 的默认编码器 —— 有的机器上默认会落到硬件编码，装不出东西来"
+choices = [
+  { label = "H.264（libx264，通用）", value = "libx264" },
+  { label = "H.265（libx265，同画质更小）", value = "libx265" },
+  { label = "MPEG-4（最保守，兼容老设备）", value = "mpeg4" },
+]
+
+[[action.argument]]
+key = "audio"
+label = "音频怎么处理"
+kind = "choice"
+flag = "-c:a"
+default = "copy"
+help = "画面反正要重编码，音频能拷就拷，省时间也不掉音质"
+choices = [
+  { label = "直接拷贝（不重编码）", value = "copy" },
+  { label = "重编码成 AAC", value = "aac" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会停下来问你"
+
+[[action.argument]]
+key = "output"
+label = "输出视频"
+kind = "path"
+required = true
+default = "{dir}/{stem}_crop.{ext}"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板"
+
+# ── 响度归一：把音量拉齐 ────────────────────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-extra-loudnorm"
+name = "响度归一（EBU R128）"
+summary = "把音量统一到同一个响度，手机 / 音箱 / 各平台之间不再忽大忽小"
+domain = "媒体"
+tags = ["转码", "音频"]
+program = "ffmpeg"
+base_argv = ["-nostats", "-progress", "pipe:1"]
+mode = "capture"
+foreach = "input"
+install = "sudo pacman -S ffmpeg"
+input = "视频或音频"
+output = "响度归一后的文件"
+features = "三档目标响度（手机 / 流媒体 / 广播）；画面直接拷贝不重编码"
+
+[[action.argument]]
+key = "input"
+label = "输入文件"
+kind = "path"
+flag = "-i"
+required = true
+repeatable = true
+placement = "leading"
+help = "要归一的文件；多个用逗号隔开，每个各跑一次"
+
+[[action.argument]]
+key = "target"
+label = "目标响度"
+kind = "choice"
+flag = "-af"
+required = true
+default = "loudnorm=I=-16:TP=-1.5:LRA=11"
+help = "I 是整体响度（LUFS），TP 是峰值上限，LRA 是允许的动态范围"
+choices = [
+  { label = "-16 LUFS（手机 / 播客）", value = "loudnorm=I=-16:TP=-1.5:LRA=11" },
+  { label = "-14 LUFS（流媒体）", value = "loudnorm=I=-14:TP=-1.0:LRA=11" },
+  { label = "-23 LUFS（EBU R128 广播）", value = "loudnorm=I=-23:TP=-2.0:LRA=7" },
+]
+
+[[action.argument]]
+key = "video"
+label = "画面怎么处理"
+kind = "choice"
+flag = "-c:v"
+default = "copy"
+help = "只是调音量而已，画面原样拷贝最快"
+choices = [
+  { label = "直接拷贝（不重编码）", value = "copy" },
+  { label = "重编码成 H.264", value = "libx264" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会停下来问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+default = "{dir}/{stem}_norm.{ext}"
+help = "支持 {stem}/{name}/{ext}/{dir} 模板"
+
+# ── 拼接：按清单把同编码的若干段接起来 ──────────────────────────────────────
+
+[[action]]
+id = "ffmpeg-extra-concat"
+name = "按清单拼接（不重编码）"
+summary = "把同编码的若干段按 list.txt 的顺序接成一个文件，速度接近拷贝"
+domain = "媒体"
+tags = ["转码"]
+program = "ffmpeg"
+# -f concat -safe 0 是输入格式选项，必须在 -i 前面。
+base_argv = ["-nostats", "-progress", "pipe:1", "-f", "concat", "-safe", "0"]
+mode = "capture"
+install = "sudo pacman -S ffmpeg"
+input = "一个 concat 清单文件"
+output = "拼好的文件"
+features = "不重编码；清单里能写绝对路径（-safe 0）；输出容器可选"
+
+[[action.argument]]
+key = "list"
+label = "清单文件"
+kind = "path"
+flag = "-i"
+required = true
+placement = "leading"
+help = "每行写 file '/绝对/路径/片段.mp4' 的文本文件；路径要加单引号"
+
+[[action.argument]]
+key = "codec"
+label = "编码"
+kind = "choice"
+flag = "-c"
+default = "copy"
+help = "片段编码一致时用「直接拷贝」，否则会报时间戳 / 参数不匹配"
+choices = [
+  { label = "直接拷贝（最快）", value = "copy" },
+  { label = "重编码成 H.264", value = "libx264" },
+  { label = "重编码成 H.265", value = "libx265" },
+]
+
+[[action.argument]]
+key = "overwrite"
+label = "覆盖已有文件"
+kind = "toggle"
+flag = "-y"
+default = "false"
+help = "关着的话，输出已存在时 ffmpeg 会停下来问你"
+
+[[action.argument]]
+key = "output"
+label = "输出文件"
+kind = "path"
+required = true
+default = "{dir}/joined.mp4"
+help = "扩展名决定容器；拼接要求各段编码与参数一致"
+
+# ── 列流：ffprobe 一条流一行 ────────────────────────────────────────────────
+
+[[action]]
+id = "ffprobe-extra-streams"
+name = "ffprobe 列出每条流"
+summary = "一行一条流：编号 / 类型 / 编码 / 分辨率 / 码率，方便对比和脚本处理"
+domain = "媒体"
+tags = ["探测"]
+program = "ffprobe"
+base_argv = ["-v", "error", "-show_entries", "stream=index,codec_type,codec_name,width,height,bit_rate"]
+mode = "capture"
+install = "sudo pacman -S ffmpeg"
+input = "媒体文件"
+output = "每条流一行"
+features = "输出格式可选（键值 / JSON / CSV）；不打印外壳信息，直接能喂脚本"
+
+[[action.argument]]
+key = "format"
+label = "输出格式"
+kind = "choice"
+flag = "-of"
+default = "default=noprint_wrappers=1"
+help = "键值对最好读；CSV=p=0 最方便 cut / awk"
+choices = [
+  { label = "键值对（key=value）", value = "default=noprint_wrappers=1" },
+  { label = "JSON", value = "json" },
+  { label = "CSV（不带表头）", value = "csv=p=0" },
+]
+
+[[action.argument]]
+key = "input"
+label = "媒体文件"
+kind = "path"
+required = true
+help = "没写 flag，所以它作为位置参数排在最后"

@@ -1,0 +1,484 @@
+{
+  "schema_version": 1,
+  "name": "ToolHub Official",
+  "packages": [
+    {
+      "id": "demo-actions",
+      "name": "Demo Actions",
+      "version": "1.0.0",
+      "summary": "演示用的一包动作：toolbox.toml + manifest + 脚本",
+      "description": "ToolHub Repository 里的「完整包裹」示例：一个包里同时带命令（demo-echo）与动作定义（demo.toml）。装完之后 demo-echo 落到 ~/.local/bin，manifest 与文档落到包自己的目录，用来演示「命令 + 动作」怎么写、表单填的值怎么变成命令行。零第三方依赖，只用 bash。",
+      "categories": [
+        "tools"
+      ],
+      "tags": [
+        "示例",
+        "manifest",
+        "动作"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [],
+      "requires_root": false,
+      "danger": "safe",
+      "artifact": {
+        "url": "artifacts/demo-actions-1.0.0.tar.gz",
+        "sha256": "6065d36ada929086235d14acd25137cb0235f5ff878b16f84d5b18311fc4edaa",
+        "kind": "tar.gz",
+        "size": 3326
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "3168b6a23ea11f45a0587dc124af390fc33e42afe63d31003bbb50d8f26eff99",
+          "executable": null
+        },
+        {
+          "path": "manifests/demo.toml",
+          "kind": "manifest",
+          "sha256": "b15bb8dbfaab405ef7de1ef011658dbda5224752f4d74c25740af8ac05cda876",
+          "executable": null
+        },
+        {
+          "path": "scripts/demo-echo",
+          "kind": "bin",
+          "sha256": "f9947191483f5ff0267343d2ed5fd1335659ff852eb1b20a0f1ddc3cdb0bb241",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "disk-report",
+      "name": "磁盘占用排查",
+      "version": "1.0.0",
+      "summary": "看看谁占了你的磁盘：目录汇总、最大的文件、按扩展名统计",
+      "description": "一个只读的磁盘占用排查壳子：du/find/sort/awk 拼出来的三条命令，做成表单。可以按深度汇总某个目录（看看这一层谁最占地方）、列出最大的文件（可限最小体积）、按扩展名统计文件数与总大小。默认不跨文件系统，扫 / 时不会掉进挂载的移动硬盘。不写文件、不联网、不需要 root。",
+      "categories": [
+        "system"
+      ],
+      "tags": [
+        "disk",
+        "du",
+        "find",
+        "磁盘",
+        "占用"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "du",
+          "hint": "sudo pacman -S coreutils"
+        },
+        {
+          "command": "find",
+          "hint": "sudo pacman -S findutils"
+        }
+      ],
+      "requires_root": false,
+      "danger": "safe",
+      "artifact": {
+        "url": "artifacts/disk-report-1.0.0.tar.gz",
+        "sha256": "64b0877d0dc770585b3cf75281a98e20431113c26af6787884e4fca79af40140",
+        "kind": "tar.gz",
+        "size": 5725
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "7cddfcb67209f0beb21e9eca2fba45856cb70433f03818096f096cef619ceeee",
+          "executable": null
+        },
+        {
+          "path": "manifests/disk-report.toml",
+          "kind": "manifest",
+          "sha256": "a5447b36b4722674a8a5db7ecd950050628a2896a94d0f4c59adca93233776d9",
+          "executable": null
+        },
+        {
+          "path": "scripts/disk-report",
+          "kind": "bin",
+          "sha256": "e6f0aefd461d63ee90fd5cf23ab89d813dc7d09526e9075150a1d5417d00e939",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "docker-cleanup",
+      "name": "Docker 清理与体检",
+      "version": "1.0.0",
+      "summary": "看清 Docker 占了多少磁盘、有哪些容器，再按需清理悬空镜像 / 未用卷 —— 默认只预览",
+      "description": "把 Docker 的磁盘占用、容器清单和可回收对象摆出来，再决定要不要动手。三条体检动作（占用表、容器清单、环境自检）直接调用 docker；清理动作走本包的 scripts/docker-cleanup，默认只列出会被删掉的东西，加 --yes 才真删。悬空镜像、未使用的卷、停掉的容器、没人用的网络、构建缓存各一条，互不牵连。",
+      "categories": [
+        "tools"
+      ],
+      "tags": [
+        "docker",
+        "容器",
+        "清理",
+        "磁盘"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "docker",
+          "hint": "sudo pacman -S docker"
+        }
+      ],
+      "requires_root": false,
+      "danger": "caution",
+      "artifact": {
+        "url": "artifacts/docker-cleanup-1.0.0.tar.gz",
+        "sha256": "e437cdf71d4c5444af85dee4e85083619d247b14d1082211fe1431bb89c726a3",
+        "kind": "tar.gz",
+        "size": 6523
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "d33602532e670ed0ff3172d503b8767a59d812f739d5c41b2d540928decd3525",
+          "executable": null
+        },
+        {
+          "path": "manifests/docker-cleanup.toml",
+          "kind": "manifest",
+          "sha256": "173d7736739d9ca1a7a2a4f15be67a842cf1ae237bbc69fb5f7cd449cca12a2e",
+          "executable": null
+        },
+        {
+          "path": "scripts/docker-cleanup",
+          "kind": "bin",
+          "sha256": "6513b3c92cc7b6fcc67dd0942256f750ac240518126e87c6f4a41ea394fd24cb",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "ffmpeg-extra-recipes",
+      "name": "FFmpeg Extra Recipes",
+      "version": "1.0.0-1",
+      "summary": "只放动作、不放脚本：给 ffmpeg / ffprobe 补几条常用 recipe",
+      "description": "演示「仓库里的包可以只是一个 manifest」。产物里只有 manifests/ffmpeg-extra.toml，没有任何可执行文件；动作直接调用你自己装好的 ffmpeg 与 ffprobe：抽帧、取封面图、按比例裁画面、响度归一、按清单拼接、列出每条流。",
+      "categories": [
+        "media"
+      ],
+      "tags": [
+        "ffmpeg",
+        "manifest",
+        "recipe",
+        "媒体"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "ffmpeg",
+          "hint": "sudo pacman -S ffmpeg"
+        },
+        {
+          "command": "ffprobe",
+          "hint": "sudo pacman -S ffmpeg"
+        }
+      ],
+      "requires_root": false,
+      "danger": "safe",
+      "artifact": {
+        "url": "artifacts/ffmpeg-extra-recipes-1.0.0-1.tar.gz",
+        "sha256": "553afbdd2354129f16065ea3ab61db43b43687a7d3b5152a0dc9f2c6e57c807b",
+        "kind": "tar.gz",
+        "size": 4153
+      },
+      "files": [
+        {
+          "path": "manifests/ffmpeg-extra.toml",
+          "kind": "manifest",
+          "sha256": "df195596ed37cf4332e7616fa957613446dde988317f881d41ae8ddc9bae3904",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "git-worktree",
+      "name": "Worktree 与分支管理",
+      "version": "1.0.0",
+      "summary": "git worktree / 分支的日常管理：列出来、开新的、清理已合并的",
+      "description": "围绕 git worktree 与分支的五件日常事：列出所有 worktree、给某个分支开一个独立工作目录（可从已有分支，也可顺手开新分支并指定起点）、列出已经合并进 main 的分支、删掉这些已合并分支（默认只列出来，加 --delete 才动手）、清掉目录已经没了却还留在 .git 里的 worktree 记录。所有子命令都能用 --repo 换仓库；分支参数在表单里会列出当前仓库的分支当候选。不联网、不需要 root。",
+      "categories": [
+        "dev"
+      ],
+      "tags": [
+        "git",
+        "worktree",
+        "分支",
+        "开发"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "git",
+          "hint": "sudo pacman -S git"
+        }
+      ],
+      "requires_root": false,
+      "danger": "caution",
+      "artifact": {
+        "url": "artifacts/git-worktree-1.0.0.tar.gz",
+        "sha256": "0da0dd4a3225b08c5d3cf1540c624b35d386fb6971d9ec2a45b9c8afebe5faa0",
+        "kind": "tar.gz",
+        "size": 6685
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "261935e9d14fc847398ab0e7c0d2416c4855a87c17bac21d09e2dcf5814ec714",
+          "executable": null
+        },
+        {
+          "path": "manifests/git-worktree.toml",
+          "kind": "manifest",
+          "sha256": "8186618fd1837adf890de4b90e82e784ebd3ce2ed680eee722daf9a302f7f6b9",
+          "executable": null
+        },
+        {
+          "path": "scripts/git-worktree",
+          "kind": "bin",
+          "sha256": "ffc9daf012ddd5968f3fcf15690bc07c4d14fab1084cd39e112fcc1c94cc5e50",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "hello-tool",
+      "name": "Hello Tool",
+      "version": "1.0.0",
+      "summary": "打个招呼，顺手报一下本机概况（系统 / 内核 / 运行时长 / 内存 / 根分区）",
+      "description": "单文件 shell 脚本的最小示例包：零第三方依赖，只用 bash 与 coreutils。默认打印问候语与本机概况，--json 输出一份机器可读的，-q 只要问候语。适合用来确认「加仓库 → 搜索 → 安装 → 运行」这条链路是通的。",
+      "categories": [
+        "tools"
+      ],
+      "tags": [
+        "示例",
+        "shell",
+        "系统信息"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [],
+      "requires_root": false,
+      "danger": "safe",
+      "artifact": {
+        "url": "artifacts/hello-tool-1.0.0.tar.gz",
+        "sha256": "5cbd1283f4c2377308eb47761282eb40c774c124dd226a3ba0231769f1ba9f4f",
+        "kind": "tar.gz",
+        "size": 2408
+      },
+      "files": [
+        {
+          "path": "scripts/hello-tool",
+          "kind": "bin",
+          "sha256": "6908602113385422c03038e1d458bd01822bdd4487081c3f1a551cbf834ca7a8",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "image-batch",
+      "name": "批量图片处理",
+      "version": "1.0.0",
+      "summary": "批量转格式 / 缩放 / 去元数据：目录 + 通配 + 输出目录",
+      "description": "给一个目录、一个通配符、一个输出目录，剩下的交给 ImageMagick：批量转格式（jpg / png / webp / avif / tiff / gif / bmp）、批量缩放（限制在框内 / 填满后裁剪 / 强行拉伸，可只给宽或高）、批量去元数据（-strip）。支持递归子目录并保持相对结构，默认跳过已存在的输出，不会默默覆盖；有 --dry-run 可以先看会执行哪些命令。会往输出目录写文件，所以 danger 标了 caution。",
+      "categories": [
+        "image"
+      ],
+      "tags": [
+        "imagemagick",
+        "magick",
+        "图片",
+        "批量",
+        "缩放",
+        "转格式"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "magick",
+          "hint": "sudo pacman -S imagemagick"
+        }
+      ],
+      "requires_root": false,
+      "danger": "caution",
+      "artifact": {
+        "url": "artifacts/image-batch-1.0.0.tar.gz",
+        "sha256": "e1fc5419a7f77e2fea39bb275acb476ecb3381428cf856e0bc1742866f0096d1",
+        "kind": "tar.gz",
+        "size": 7498
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "9c23c0dbb64a3dd2f947a7588b0c0a73fce642989509a1df1c6ff8881de749ca",
+          "executable": null
+        },
+        {
+          "path": "manifests/image-batch.toml",
+          "kind": "manifest",
+          "sha256": "9570ea7074881c5929c356aa3eaf736933f805f667d44f92a275bb9277835cf4",
+          "executable": null
+        },
+        {
+          "path": "scripts/image-batch",
+          "kind": "bin",
+          "sha256": "2da6b59845145dcefbb99e3ebcb9829dfa478a1c5953f45f54131a8cc47676f2",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "net-diagnose",
+      "name": "网络诊断",
+      "version": "1.0.0",
+      "summary": "一个域名/IP 的 DNS 解析、连通性、路由、端口连通性，以及本机出口 IP 与 DNS 配置",
+      "description": "排查「网不通」的标准四件套：域名解析（dig）、连通性（ping，次数可填）、路由（traceroute，跳数可填）、端口通不通（nc -z，端口可填），外加一条只看本机的体检 —— 本机地址、默认路由、出口源地址、DNS 配置到底是谁。DNS / ping / traceroute / 端口这四条直接调用系统里已有的命令，缺了会提示装；本机体检走包里的 scripts/net-diagnose。全部只读，不改任何网络配置。",
+      "categories": [
+        "network"
+      ],
+      "tags": [
+        "网络",
+        "诊断",
+        "dns",
+        "ping",
+        "traceroute"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "dig",
+          "hint": null
+        },
+        {
+          "command": "ip",
+          "hint": "sudo pacman -S iproute2"
+        },
+        {
+          "command": "nc",
+          "hint": null
+        },
+        {
+          "command": "ping",
+          "hint": null
+        },
+        {
+          "command": "traceroute",
+          "hint": null
+        }
+      ],
+      "requires_root": false,
+      "danger": "safe",
+      "artifact": {
+        "url": "artifacts/net-diagnose-1.0.0.tar.gz",
+        "sha256": "d1f97bd2ea9b7ffdeb1c0d7697948172b1ea19427779b25843770cddcd745b1b",
+        "kind": "tar.gz",
+        "size": 5903
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "8dcfded840c7e9ceb47b917d0eb56e299302e4e84620dc6895a4063581c2068c",
+          "executable": null
+        },
+        {
+          "path": "manifests/net-diagnose.toml",
+          "kind": "manifest",
+          "sha256": "33acf12e912b31fd5bfc3fbbae41a903ec0bc9ce95e2f4f908303f3326c8917a",
+          "executable": null
+        },
+        {
+          "path": "scripts/net-diagnose",
+          "kind": "bin",
+          "sha256": "3d775c00af6dde7e12fc4da055f58ae1a8684efbf44c0ea6dc5f73ee6f54b717",
+          "executable": null
+        }
+      ]
+    },
+    {
+      "id": "system-cleanup",
+      "name": "系统清理预检",
+      "version": "1.0.0",
+      "summary": "先看清楚能清什么、各有多大：pacman 缓存 / 日志 / ~/.cache / 缩略图 / 孤儿包",
+      "description": "系统清理的「先称重、再动手」：pacman 包缓存、systemd 日志、~/.cache、缩略图、孤儿包各占多少磁盘，一条条列清楚。六条预检动作全部只读，只跑 du / find / journalctl --disk-usage / pacman -Qdtq，不删任何东西。唯一的清理动作只针对 pacman 缓存，默认走 paccache --dryrun 预览，加 --yes 才真删，而且真删需要 root —— 提不了权就把该跑的命令原样打出来。",
+      "categories": [
+        "system"
+      ],
+      "tags": [
+        "清理",
+        "磁盘",
+        "pacman",
+        "系统"
+      ],
+      "author": "emo",
+      "license": "MIT",
+      "source": "https://github.com/emoeem/toolbox-hub",
+      "homepage": null,
+      "dependencies": [
+        {
+          "command": "paccache",
+          "hint": "sudo pacman -S pacman-contrib"
+        }
+      ],
+      "requires_root": false,
+      "danger": "caution",
+      "artifact": {
+        "url": "artifacts/system-cleanup-1.0.0.tar.gz",
+        "sha256": "911dfabf5b9ecb0316da787a65be10af397e9566de4de3f100a7811147fe1eef",
+        "kind": "tar.gz",
+        "size": 6436
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "kind": "doc",
+          "sha256": "69b1a6f251e6cb26e587cda3d53a1947e155d709fac6d01a1f9dfc059d7b10f3",
+          "executable": null
+        },
+        {
+          "path": "manifests/system-cleanup.toml",
+          "kind": "manifest",
+          "sha256": "96dffe5a78481970532439fcdd27bfe3d96d4fa48e25536824247777c0b9fa01",
+          "executable": null
+        },
+        {
+          "path": "scripts/sysclean",
+          "kind": "bin",
+          "sha256": "d53cab6510abc5844740294bc1d746937222f5d8cae9e6a6151f6ab5d354d191",
+          "executable": null
+        }
+      ]
+    }
+  ]
+}

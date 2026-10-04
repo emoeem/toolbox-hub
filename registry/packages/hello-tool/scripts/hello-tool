@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# hello-tool —— 打个招呼，顺手报一下本机概况。
+#
+# 这是 ToolHub Repository 里的最小示例包：单文件、零第三方依赖（只用 bash 与
+# coreutils / procfs 里最普通的那几样），装到 ~/.local/bin/hello-tool。
+#
+# 退出码：0 正常；2 用法不对。
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="${0##*/}"
+AS_JSON=0
+QUIET=0
+
+usage() {
+    cat <<EOF
+用法: $PROG [选项]
+
+打个招呼，并打印本机概况（系统 / 内核 / 运行时长 / 内存 / 根分区）。
+
+选项:
+  -j, --json     输出一份 JSON，方便喂给别的工具
+  -q, --quiet    只打印问候语
+  -h, --help     显示这份帮助
+  -V, --version  显示版本
+EOF
+}
+
+die() { printf '%s: %s（-h 看用法）\n' "$PROG" "$*" >&2; exit 2; }
+
+for arg in "$@"; do
+    case "$arg" in
+        -j|--json)    AS_JSON=1 ;;
+        -q|--quiet)   QUIET=1 ;;
+        -h|--help)    usage; exit 0 ;;
+        -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        *)            die "不认识的参数「$arg」" ;;
+    esac
+done
+
+# ── 采集：每一项都容错，拿不到就写「未知」，绝不让脚本半路死掉 ──────────────
+
+os_name() {
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        printf '%s' "${PRETTY_NAME:-${NAME:-Linux}}"
+    else
+        printf 'Linux'
+    fi
+}
+
+kernel_name() { uname -sr 2>/dev/null || printf '未知'; }
+
+who() {
+    local user host
+    user="${USER:-}"
+    [ -n "$user" ] || user="$(id -un 2>/dev/null)" || user='?'
+    host="$(hostname 2>/dev/null)" || host='?'
+    printf '%s@%s' "$user" "$host"
+}
+
+uptime_text() {
+    local seconds
+    seconds="$(cut -d. -f1 /proc/uptime 2>/dev/null)" || { printf '未知'; return; }
+    printf '%d 天 %d 小时 %d 分' \
+        "$((seconds / 86400))" "$((seconds % 86400 / 3600))" "$((seconds % 3600 / 60))"
+}
+
+memory_text() {
+    awk '
+        /^MemTotal:/     { total = $2 }
+        /^MemAvailable:/ { free = $2 }
+        END {
+            if (total == 0) { printf "未知"; exit }
+            printf "%.1f GiB 可用 / %.1f GiB", free / 1048576, total / 1048576
+        }
+    ' /proc/meminfo 2>/dev/null || printf '未知'
+}
+
+disk_text() {
+    df -hP / 2>/dev/null | awk 'NR == 2 { printf "%s 可用 / %s（已用 %s）", $4, $2, $5 }' \
+        || printf '未知'
+}
+
+cpu_text() {
+    local cores
+    cores="$(nproc 2>/dev/null)" || cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || cores=''
+    if [ -n "$cores" ]; then printf '%s 核' "$cores"; else printf '未知'; fi
+}
+
+json_escape() {
+    local text="$1"
+    text="${text//\\/\\\\}"
+    text="${text//\"/\\\"}"
+    printf '%s' "$text"
+}
+
+# ── 输出 ────────────────────────────────────────────────────────────────────
+
+OS="$(os_name)"
+KERNEL="$(kernel_name)"
+WHO="$(who)"
+UPTIME="$(uptime_text)"
+MEMORY="$(memory_text)"
+DISK="$(disk_text)"
+CPU="$(cpu_text)"
+
+if [ "$AS_JSON" -eq 1 ]; then
+    cat <<EOF
+{
+  "hello": "$(json_escape "$WHO")",
+  "tool": "$PROG",
+  "version": "$VERSION",
+  "os": "$(json_escape "$OS")",
+  "kernel": "$(json_escape "$KERNEL")",
+  "uptime": "$(json_escape "$UPTIME")",
+  "memory": "$(json_escape "$MEMORY")",
+  "disk_root": "$(json_escape "$DISK")",
+  "cpu": "$(json_escape "$CPU")"
+}
+EOF
+    exit 0
+fi
+
+printf '\n你好，%s —— 欢迎回来。\n\n' "$WHO"
+
+if [ "$QUIET" -eq 0 ]; then
+    printf '  系统      %s\n' "$OS"
+    printf '  内核      %s\n' "$KERNEL"
+    printf '  运行时长  %s\n' "$UPTIME"
+    printf '  内存      %s\n' "$MEMORY"
+    printf '  根分区    %s\n' "$DISK"
+    printf '  处理器    %s\n' "$CPU"
+    printf '\n一切正常，开始干活吧。\n\n'
+fi

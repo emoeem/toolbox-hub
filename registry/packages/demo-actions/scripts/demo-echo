@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# demo-echo —— 把拿到的参数原样回显出来。
+#
+# 它是 demo-actions 包里的「动作命令」：manifests/demo.toml 里的每个参数都对应
+# 这里的一个开关，所以装完之后在 TUI 里填一次表单，就能看清「表单上的值是怎么
+# 变成命令行 argv 的」。
+#
+# 支持: -u/--upper 大写、-n/--number 编号、-b/--banner 标题、-- 结束选项。
+set -euo pipefail
+
+PROG="${0##*/}"
+upper=0
+numbered=0
+banner=""
+words=()
+
+usage() {
+    cat <<EOF
+用法: $PROG [选项] [--] <词>...
+
+选项:
+  -u, --upper          输出改成大写
+  -n, --number         每行前面加编号
+  -b, --banner <文字>  在结果前先打一行标题
+  -h, --help           显示这份帮助
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u|--upper)  upper=1 ;;
+        -n|--number) numbered=1 ;;
+        -b|--banner)
+            if [ $# -lt 2 ]; then
+                printf '%s: -b 后面要跟一个标题\n' "$PROG" >&2
+                exit 2
+            fi
+            banner="$2"
+            shift
+            ;;
+        --banner=*)  banner="${1#--banner=}" ;;
+        -h|--help)   usage; exit 0 ;;
+        --)
+            shift
+            while [ $# -gt 0 ]; do words+=("$1"); shift; done
+            break
+            ;;
+        -*)
+            printf '%s: 不认识的选项「%s」（-h 看用法）\n' "$PROG" "$1" >&2
+            exit 2
+            ;;
+        *) words+=("$1") ;;
+    esac
+    shift
+done
+
+if [ "$upper" -eq 1 ]; then
+    banner="${banner^^}"
+fi
+
+if [ -n "$banner" ]; then
+    printf '%s\n' "$banner"
+fi
+
+if [ "${#words[@]}" -eq 0 ]; then
+    printf '%s: 一个词都没给（-h 看用法）\n' "$PROG" >&2
+    exit 2
+fi
+
+index=0
+for word in "${words[@]}"; do
+    index=$((index + 1))
+    if [ "$upper" -eq 1 ]; then
+        word="${word^^}"
+    fi
+    if [ "$numbered" -eq 1 ]; then
+        printf '%2d. %s\n' "$index" "$word"
+    else
+        printf '%s\n' "$word"
+    fi
+done

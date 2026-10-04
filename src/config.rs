@@ -30,14 +30,19 @@ use crate::packages::SortMode;
 pub const CONFIG_ENV: &str = "TOOLBOX_HUB_CONFIG";
 /// 覆盖数据目录的环境变量。
 pub const DATA_ENV: &str = "TOOLBOX_HUB_DATA";
+/// 覆盖缓存目录的环境变量。
+pub const CACHE_ENV: &str = "TOOLBOX_HUB_CACHE";
 
 /// 配置目录名（`$XDG_CONFIG_HOME` 或 `~/.config` 之下）。
 const CONFIG_LEAF: &str = "toolbox-hub";
 /// 数据目录名（`$XDG_DATA_HOME` 或 `~/.local/share` 之下）。
 const DATA_LEAF: &str = "toolbox-hub";
+/// 缓存目录名（`$XDG_CACHE_HOME` 或 `~/.cache` 之下）。
+const CACHE_LEAF: &str = "toolbox-hub";
 
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// 启动时定下两个目录（`None` 表示「用默认/环境变量」）。
 ///
@@ -58,6 +63,19 @@ pub fn data_dir() -> PathBuf {
     DATA_DIR.get().cloned().unwrap_or_else(default_data_dir)
 }
 
+/// 缓存目录（仓库索引这类**可再生**的东西）。
+///
+/// 单独一个目录的理由和配置/数据分开一样：缓存删掉不该有任何后果，
+/// 所以它不该混在数据目录里，被人误当成需要备份的东西。
+pub fn cache_dir() -> PathBuf {
+    CACHE_DIR.get().cloned().unwrap_or_else(default_cache_dir)
+}
+
+/// 定下缓存目录（只认第一次调用，和 configure 一个道理）。
+pub fn configure_cache(dir: Option<PathBuf>) {
+    let _ = CACHE_DIR.set(dir.unwrap_or_else(default_cache_dir));
+}
+
 fn default_config_dir() -> PathBuf {
     if let Some(dir) = env::var_os(CONFIG_ENV) {
         return PathBuf::from(dir);
@@ -70,6 +88,13 @@ fn default_data_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     xdg("XDG_DATA_HOME", ".local/share").join(DATA_LEAF)
+}
+
+fn default_cache_dir() -> PathBuf {
+    if let Some(dir) = env::var_os(CACHE_ENV) {
+        return PathBuf::from(dir);
+    }
+    xdg("XDG_CACHE_HOME", ".cache").join(CACHE_LEAF)
 }
 
 /// XDG 那套：环境变量指了就用它（相对路径按规范忽略），否则 `$HOME/<fallback>`。

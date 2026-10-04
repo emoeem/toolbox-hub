@@ -39,6 +39,13 @@ pub enum Action {
     ClearCache,
     /// `ui …`：给脚本用的界面组件（确认框 / 翻页器 / 选文件）。
     Ui(crate::components::UiCommand),
+    /// `repo …` / `search` / `info` / `install` / `uninstall` / `update` /
+    /// `list` / `run`：**ToolHub 自己的工具包**。
+    ///
+    /// 刻意和上面那批 `-s/-i/-r/-u/-l` 分开：那批管的是 pacman/AUR 的软件包，
+    /// 这批管的是工具箱仓库里的工具包。两者后果完全不同（卸错一个 Arch 包会拆掉
+    /// 系统），所以命令名也必须不同。
+    Repository(Box<crate::repository::cli::Command>),
     Help,
     Version,
 }
@@ -89,7 +96,25 @@ where
     let mut news_scope: Option<NewsFilter> = None;
     let mut list_scope: Option<InstalledFilter> = None;
 
-    let mut args = args.into_iter().peekable();
+    let mut raw: Vec<String> = args.into_iter().collect();
+    strip_global_options(&mut raw, &mut dirs, &mut dry_run)?;
+
+    // 动词必须出现在最前面（全局选项之外）。它们是仓库类命令，和老的单横线命令
+    // 走不同的解析路径 —— 老路径把位置参数当「脚本目录」。
+    if let Some(verb) = raw
+        .first()
+        .cloned()
+        .filter(|word| crate::repository::cli::is_verb(word))
+    {
+        let rest = raw.split_off(1);
+        if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+            return Ok(command(dry_run, dirs, Action::Help));
+        }
+        let parsed = crate::repository::cli::parse(&verb, &rest)?;
+        return Ok(command(dry_run, dirs, Action::Repository(Box::new(parsed))));
+    }
+
+    let mut args = raw.into_iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
@@ -171,6 +196,44 @@ where
         dirs,
         action: chosen,
     }))
+}
+
+/// 把「放在哪儿都认」的选项摘出来（--dry-run / --config-dir / --data-dir）。
+///
+/// 动词命令（repo / install / …）也需要这三个，但它们不该跟着动词的解析器走，
+/// 所以先统一摘掉，剩下的才是动词自己的参数。
+fn strip_global_options(
+    args: &mut Vec<String>,
+    dirs: &mut Dirs,
+    dry_run: &mut bool,
+) -> Result<(), String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].clone();
+        match arg.as_str() {
+            "--dry-run" => {
+                *dry_run = true;
+                args.remove(index);
+            }
+            "--config-dir" | "--data-dir" => {
+                if index + 1 >= args.len() {
+                    return Err(format!("{arg} 后面要跟一个值"));
+                }
+                let value = args.remove(index + 1);
+                if value.trim().is_empty() {
+                    return Err(format!("{arg} 后面的值是空的"));
+                }
+                if arg == "--config-dir" {
+                    dirs.config = Some(PathBuf::from(value));
+                } else {
+                    dirs.data = Some(PathBuf::from(value));
+                }
+                args.remove(index);
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
 }
 
 fn command(dry_run: bool, dirs: Dirs, action: Action) -> Invocation {
@@ -371,6 +434,11 @@ pub fn run(options: &Options) -> Result<(), String> {
             let (program, argv) = packages::escalate(&program, &argv);
             execute(&program, &argv, options.dry_run, "清包缓存")
         }
+        // 仓库/工具命令：全部走 repository::service —— 和 TUI 是**同一段代码**。
+        Action::Repository(command) => {
+            let service = crate::repository::Service::from_config();
+            crate::repository::cli::run(command, &service, &tool_bin_dir(), options.dry_run)
+        }
         // 组件自己管退出码（0 选了 / 1 取消 / 2 环境不支持），所以在这里就地退出：
         // 让 main 再映射一遍会把 1 和 2 混成同一个。
         Action::Ui(command) => match crate::components::run(command.clone()) {
@@ -406,7 +474,7 @@ Toolbox Hub —— Linux CLI 工具箱（TUI + 命令行两用）
       --remove-orphans       卸载孤儿包
       --clear-cache          清包缓存（paccache -rk1，没有 paccache 才退回 pacman -Sc）
 
-界面组件（给你自己的脚本用；结果走 stdout，界面走 stderr）:
+界面组件（给你自己的脚本用；结果走 stdout，界面走 /dev/tty）:
   ui confirm <文案>          弹一个确认框。退出码 0=确认 1=取消
       --yes <文字>           确认按钮的文字（默认「确认」）
       --no <文字>            取消按钮的文字（默认「取消」）
@@ -414,11 +482,53 @@ Toolbox Hub —— Linux CLI 工具箱（TUI + 命令行两用）
       --default yes|no       没有终端时用这个答案（cron / CI 用）
   ui pager [文件]            翻页器：`cmd | toolbox-hub ui pager`；不是终端就原样透传
       --title <文字>         标题（默认「输出」）
-  ui pick                    在终端里挑文件，选中的路径打到 stdout（一行一个）
+  ui pick                    挑文件，选中的路径打到 stdout（一行一个）
+                             优先交给外部文件管理器（默认 yazi），没装才用内置的
+                             在 yazi 里：Enter = 选中并退出，空格多选
+                             选目录要先进到那个目录再退出（chooser 只认文件）
       --dir <目录>           从哪个目录开始（默认当前目录）
-      --filter <词>          预先填进过滤框
-      --multi                多选（Tab 标记，Enter 收工）
-      --dir-only             只让选目录
+      --filter <词>          预先填进过滤框（只有内置选择器认；yazi 里按 / 现打）
+      --multi                多选（yazi 里空格标记，内置里 Tab 标记）
+      --dir-only             只让选目录（yazi 里 = 退出时所在的目录）
+                             换程序：设 TOOLBOX_HUB_FILE_MANAGER；设 builtin 用内置的
+
+工具仓库（ToolHub 自己的工具包，和上面的 pacman 命令是两回事）:
+  repo list                  看有哪些仓库
+  repo add <地址>            加一个仓库（URL / 本地路径 / file://…）
+      --name <名字>          显示名（默认从地址里猜）
+      --trust <等级>         trusted / verified / community / unknown
+      --priority <整数>      越小越优先（同名包取优先级高的仓库）
+  repo remove <id>           删掉一个仓库
+  repo enable <id>           启用
+  repo disable <id>          停用（搜索与安装都不再看它）
+  repo update [id]           刷新索引（不带 id = 全部已启用仓库）
+  repo search <词>           只在仓库里搜
+  repo path                  打印索引缓存目录
+  search <词>                本地工具 + 仓库里的包一起搜
+      --scope <范围>         all / available / installed / upgradable
+  info <名字>                看详情（仓库里的包会给完整安装计划；本地工具给参数表）
+  install <包...>            安装（会先打印来源 / 依赖 / 文件 / 哈希再动手）
+      --allow-unverified     来源没提供 SHA-256 时才需要，表示你接受这一点
+  uninstall <包...>          卸载；你改过的文件不会被删
+      --purge                连你改过的那些也一起删
+  list                       列已安装的工具包
+  update                     把已安装的工具包升到最新（会先列出来）
+      --check                只检查不升级；有更新时退出码 10（给脚本 / 定时任务用）
+  run <工具> [--字段 值]…    填好参数直接跑；--dry-run 只看命令
+                             例：toolbox-hub run ffmpeg-compress --input a.mkv --crf 20
+
+写插件（作者工具；服务的是「写包的人」，和上面「装包」那批是两回事）:
+  new <包名>                 造一个新插件骨架（生成出来就能直接跑通）
+      --kind script|recipe   script = 自带脚本（默认）；recipe = 只包装已装的 CLI
+      --dir <目录>           放哪儿（默认仓库的 packages/，否则当前目录）
+      --description <一句话>
+      --domain <域>          媒体/图像/系统/网络/开发/工具/包管理/打包/发现
+      --program <命令>       动作要跑的命令（默认脚本名，recipe 默认 jq）
+  check [目录]               校验插件包或整个仓库；有错返回 1
+  build [目录]               打包 + 重建 index.json（可复现：两次构建逐字节相同）
+      --stamp                给索引盖时间戳（默认不盖，否则索引不再可复现）
+
+  写插件的完整说明见 docs/plugin-authoring.md
 
 通用:
       --dry-run              只打印将要执行的命令，不动系统
@@ -433,6 +543,14 @@ TUI 里的按键: 进界面按 ? 看全部（包管理是 p 键）。
 ";
 
 // ── 各个动作 ────────────────────────────────────────────────────────────────
+
+/// 本地工具目录（和 main.rs 的 resolve_bin_dir 同一套规则）。
+fn tool_bin_dir() -> PathBuf {
+    std::env::var_os("FZF_FFTOOLS_BIN_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin")))
+        .unwrap_or_else(|| PathBuf::from(".local/bin"))
+}
 
 fn search(term: &str) -> Result<(), String> {
     let db = Db::open()?;

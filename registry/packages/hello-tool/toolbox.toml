@@ -1,0 +1,19 @@
+# hello-tool 的包元数据。
+#
+# 这个包是**单文件产物**：index.json 里 artifact.kind = "file"，
+# 装出来的就是 scripts/hello-tool 这一个脚本本身。这份 toolbox.toml
+# 留在仓库里描述这个包；id 与 version 必须和索引逐字一致。
+
+[package]
+id = "hello-tool"
+name = "Hello Tool"
+version = "1.0.0"
+summary = "打个招呼，顺手报一下本机概况（系统 / 内核 / 运行时长 / 内存 / 根分区）"
+description = "单文件 shell 脚本的最小示例包：零第三方依赖，只用 bash 与 coreutils。默认打印问候语与本机概况，--json 输出一份机器可读的，-q 只要问候语。适合用来确认「加仓库 → 搜索 → 安装 → 运行」这条链路是通的。"
+categories = ["tools"]
+tags = ["示例", "shell", "系统信息"]
+author = "emo"
+license = "MIT"
+source = "https://github.com/emoeem/toolbox-hub"
+requires_root = false
+danger = "safe"
