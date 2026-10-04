@@ -285,7 +285,7 @@ pub fn fetch(config: &RepositoryConfig, root: &Path, agent: &ureq::Agent) -> Fet
             Err(error) => return failed(config, error, cached),
         }
     } else {
-        match http_get(config, agent, cached.as_ref()) {
+        match http_get_settled(config, agent, cached.as_ref()) {
             HttpOutcome::Body {
                 text,
                 etag,
@@ -385,6 +385,57 @@ enum HttpOutcome {
 /// 条件 GET：带上缓存里的 ETag / Last-Modified。
 ///
 /// 为什么值得做：索引可以有几百 KB，每天后台刷一次却几乎从不变。
+/// 拿到空 body 之后等多久再试一次。
+///
+/// 800ms 是估的：raw.githubusercontent.com 的 CDN 传播通常在 1 秒内完成。
+/// 这是后台线程里的等待，界面看不见。
+const EMPTY_BODY_RETRY_DELAY: Duration = Duration::from_millis(800);
+
+/// 抓一次；拿到**空 body** 就再试一次。
+///
+/// 为什么单为「空」重试：刚 `git push` 完，raw.githubusercontent.com 会先返回
+/// 200 + 0 字节，一两秒后才给真内容 —— 这不是故障，是时序。旧代码把它报成
+/// 「索引不是合法的 JSON：EOF while parsing a value」，
+/// 一句会让人以为仓库挂了的话（实测踩到过）。
+///
+/// 只有「空」才重试：网络错误有明确含义（DNS / TLS / 超时），盲目重试只会让用户
+/// 多等一轮，还看不出到底发生了什么。
+fn http_get_settled(
+    config: &RepositoryConfig,
+    agent: &ureq::Agent,
+    cached: Option<&CachedIndex>,
+) -> HttpOutcome {
+    let first = http_get(config, agent, cached);
+    let HttpOutcome::Body { text, .. } = &first else {
+        return first;
+    };
+    if !text.trim().is_empty() {
+        return first;
+    }
+
+    std::thread::sleep(EMPTY_BODY_RETRY_DELAY);
+    // 第二次不带条件头：上一轮的 ETag 我们没存下来（内容不可用），
+    // 拿它发条件请求只会换回一个 304。
+    match http_get(config, agent, None) {
+        HttpOutcome::Body {
+            text,
+            etag,
+            last_modified,
+        } if !text.trim().is_empty() => HttpOutcome::Body {
+            text,
+            etag,
+            last_modified,
+        },
+        // 第二次还是空（或反过来给了 304）：给一句能照着做的建议。
+        HttpOutcome::Body { .. } | HttpOutcome::NotModified => HttpOutcome::Failed(format!(
+            "{} 返回了空内容。刚推送完的话等几秒再试一次；也可能是镜像 / CDN 还没同步到这台              机器就近的节点",
+            config.index
+        )),
+        // 第二次真的报错了：那个错误比「空」更有信息量，照实传出去。
+        HttpOutcome::Failed(error) => HttpOutcome::Failed(error),
+    }
+}
+
 fn http_get(
     config: &RepositoryConfig,
     agent: &ureq::Agent,
@@ -601,5 +652,135 @@ mod tests {
     fn the_stale_threshold_has_a_sane_default_and_ignores_junk() {
         assert_eq!(stale_after(), DEFAULT_STALE_SECS);
         assert_eq!(DEFAULT_STALE_SECS, 24 * 60 * 60);
+    }
+}
+
+/// 「空 body」这类瞬时故障：要能自愈，自愈不了要会说人话。
+#[cfg(test)]
+mod empty_body_tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use super::*;
+
+    /// 一个只会回几句话的假 HTTP 服务器：按顺序应请求，一句一个，然后退出。
+    ///
+    /// 用它而不是打真网络：这条路径要验的正是「第一次给空、第二次给内容」的时序，
+    /// 真服务器没法被我们摆布。
+    struct TinyServer {
+        port: u16,
+        accepted: Arc<AtomicUsize>,
+    }
+
+    impl TinyServer {
+        fn new(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&accepted);
+            std::thread::spawn(move || {
+                for response in responses {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            Self { port, accepted }
+        }
+
+        fn repo(&self) -> RepositoryConfig {
+            RepositoryConfig {
+                id: String::from("tiny"),
+                name: String::from("Tiny"),
+                index: format!("http://127.0.0.1:{}/index.json", self.port),
+                enabled: true,
+                priority: 0,
+                trust: None,
+                note: None,
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// 就是那次实测拿到的样子：200，但没有正文。
+    fn empty() -> String {
+        String::from("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const SAMPLE: &str = r#"{"schema_version": 1, "packages": [
+        {"id": "a", "name": "A", "version": "1.0.0", "files": [{"path": "scripts/a"}]}
+    ]}"#;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("toolbox-hub-empty-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn an_empty_body_is_retried_and_then_succeeds() {
+        let server = TinyServer::new(vec![empty(), ok(SAMPLE)]);
+        let root = temp_root("retry");
+        let result = fetch(&server.repo(), &root.join("cache"), &agent());
+
+        assert_eq!(server.accepted(), 2, "拿到空 body 应当再试一次");
+        assert_eq!(result.state, CacheState::Fresh);
+        assert_eq!(result.package_count(), 1, "第二次的内容要真的被用上");
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 正常情况不能因为这条重试逻辑多打一次请求（那会白白多一次往返）。
+    #[test]
+    fn a_good_body_is_fetched_once() {
+        let server = TinyServer::new(vec![ok(SAMPLE)]);
+        let root = temp_root("once");
+        let result = fetch(&server.repo(), &root.join("cache"), &agent());
+
+        assert_eq!(server.accepted(), 1, "内容正常时不该重试");
+        assert_eq!(result.state, CacheState::Fresh);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 两次都空：不能再说那句让人发懵的 JSON 报错，要给一条能照着做的建议。
+    #[test]
+    fn two_empty_bodies_say_something_actionable() {
+        let server = TinyServer::new(vec![empty(), empty()]);
+        let root = temp_root("empty");
+        let result = fetch(&server.repo(), &root.join("cache"), &agent());
+
+        assert_eq!(server.accepted(), 2);
+        assert_ne!(result.state, CacheState::Fresh, "取不到就是取不到");
+        let error = result.error.clone().unwrap_or_default();
+        assert!(error.contains("空内容"), "{error}");
+        assert!(error.contains("等几秒"), "要给出可照做的建议：{error}");
+        assert!(result.index.is_none(), "没有缓存时不能假装有");
+        let _ = fs::remove_dir_all(&root);
     }
 }
