@@ -40,6 +40,9 @@ unicode-width = "0.2"
 sha2 = "0.10"
 flate2 = "1.1.10"
 tar = "0.4.46"
+# 监听配置目录：改了 `tools.d/*.toml` 或 `tools/` 里的脚本就自动重载，不用每次手按 `r`。
+# Linux 后端是 inotify，依赖很轻（整棵子树 10 个 crate）。
+notify = "8"
 
 [profile.release]
 strip = true

@@ -27,6 +27,7 @@ mod runtime;
 mod state;
 mod ui;
 mod util;
+mod watch;
 
 use std::{env, io, path::PathBuf, time::Duration};
 
@@ -172,6 +173,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
     // 这几种情况才画。
     let mut dirty = true;
     let mut shown_reload_second = app.seconds_since_reload();
+    // 配置目录一改就自动重载（以前只能手按 `r`）。起不来就退化成手动 —— 见 watch 模块。
+    // 盯的是「用户手写的那两个子树」，程序自己写的 `state.toml` 不算，否则按一下
+    // `f` 收藏就会把自己的界面弹回顶部。
+    let config_dir = config::config_dir();
+    let mut config_watcher = crate::watch::ConfigWatcher::spawn(&config_dir);
     loop {
         let reload_second = app.seconds_since_reload();
         if reload_second != shown_reload_second {
@@ -230,6 +236,25 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<(), Box<dyn std::error::Erro
         }
         // 动态参数候选：解析在后台线程，这里每帧收一次。
         if app.poll_dynamic() {
+            dirty = true;
+        }
+        // 第一次跑：那时配置目录还不存在，watcher 挂不上（走到这儿就是退化成手动
+        // 的那条路）。它一出现就补挂一次 —— 否则这一整轮「自动重载」都是死的，
+        // 而用户完全看不出来，只会以为新写的 manifest 没生效。挂上的同时先重扫
+        // 一遍：挂载之前建的文件不会补发事件。
+        if config_watcher.is_none() && config_dir.is_dir() {
+            config_watcher = crate::watch::ConfigWatcher::spawn(&config_dir);
+            if config_watcher.is_some() {
+                app.reload();
+                dirty = true;
+            }
+        }
+        // 配置目录被改过：重新发现一遍工具（自动重载）。
+        if config_watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.take_changed())
+        {
+            app.reload();
             dirty = true;
         }
     }
