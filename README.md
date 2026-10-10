@@ -55,9 +55,17 @@ sudo pacman -S --needed base-devel git rust pkgconf chafa
 | 文件视图（`F`） | `↑↓` 选文件 · 右半边**预览图片** · `Enter` 切到该文件所在目录 · 打字过滤 |
 | 执行中 | `q` 取消（先 SIGTERM 让工具收尾） · 其余按键照常可用 |
 
+**长任务跑完会发一条桌面通知**（走 `notify-send`，只在跑够 10 秒时发）：转码、打包这类
+要跑几分钟的活，你早就切去别的窗口了 —— 跑完弹一条，切走了也能第一时间知道成没成。
+没有 `notify-send`（无桌面 / SSH / CI）就自动跳过，不影响执行。
+
+**改了配置自动重载**：`~/.config/toolbox-hub/tools.d/` 或 `tools/` 里一动文件，主界面
+用 inotify 侦测到就自动重新发现一遍工具（以前得手按 `Ctrl-R`）—— 写插件时少按几十次键。
+盯的就是这两个目录：程序自己写的 `state.toml`（收藏、上次工作目录）不会把自己弹回顶部。
+
 ## 两条加东西的路
 
-**① 一个 CLI 动作（推荐）** —— 写个 TOML 丢进 `~/.config/toolbox-hub/tools.d/`，`Ctrl-R` 刷新，**不用重编译**：
+**① 一个 CLI 动作（推荐）** —— 写个 TOML 丢进 `~/.config/toolbox-hub/tools.d/`，**改完自动重载**（`Ctrl-R` 仍能手动重扫），不用重编译：
 
 ```toml
 [[action]]

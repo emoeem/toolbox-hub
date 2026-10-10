@@ -124,15 +124,87 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 - `mode` 是**实测**分出来的，不是按感觉标的：逐个函数扫过对 `fzf`/`prompt_value`/`select_one`/`sudo` 的依赖之后，只有 5 个纯只读动作走 `capture`（`dashboard`/`audit`/`timing`/`doctor`/`pull`，输出留在输出视图里），其余 15 个要选包或提权，走 `interactive` 把终端交给它。第一遍扫描漏了间接调用（`check_local_updates` 末尾其实有个 fzf 浏览器），按函数体判定比按印象判定可靠。
 - 这个域暴露了一个**真 bug**：`runtime::execute_tools`（interactive 那条路）把 `argv` 写死成空 `Vec`，于是「本体命令写在 `base_argv` 里」的动作全变成光跑程序名 —— 实测 `manage.sh plan` 变成了光跑 `manage.sh`（弹出它自己的主菜单）。capture 那条路此前踩过同一个坑。现在两条路共用 `runtime::default_argv()`，并有一条测试钉住。
 
+## 一轮修补（2026-10-10）
+
+### 一致性
+
+- 包操作跑完后清队列落盘（`app/mod.rs` 的 `Plan::Queue` 收尾）改用和 `close_packages`
+  同一个来源（`self.queue_path` 覆盖），不再直接写默认路径 —— 覆盖过队列路径时（测试、
+  将来可能的自定义路径）不会清错文件。
+- 去掉生产路径上唯一一个 `expect`（`poll_job` 收尾），改成 `let ... else`。
+
+### 可维护性
+
+- 软件包中心四个模式的「选中下标」读写收敛成 `selected_index` / `set_selected_index`
+  两个访问器：`rows_selected` / `move_row` / `select_row_edge` 不再各写一遍四路 `match`
+  （加一种模式曾要改三处，漏一处就是「按键不动」）。「选中那行的包名」也收敛成
+  `selected_name`（`current_row_name` 与 `remove_from_queue` 共用）。
+
+### 两个新功能
+
+- **配置目录自动重载**：新增 `src/watch.rs`，用 `notify`（Linux 走 inotify）盯着配置目录，
+  改了 `tools.d/*.toml` 或 `tools/` 就自动 `reload`，不用每次手按 `Ctrl-R`。起不来
+  （没有 inotify）就退化成手动，不拦程序。三条边界都是实测踩出来的，写进了模块文档和测试：
+
+  - **只认用户手写的两个子树**。配置目录里还躺着 `state.toml`（收藏、上次工作目录）、
+    `repositories.toml`、`packages.toml` —— 那些是**程序自己**在正常操作里写的。第一版
+    回调不看路径（`if event.is_ok()`），于是按 `f` 收藏 → `state.toml` 落盘 → 下一帧
+    自己 `reload`：选中项跳回第一行、提示从「已收藏 x」被顶成「已刷新」。现在按**路径
+    组件**比（`Path::starts_with`），只认 `tools.d/` 与 `tools/`；`tools.d` 不是 `tools`
+    的子路径，`tools-extra/` 也不是。
+  - **`Access` 类事件不算数**。inotify 把它自己的递归扫描（打开目录列内容）也报成
+    `Access(Open)`：不看事件类型的话，启动时一眼 `tools.d/` 就会凭空重载一次。
+  - **配置目录还不存在时**（第一次跑）挂不上，等它出现再补挂一次并立刻重扫 —— 挂载
+    之前建的文件不会补发事件。否则这一整轮自动重载都是死的，而用户看不出来，只会以为
+    新写的 manifest 没生效。
+- **长任务桌面通知**：新增 `src/notifications.rs`，长的后台任务（> 10s）跑完发一条
+  `notify-send`。刻意**没有**引 `notify-rust`：它在 Linux 上默认走 zbus，会把整条 async
+  运行时（实测 80+ 个 crate）拖进来，对「跑完提醒一句」太重；`notify-send` 和剪贴板那套
+  （`wl-copy` / `xclip`）一个思路 —— 尽力而为，缺了就退化成没有。
+
+### CI
+
+- clippy / test 加 `--all-features`。
+- 新增 `msrv` job：固定用 1.90.0 编译一次，`Cargo.toml` 声明的 MSRV 破了就红。
+
+### 未做（有意留手，见下）
+
+- **CLI 上 `clap`**：`src/cli.rs` 的解析器**故意**手写（动词必须最先出现、全局选项先剥离、
+  `ui` 子命令、TUI 模式的裸位置参数当脚本目录、`--all` 同时对新闻与列表生效）。换成 clap
+  是一次**行为敏感的重写**，收益主要在自动补全，回归风险却压在「能不能被别的程序调用」这条
+  命脉上 —— 值得单独一个 change 去做，不在本轮里顺手改。
+- **`thiserror` 统一错误**：全仓库是 `Result<_, String>`，整体迁移是一次 4 万行级别的侵入式
+  改动，且没有用户可见收益。建议按模块**增量**引入，不做一次性大迁移。
+- **工具仓库 PGP 签名校验**（`sequoia-openpgp` 等）：真正的安全增强，但涉及依赖体量与密钥
+  管理设计，需先定方案。
+
 ## 验证记录
 
-本轮验证结果：
+### 2026-10-10（本轮：自动重载 + 桌面通知 + CI 门）
 
 - `cargo fmt --all -- --check` 通过。
-- `cargo test`：268 项通过，14 项 ignored。
-- `cargo clippy --all-targets -- -D warnings` 通过。
+- `cargo clippy --all-targets --all-features -- -D warnings` 通过。
+- `cargo test --all-features`：**504 项通过，0 失败，16 项 ignored**。
+- `cargo +1.90.0 build --locked` 通过 —— CI 新增的 `msrv` job 钉的就是这一条。
+- **干净容器复核**：`archlinux:latest` + `pacman -S gcc pkgconf chafa` + rustup 1.90.0 +
+  空的 `CARGO_HOME`，`cargo build --locked` 一次通过，产物 `--version` 正常。这条是照着
+  `msrv` job 的步骤走的（那台机器上本机装了 1.90）；job 里 `base-devel` 那一整行的完整
+  安装没能在这边复现 —— 本机到 Arch 镜像的 SSL 接连被重置（`unexpected eof` /
+  `HTTP/2 PROTOCOL_ERROR`），连试三轮都卡在下载而不是安装或构建。那一行本身没改过，
+  现有的 `check` job 一直在跑同一行。
 - `cargo build --release` 通过；`ldd` 未发现 `libchafa`；`--version` 和 `--help` 正常。
+- `cargo run --quiet -- check registry/`：84 项通过 · 1 个警告（本机没装 `docker`）· 0 个错误。
 - `makepkg --printsrcinfo` 通过。
+- **自动重载端到端**（真 pty，`script` 提供，全程不按 `Ctrl-R`）：
+  - 启动后往 `tools.d/` 写一个新 manifest，界面自己出现了它 —— 不用手按 `Ctrl-R`。
+  - 按 `f` 收藏（程序随即写自己的 `state.toml`）之后，状态栏最后一条仍是「已收藏 …」，
+    不是「已刷新 …」，选中项也没跳回第一行。
+  - 这条用**对旧实现是红的**：把路径过滤拿掉重跑，它会报「程序写自己的 state.toml
+    触发了重载」。能红的用例才算钉住了回归，不是摆设。
+
+### 更早一轮（`ui pick` 等）
+
+- `cargo test` 在那一轮是 268 项通过、14 项 ignored（测试数后来涨到 500+，上面是本轮的实时值）。
 - `toolbox-hub ui pick` 端到端验证（假文件管理器 + `script` 提供的真 pty，8 个用例）：外部程序写进自己 stdout/stderr 的画面噪音**一个字节都没有**进入调用方的 stdout；单选、多选、多行只取首条、取消（退出码 1）、`--dir-only` 取退出目录、`builtin` 强制内置、外部程序不存在时退回内置，均符合预期；完全没有终端时退出码 2 并给出可读提示。
 - 验证过程踩到一个坑（记下来省下一次）：`script -c` 用的是 `$SHELL`（本机为 fish），而 fish 不认 `$?`，会让整条命令直接不执行、且失败得很安静。验证脚本里必须显式 `SHELL=/bin/sh`。
 
