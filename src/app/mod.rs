@@ -1571,7 +1571,11 @@ impl App {
                             }
                         }
                     }
-                    let _ = packages::save_queue_to(&packages::queue_path(), &[]);
+                    // 落盘走和 `close_packages` 同一个来源（`self.queue_path` 覆盖），
+                    // 不能直接写默认路径，否则覆盖过队列路径时（测试、将来可能的
+                    // 多实例）会清错文件。
+                    let path = self.queue_path.clone().unwrap_or_else(packages::queue_path);
+                    let _ = packages::save_queue_to(&path, &[]);
                 }
             }
             Plan::Upgrade { program } => {
@@ -2065,10 +2069,9 @@ impl App {
             }
         }
 
-        if done.is_none() {
+        let Some(captured) = done else {
             return changed;
-        }
-        let captured = done.expect("刚判过不是 None");
+        };
 
         // 收尾前先把 running 的借用放掉。
         let Some(running) = self.running.take() else {

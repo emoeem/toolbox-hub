@@ -1186,11 +1186,38 @@ impl PackageView {
     }
 
     pub fn rows_selected(&self) -> usize {
+        self.selected_index()
+    }
+
+    /// 当前模式结果区的选中下标。
+    ///
+    /// 四种模式各存一份选中下标，读写都收敛到这两个访问器 —— 以前
+    /// `rows_selected` / `move_row` / `select_row_edge` 各写一遍四路 `match`，
+    /// 加一种模式就要改三处，漏一处就是「按键不动」。
+    fn selected_index(&self) -> usize {
         match self.mode {
             PackageMode::Search => self.selected,
             PackageMode::Installed => self.installed_selected,
             PackageMode::News => self.news_selected,
             PackageMode::Health => self.health_selected,
+        }
+    }
+
+    fn set_selected_index(&mut self, index: usize) {
+        match self.mode {
+            PackageMode::Search => self.selected = index,
+            PackageMode::Installed => self.installed_selected = index,
+            PackageMode::News => self.news_selected = index,
+            PackageMode::Health => self.health_selected = index,
+        }
+    }
+
+    /// 当前模式选中那行的包名（搜索 / 已安装有名字，新闻 / 维护没有）。
+    fn selected_name(&self) -> Option<String> {
+        match self.mode {
+            PackageMode::Search => self.selected_hit().map(|hit| hit.name.clone()),
+            PackageMode::Installed => self.selected_installed().map(|item| item.name.clone()),
+            PackageMode::News | PackageMode::Health => None,
         }
     }
 
@@ -1291,12 +1318,7 @@ impl PackageView {
         }
         let current = self.rows_selected() as isize;
         let next = (current + delta).rem_euclid(len) as usize;
-        match self.mode {
-            PackageMode::Search => self.selected = next,
-            PackageMode::Installed => self.installed_selected = next,
-            PackageMode::News => self.news_selected = next,
-            PackageMode::Health => self.health_selected = next,
-        }
+        self.set_selected_index(next);
     }
 
     /// 队列上下移动。
@@ -1347,12 +1369,7 @@ impl PackageView {
         } else {
             0
         };
-        match self.mode {
-            PackageMode::Search => self.selected = index,
-            PackageMode::Installed => self.installed_selected = index,
-            PackageMode::News => self.news_selected = index,
-            PackageMode::Health => self.health_selected = index,
-        }
+        self.set_selected_index(index);
     }
 
     /// 包信息面板滚动。
@@ -1461,11 +1478,7 @@ impl PackageView {
 
     /// 当前选中的那一行的包名（三种模式各自取）。
     pub fn current_row_name(&self) -> Option<String> {
-        match self.mode {
-            PackageMode::Search => self.selected_hit().map(|hit| hit.name.clone()),
-            PackageMode::Installed => self.selected_installed().map(|item| item.name.clone()),
-            _ => None,
-        }
+        self.selected_name()
     }
 
     /// 造一条队列项（从当前模式里能找到的信息来）。
@@ -1499,11 +1512,7 @@ impl PackageView {
                 None
             }
         } else {
-            let name = match self.mode {
-                PackageMode::Installed => self.selected_installed().map(|item| item.name.clone()),
-                PackageMode::Search => self.selected_hit().map(|hit| hit.name.clone()),
-                _ => None,
-            };
+            let name = self.selected_name();
             name.and_then(|name| {
                 let position = self.queue.iter().position(|item| item.name == name)?;
                 Some(self.queue.remove(position).name)

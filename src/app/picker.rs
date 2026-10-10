@@ -155,11 +155,14 @@ impl Picker {
     }
 
     pub fn apply_filter(&mut self) {
+        // 过滤词的小写形式算**一次**：`matches` 每个目录项都要用它，放在里面
+        // 就是「一个词 × N 个文件」次重复分配（`/usr/lib` 七千多项时很明显）。
+        let needle = self.filter.text().to_lowercase();
         self.visible = self
             .all
             .iter()
             .enumerate()
-            .filter(|(_, entry)| matches(&entry.name, self.filter.text()))
+            .filter(|(_, entry)| matches(&entry.name, &needle))
             .map(|(index, _)| index)
             .collect();
 
@@ -243,11 +246,13 @@ impl Picker {
 }
 
 /// 不区分大小写的子串匹配。
+///
+/// `filter` 必须**已经小写**：调用方在循环外算一次，这里只管比。
 fn matches(name: &str, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
-    name.to_lowercase().contains(&filter.to_lowercase())
+    name.to_lowercase().contains(filter)
 }
 
 #[cfg(test)]
