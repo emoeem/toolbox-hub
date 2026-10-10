@@ -2099,6 +2099,8 @@ impl App {
             success && !cancelled,
             captured.elapsed.as_millis(),
         );
+        // 长的后台任务跑完提醒一句（短的不发 —— 见 notifications 模块的门槛）。
+        crate::notifications::task_finished(&tool_name, success && !cancelled, captured.elapsed);
         self.job_results.push(captured);
 
         // 还有排队的就接着跑；都跑完了把这一批的输出一起摆出来。

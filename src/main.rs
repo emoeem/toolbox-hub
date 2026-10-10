@@ -18,6 +18,7 @@ mod dynamic;
 mod history;
 mod media;
 mod model;
+mod notifications;
 mod packages;
 mod preview;
 mod providers;
