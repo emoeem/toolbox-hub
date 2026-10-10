@@ -1,4 +1,4 @@
-# 三件事：格式、lint、测试。仓库里已经有 210+ 个测试，但没有一条自动门。
+# 三件事：格式、lint、测试。仓库里已经有几百个测试，但没有一条自动门。
 #
 # 为什么跑在 Arch 容器里而不是 ubuntu 上：这个二进制**链接 libalpm**
 # （包数据层直连 pacman 的库，见 src/packages/libalpm.rs）。ubuntu 上没有它，
@@ -56,16 +56,46 @@ jobs:
         run: cargo fmt --check
 
       - name: lint（警告即错误）
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: 测试
-        run: cargo test
+        run: cargo test --all-features
 
       # cargo test 里已经有一条「官方 registry 必须自洽」的测试，这里再显式跑一次
       # check：报错信息更具体（哪个包、哪个文件、怎么修），而且和 Registry 工作流
       # 用同一条命令 —— 改了 registry/ 却在别的 workflow 上，也能被拦住。
       - name: 工具仓库自洽（索引 ↔ 产物 ↔ 源码）
         run: cargo run --quiet -- check registry/
+
+  # Cargo.toml 声明 `rust-version = "1.90"`，但上面的 check 用的是 Arch 的最新
+  # stable —— 拦不住「不小心用了 1.91 才有的 API」这类 MSRV 回归。这一 job 固定
+  # 用 1.90.0 编译一次：MSRV 破了就在这里红，而不是在用户的旧工具链上才炸。
+  msrv:
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 系统依赖（libalpm / pkgconf / chafa）
+        run: pacman -Syu --noconfirm --needed base-devel git pkgconf chafa
+
+      - name: 装 MSRV 工具链（Cargo.toml 声明的 1.90）
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 用最低支持版本编译（--locked，MSRV 回归即红）
+        run: cargo build --locked
 
   # README 里那句「行为用测试钉住，工具链用冒烟钉住」的后半句。
   # 这批 `--ignored` 测试抓的都是只有真跑才看得见的问题（7z 只认 -mx9、
