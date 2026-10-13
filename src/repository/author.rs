@@ -1641,10 +1641,19 @@ required = true
         assert!(names.contains(&"jq"), "{names:?}");
 
         let report = check_package(&dir);
+        // 这一条**不能假定本机装没装 jq**：装了会报「依赖 jq 在 PATH 上」，没装
+        // （CI 的 Arch 容器里就没有）会报「依赖「jq」本机没有」—— 两种都是「报告里
+        // 如实出现了这个依赖」，都算对。以前只认前者，于是在没装 jq 的机器上必红：
+        // CI 已经照着红了好几周，本地却因为装了 jq 一直看不出来。
+        let mentions_jq = report
+            .passed
+            .iter()
+            .chain(report.warnings.iter())
+            .any(|line| line.contains("jq"));
         assert!(
-            report.passed.iter().any(|line| line.contains("jq")),
-            "{:?}",
-            report.passed
+            mentions_jq,
+            "报告里应当出现推导出的依赖 jq：passed={:?} warnings={:?}",
+            report.passed, report.warnings
         );
         std::fs::remove_dir_all(&base).expect("cleanup");
     }

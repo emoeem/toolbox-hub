@@ -1329,7 +1329,11 @@ help = "随便"
         type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], bool);
         let cases: &[Case] = &[
             ("manifest:pkg-search", &[("query", "fzf")], true),
-            ("manifest:pkg-owner", &[("file", "/usr/bin/pac")], true),
+            // 用一个**任何 Arch 系统都一定有、而且一定由 pacman 包拥有**的路径。
+            // 原来写的是 /usr/bin/pac —— 那在我这台机器上确实存在，但它属于第三方
+            // 包（shorin-pac-git），CI 的干净容器里根本没有，于是 `pacman -Qo` 退出 1、
+            // 这条冒烟在容器里必红。
+            ("manifest:pkg-owner", &[("file", "/etc/pacman.conf")], true),
             ("manifest:pkg-files", &[("package", "pacman")], true),
         ];
 

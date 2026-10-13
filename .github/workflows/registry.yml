@@ -64,15 +64,23 @@ jobs:
         run: ./target/release/toolbox-hub check registry/
 
       # 再重建一遍，看仓库里那一份是不是就是源码该产出的那一份。
+      #
+      # 比对用「先复制一份 → 重建 → diff -r」，**不用 git**：容器 job 里
+      # `git add -N` / `git diff` 会直接死在 `fatal: not a git repository`
+      # （这条步骤从加进来那天起就没绿过，一直红着没人发现），而它本来也只是
+      # 借 git 做文件比对。复制再比语义更直白：**checkout 出来的那份** vs
+      # **刚构建出来的那份**；忘提交的新产物照样会被逮住（它只在新树里）。
       - name: 仓库里的索引与产物必须就是源码构建出来的那一份
         run: |
+          set -euo pipefail
+          before="$(mktemp -d)"
+          cp -a registry/. "$before/"
+
           ./target/release/toolbox-hub build registry/
 
-          # git diff 默认看不见**未跟踪**文件：只提交了 index.json、忘了提交
-          # artifacts/ 的 PR，会被静默放过。先标成「打算加」，新产物才会进 diff。
-          git add -N registry/
-
-          if git diff --exit-code registry/; then
+          # -q：只列对不上的文件名，不打内容（artifact 是二进制，打出来也没用）
+          diff_out="$(diff -r -q "$before" registry/ || true)"
+          if [ -z "$diff_out" ]; then
             echo "✓ registry/index.json 与 registry/artifacts/ 都是源码构建出来的那一份"
             exit 0
           fi
@@ -86,21 +94,13 @@ jobs:
             echo
             echo "构建是可复现的（同样的源码两次构建逐字节相同），所以这份差异只可能来自「产物没提交」或「构建版本不一致」。"
             echo
-            echo '```'
-            git diff --stat registry/
-            echo '```'
-            echo
             echo "对不上的文件："
             echo
             echo '```'
-            git diff --name-status registry/
+            echo "$diff_out"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
-          echo "--- git diff --stat registry/ ---"
-          git diff --stat registry/
           echo "--- 对不上的文件 ---"
-          git diff --name-status registry/
-          # gzip 的 OS 字节可能随 flate2 版本变；真出现差异时上面已经把文件列出来了，
-          # 别静默失败。
+          echo "$diff_out"
           exit 1

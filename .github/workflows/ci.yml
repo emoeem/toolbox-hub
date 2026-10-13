@@ -158,6 +158,16 @@ jobs:
           pacman -Syu --noconfirm --needed
           base-devel git rust pkgconf chafa
           ffmpeg p7zip jq pandoc perl-image-exiftool imagemagick
+          fzf
+        # fzf：`smoke_search_both_sources` 里有「装了 fzf 就该标成已安装」这条断言，
+        # 容器里必须真装着它 —— 否则那条断言测的是「没装」这件事，必红。
+
+      - name: exiftool 在 vendor_perl 里，把它放进 PATH
+        run: echo "/usr/bin/vendor_perl" >> "$GITHUB_PATH"
+        # Arch 的 perl-image-exiftool 把可执行文件装到 /usr/bin/vendor_perl/exiftool，
+        # 而这个目录只在**登录 shell** 的默认 PATH 里；容器 job 的非交互 shell 没有它，
+        # 于是 exif-read 动作会「找不到程序」。产品侧行为是对的（依赖缺失就如实标出来），
+        # 缺的是 CI 环境的 PATH。
 
       - name: 缓存 cargo
         uses: actions/cache@v4
