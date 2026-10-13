@@ -1,0 +1,28 @@
+{
+  "id": "video-probe",
+  "title": "查看媒体流信息",
+  "description": "用 ffprobe 输出媒体流 JSON",
+  "command": "ffprobe",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-v",
+    "error",
+    "-show_format",
+    "-show_streams",
+    "-of",
+    "json",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "媒体",
+    "ffmpeg"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "process-top",
+  "title": "查看进程概况",
+  "description": "按 CPU 使用率显示进程",
+  "command": "ps",
+  "params": [],
+  "args": [
+    "-eo",
+    "pid,comm,%cpu,%mem",
+    "--sort=-%cpu"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "进程"
+  ]
+}

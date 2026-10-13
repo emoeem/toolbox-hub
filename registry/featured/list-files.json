@@ -1,0 +1,24 @@
+{
+  "id": "list-files",
+  "title": "列出目录文件",
+  "description": "以长格式列出指定目录",
+  "command": "ls",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-lah",
+    "--",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "文件",
+    "只读"
+  ]
+}

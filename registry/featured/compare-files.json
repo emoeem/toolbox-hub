@@ -1,0 +1,30 @@
+{
+  "id": "compare-files",
+  "title": "比较两个文件",
+  "description": "比较文件内容并返回差异状态",
+  "command": "diff",
+  "params": [
+    {
+      "name": "left",
+      "description": "left",
+      "required": true
+    },
+    {
+      "name": "right",
+      "description": "right",
+      "required": true
+    }
+  ],
+  "args": [
+    "-u",
+    "--",
+    "{left}",
+    "{right}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "文件",
+    "比较"
+  ]
+}

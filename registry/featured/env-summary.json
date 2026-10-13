@@ -1,0 +1,22 @@
+{
+  "id": "env-summary",
+  "title": "查看指定环境变量",
+  "description": "只显示用户指定的变量名和值",
+  "command": "printenv",
+  "params": [
+    {
+      "name": "name",
+      "description": "name",
+      "required": true
+    }
+  ],
+  "args": [
+    "{name}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "环境"
+  ]
+}

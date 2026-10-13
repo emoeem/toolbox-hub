@@ -1,0 +1,25 @@
+{
+  "id": "cargo-test",
+  "title": "运行 Cargo 测试",
+  "description": "在指定 Rust 项目目录运行测试",
+  "command": "cargo",
+  "params": [
+    {
+      "name": "manifest",
+      "description": "manifest",
+      "required": true
+    }
+  ],
+  "args": [
+    "test",
+    "--manifest-path",
+    "{manifest}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "开发",
+    "rust",
+    "测试"
+  ]
+}

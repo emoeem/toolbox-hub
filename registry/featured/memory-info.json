@@ -1,0 +1,16 @@
+{
+  "id": "memory-info",
+  "title": "查看内存信息",
+  "description": "读取内存概况",
+  "command": "free",
+  "params": [],
+  "args": [
+    "-h"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "诊断"
+  ]
+}

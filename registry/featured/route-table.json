@@ -1,0 +1,17 @@
+{
+  "id": "route-table",
+  "title": "查看路由表",
+  "description": "只读查看路由表",
+  "command": "ip",
+  "params": [],
+  "args": [
+    "route",
+    "show"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "网络",
+    "诊断"
+  ]
+}

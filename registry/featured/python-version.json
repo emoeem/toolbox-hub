@@ -1,0 +1,16 @@
+{
+  "id": "python-version",
+  "title": "查看 Python 版本",
+  "description": "打印 Python 运行时版本",
+  "command": "python3",
+  "params": [],
+  "args": [
+    "--version"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "开发",
+    "python"
+  ]
+}

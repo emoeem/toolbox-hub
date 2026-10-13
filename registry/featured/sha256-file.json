@@ -1,0 +1,23 @@
+{
+  "id": "sha256-file",
+  "title": "计算 SHA-256",
+  "description": "计算指定文件摘要",
+  "command": "sha256sum",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "--",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "校验",
+    "安全"
+  ]
+}

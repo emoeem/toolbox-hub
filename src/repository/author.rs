@@ -541,12 +541,21 @@ pub fn build_registry(root: &Path, stamp: bool) -> Result<RegistryBuild, String>
         format!("epoch:{now}")
     });
 
+    let mut extra = std::collections::BTreeMap::new();
+    // First-party Recipe feed is a separate schema and integrity domain from installable packages.
+    // Publish a relative pointer only when this registry actually carries the featured feed.
+    if root.join("featured/index.json").is_file() {
+        extra.insert(
+            "featured".to_string(),
+            serde_json::json!({ "index": "featured/index.json", "schema_version": 1 }),
+        );
+    }
     let index = Index {
         schema_version: SCHEMA_VERSION,
         name,
         updated,
         packages: entries,
-        extra: Default::default(),
+        extra,
     };
     let mut text =
         serde_json::to_string_pretty(&index).map_err(|error| format!("写不出 JSON：{error}"))?;

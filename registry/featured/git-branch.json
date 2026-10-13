@@ -1,0 +1,17 @@
+{
+  "id": "git-branch",
+  "title": "列出本地分支",
+  "description": "只读列出本地分支",
+  "command": "git",
+  "params": [],
+  "args": [
+    "branch",
+    "--list"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "git",
+    "开发"
+  ]
+}

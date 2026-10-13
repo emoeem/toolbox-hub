@@ -1,0 +1,36 @@
+{
+  "id": "archive-create",
+  "title": "创建 tar.gz 归档",
+  "description": "把指定目录归档到用户指定输出路径",
+  "command": "tar",
+  "params": [
+    {
+      "name": "output",
+      "description": "output",
+      "required": true
+    },
+    {
+      "name": "parent",
+      "description": "parent",
+      "required": true
+    },
+    {
+      "name": "name",
+      "description": "name",
+      "required": true
+    }
+  ],
+  "args": [
+    "-czf",
+    "{output}",
+    "-C",
+    "{parent}",
+    "{name}"
+  ],
+  "safety": "caution",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "归档",
+    "文件"
+  ]
+}

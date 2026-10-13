@@ -1,0 +1,23 @@
+{
+  "id": "dns-lookup",
+  "title": "DNS 查询",
+  "description": "使用系统 getent 查询主机名",
+  "command": "getent",
+  "params": [
+    {
+      "name": "host",
+      "description": "host",
+      "required": true
+    }
+  ],
+  "args": [
+    "ahosts",
+    "{host}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "网络",
+    "dns"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "git-status",
+  "title": "查看 Git 工作区",
+  "description": "列出工作区状态，不改动文件",
+  "command": "git",
+  "params": [],
+  "args": [
+    "status",
+    "--short",
+    "--branch"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "git",
+    "开发",
+    "只读"
+  ]
+}

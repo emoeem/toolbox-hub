@@ -15,6 +15,7 @@ mod cli;
 mod components;
 mod config;
 mod dynamic;
+pub mod ecosystem;
 mod history;
 mod media;
 mod model;
@@ -26,9 +27,11 @@ mod registry;
 mod repository;
 mod runtime;
 mod state;
+mod thumbnail;
 mod ui;
 mod util;
 mod watch;
+mod widget;
 
 use std::{env, io, path::PathBuf, time::Duration};
 
@@ -62,6 +65,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     install_panic_hook();
+
+    // 生态数据命令不进入 TUI；结果只写 stdout，执行层仅使用 argv。
+    let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    if raw_args.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "recipe" | "import" | "preset" | "queue" | "history"
+        )
+    }) {
+        if let Err(error) = ecosystem::run_cli(&raw_args) {
+            eprintln!("toolbox-hub: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // shell 集成：stdout 只承载最终命令，界面自己开 /dev/tty 会话，
+    // 退出码由组件约定决定（0 选中 / 1 取消 / 2 参数错）。
+    if raw_args.first().is_some_and(|arg| arg == "widget") {
+        std::process::exit(widget::run_cli(&raw_args[1..]));
+    }
 
     // 先看这次是「命令行模式」还是「进 TUI」：带动作参数时干完就退，
     // 一个终端都不进（`toolbox-hub -s fzf | head` 要能在管道里安静地跑）。

@@ -1,0 +1,16 @@
+{
+  "id": "kernel-version",
+  "title": "查看内核版本",
+  "description": "打印当前内核版本",
+  "command": "uname",
+  "params": [],
+  "args": [
+    "-r"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "诊断"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "json-keys",
+  "title": "列出 JSON 顶层键",
+  "description": "输出 JSON 对象的键名",
+  "command": "jq",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-r",
+    "keys[]",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "json",
+    "开发"
+  ]
+}

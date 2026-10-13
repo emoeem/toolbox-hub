@@ -1,0 +1,25 @@
+{
+  "id": "git-log",
+  "title": "查看最近提交",
+  "description": "按简洁格式查看最近提交",
+  "command": "git",
+  "params": [
+    {
+      "name": "count",
+      "description": "count",
+      "required": true
+    }
+  ],
+  "args": [
+    "log",
+    "--oneline",
+    "-n",
+    "{count}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "git",
+    "开发"
+  ]
+}

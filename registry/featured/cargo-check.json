@@ -1,0 +1,25 @@
+{
+  "id": "cargo-check",
+  "title": "检查 Cargo 项目",
+  "description": "执行快速编译检查",
+  "command": "cargo",
+  "params": [
+    {
+      "name": "manifest",
+      "description": "manifest",
+      "required": true
+    }
+  ],
+  "args": [
+    "check",
+    "--manifest-path",
+    "{manifest}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "开发",
+    "rust",
+    "检查"
+  ]
+}

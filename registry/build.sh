@@ -34,4 +34,5 @@ EOF
     exit 1
 fi
 
-exec "$bin" build "$root" "$@"
+python3 "$root/build-featured.py" --build
+"$bin" build "$root" "$@"

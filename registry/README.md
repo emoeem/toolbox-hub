@@ -16,6 +16,10 @@
 registry/
 ├── index.json                 ← 索引：客户端唯一入口（schema_version = 1）
 ├── build.sh                   ← 只是 `toolbox-hub build` 的薄包装（真正干活在客户端里）
+├── featured/                  ← 第一方通用 Recipe JSON + SHA-256 索引（独立 schema）
+│   ├── index.json
+│   └── *.json                  ← 35 条通用 Recipe
+├── build-featured.py           ← featured 索引生成与 CI 校验
 ├── artifacts/                 ← 产物（索引里 artifact.url 指向的就是这些）
 │   ├── hello-tool.sh
 │   ├── demo-actions-1.0.0.tar.gz
@@ -27,7 +31,8 @@ registry/
 ```
 
 `index.json` 与 `artifacts/` 都是**生成物**：不要手改，改 `packages/` 再跑
-`toolbox-hub build registry/`（或等价的 `bash registry/build.sh`）。
+`toolbox-hub build registry/`（或等价的 `bash registry/build.sh`）。Featured Recipe 的索引单独由
+`python3 registry/build-featured.py --build` 生成；CI 会检查所有文件的 SHA-256、安全级别与索引一致性。根索引的 `featured.index` 指向这份独立索引。
 **索引是从源码生成的** —— 手工维护的索引迟早会和源码对不上（版本、哈希）。
 
 插件怎么写：**[../docs/plugin-authoring.md](../docs/plugin-authoring.md)**。

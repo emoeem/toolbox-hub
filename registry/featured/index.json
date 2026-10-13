@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "recipes": [
+    {
+      "id": "archive-create",
+      "file": "archive-create.json",
+      "sha256": "a1a537bc4165af171ce8eaeb6db628787369fddc56c245372ac2d70d05b484f9"
+    },
+    {
+      "id": "archive-list",
+      "file": "archive-list.json",
+      "sha256": "a3b0812a1665f17edf244ff7d30c64318d1964d545f86a0589b0ca2114a7b393"
+    },
+    {
+      "id": "archive-test",
+      "file": "archive-test.json",
+      "sha256": "436895a7286e68ab9cf2c62f34685a07ac892a3e50da374a38e4c093948196df"
+    },
+    {
+      "id": "cargo-check",
+      "file": "cargo-check.json",
+      "sha256": "19a3e4d57571cf4e6945dee304032adaf0647cd21b14f40838abadd5b32c61c3"
+    },
+    {
+      "id": "cargo-test",
+      "file": "cargo-test.json",
+      "sha256": "a3428c610c151166d6a71697da7f5565f82b702579c0f63211ae518273d8bc9c"
+    },
+    {
+      "id": "compare-files",
+      "file": "compare-files.json",
+      "sha256": "1f55e81bb2fb4d8cfec9c2aa9f57e74db703483da88e39df17cf2bb6e80f495e"
+    },
+    {
+      "id": "count-lines",
+      "file": "count-lines.json",
+      "sha256": "f26a559f1eec7f4e990640ad77ce226dd1d080a5165911b2314fe5cf07ca540c"
+    },
+    {
+      "id": "curl-headers",
+      "file": "curl-headers.json",
+      "sha256": "48cc9808b0394f7abb5c6d6038f2bc136351652ef3f7dd82ce1e8866442e7313"
+    },
+    {
+      "id": "disk-free",
+      "file": "disk-free.json",
+      "sha256": "e3c37f8184fe0f51d43b741045570e7e5df3bbe7916daa8202c6b35caadc26aa"
+    },
+    {
+      "id": "disk-usage",
+      "file": "disk-usage.json",
+      "sha256": "3b75377f85ee6a88b95a45d7bb69670ba251fd8fbfa79e477710dae277bacd12"
+    },
+    {
+      "id": "dns-lookup",
+      "file": "dns-lookup.json",
+      "sha256": "ace047eaf014bbfaa223e1a011e07cbeca91a97009128f78c4792c460e483256"
+    },
+    {
+      "id": "env-summary",
+      "file": "env-summary.json",
+      "sha256": "ce3b41031f1c5ec15f7ba9718d255a8fa30047cf620bdddfdc03ec57e9b6c018"
+    },
+    {
+      "id": "find-files",
+      "file": "find-files.json",
+      "sha256": "02563450ad39715e29c953bbd54594110cc2efa11288509d752a396b8f11ba5e"
+    },
+    {
+      "id": "git-branch",
+      "file": "git-branch.json",
+      "sha256": "0d81b4b4a4c6c5a64507b3c034643a6bd61c7d87402f167c7165c0309b6dce68"
+    },
+    {
+      "id": "git-diff",
+      "file": "git-diff.json",
+      "sha256": "7d9c2a38e848ff75f834394911c5c59a6f6ec9b8985c71b4fdf826cfc87076f1"
+    },
+    {
+      "id": "git-log",
+      "file": "git-log.json",
+      "sha256": "e193dafd4ab25e5c367e5e66beb2596c5bc066efa74b0c9ad0fc404707db131d"
+    },
+    {
+      "id": "git-status",
+      "file": "git-status.json",
+      "sha256": "4d697555215374a9ae278c3706ea8a251e9e6f25c10921a87e35ce84e903cb31"
+    },
+    {
+      "id": "http-download",
+      "file": "http-download.json",
+      "sha256": "401f69cef17e916eedfdacdc1a184ecc6588f7491cbaa0f9e5e3e7d2cc03b877"
+    },
+    {
+      "id": "image-info",
+      "file": "image-info.json",
+      "sha256": "86fe9c28c68042105ca37d7fb589fec16ec1fe986ba6b45ea18e7563fc50fdd9"
+    },
+    {
+      "id": "json-format",
+      "file": "json-format.json",
+      "sha256": "572f9292562b9c3aa7ef2c956244b6a654aac2811ac87cd8e0c932b8be1f6701"
+    },
+    {
+      "id": "json-keys",
+      "file": "json-keys.json",
+      "sha256": "2045b17209b7c54e63b71b6638fc899f60aeba98a4c82c085053628478160d92"
+    },
+    {
+      "id": "kernel-version",
+      "file": "kernel-version.json",
+      "sha256": "3bed8a12c6e71bcb004478b16c8fe4aa02e13670e01d30c4ffd59544adab92ae"
+    },
+    {
+      "id": "list-files",
+      "file": "list-files.json",
+      "sha256": "ef532b35b87991f1a89bc99204ed9c33d5ab2fff4514a5245453818c4d44d500"
+    },
+    {
+      "id": "listen-ports",
+      "file": "listen-ports.json",
+      "sha256": "a96ca3e54dfa736f70ffe9af6aaa3f96193b72d1bda3e60f2218f66b4cf36d77"
+    },
+    {
+      "id": "memory-info",
+      "file": "memory-info.json",
+      "sha256": "ed789b083d6b5fa7fcd840d6746bd9d6775927ed30b426804ec906593919e583"
+    },
+    {
+      "id": "os-release",
+      "file": "os-release.json",
+      "sha256": "22cf50aae840e1317b417f268a76d7337987f56619d663146f3be198644e8f3b"
+    },
+    {
+      "id": "process-top",
+      "file": "process-top.json",
+      "sha256": "75cccc6a37fe1d6cde9e9faa40bc39f6fa0b3daddfb1c4256518b0d3fd7aa16b"
+    },
+    {
+      "id": "python-version",
+      "file": "python-version.json",
+      "sha256": "2e02524c7e63ce6ea71b5bc767c689a4b9b8510800db6e870761de4d2c908467"
+    },
+    {
+      "id": "route-table",
+      "file": "route-table.json",
+      "sha256": "64ac34bb3a3dfba2980747a91852411837df91f1f7d637013f99236197dbbb38"
+    },
+    {
+      "id": "rust-version",
+      "file": "rust-version.json",
+      "sha256": "a8af49cd9838bdd3e2529d22c70165de1316bac17b403badfbf66d75b0c4c221"
+    },
+    {
+      "id": "sed-preview",
+      "file": "sed-preview.json",
+      "sha256": "3c10b5022b909f9e2edf2da5cb330d39779cf3c4e15a183b60ba1b960c0bf96c"
+    },
+    {
+      "id": "sha256-file",
+      "file": "sha256-file.json",
+      "sha256": "51dbe85f23340b2164d2b6a9bf891a8992343e35e8862a0ff12c0120b1a0e71a"
+    },
+    {
+      "id": "text-search",
+      "file": "text-search.json",
+      "sha256": "b9028c351421004eab477ca3528aea75f0cc1e1c173f422d09749513243edb0d"
+    },
+    {
+      "id": "video-probe",
+      "file": "video-probe.json",
+      "sha256": "87621bb3d1e9d901cc3da3e65ac0d188cdcd7e797e4d10c40fe48eb91c0184e2"
+    },
+    {
+      "id": "yaml-validate",
+      "file": "yaml-validate.json",
+      "sha256": "e9bc60816cea3e3e757f0242ea2c38237a3dba76205ab6717a0b41f4ece36d10"
+    }
+  ]
+}

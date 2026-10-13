@@ -671,8 +671,11 @@ mod tests {
         assert!(screen.contains("这个分类里没有包"), "该提示被筛空了");
     }
 
-    /// F 视图右半边是图片预览：面板要在、标题要说清用的是什么画图方式、
-    /// 不是图片的文件要给一句人话（而不是留一块空白让人以为坏了）。
+    /// F 视图右半边是预览面板：面板要在、标题要说清用的是什么画图方式、
+    /// 不预览的类型要给一句人话（而不是留一块空白让人以为坏了）。
+    ///
+    /// 2026-10 起视频**会**预览（ffmpeg 出的第一帧），所以这里分两种文件看：
+    /// 视频要说「正在取帧」，音频这种真不预览的才说「这个类型不预览」。
     #[test]
     fn the_files_view_shows_a_preview_pane() {
         use std::fs;
@@ -696,12 +699,34 @@ mod tests {
             "标题该说清用什么画图：\n{screen}"
         );
         assert!(
+            screen.contains("ffmpeg") || screen.contains("缩略图"),
+            "视频该说自己正在出缩略图，而不是留一块空白：\n{screen}"
+        );
+
+        app.close_files();
+
+        // 音频在扫描清单里、但既不预览图像也不出缩略图 —— 这一支才是
+        // 「这个类型不预览」真正还活着的地方。
+        let audio_dir = std::env::temp_dir().join(format!(
+            "toolbox-hub-preview-ui-audio-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&audio_dir);
+        fs::create_dir_all(&audio_dir).expect("建目录");
+        fs::write(audio_dir.join("song.mp3"), vec![0u8; 32]).expect("写文件");
+
+        app.work_dir = audio_dir.clone();
+        app.open_files();
+        app.preview = crate::preview::Preview::halfblocks_for_test();
+        let screen = render_compact(&mut app, 160, 40);
+        assert!(
             screen.contains("这个类型不预览"),
-            "视频不该留一块空白：\n{screen}"
+            "音频该给一句人话：\n{screen}"
         );
 
         app.close_files();
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&audio_dir);
     }
 
     /// 粘贴：终端开了 bracketed paste 之后，多行文本是**一个事件**。

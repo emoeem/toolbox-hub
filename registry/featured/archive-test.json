@@ -1,0 +1,23 @@
+{
+  "id": "archive-test",
+  "title": "测试 gzip tar 归档",
+  "description": "验证归档可读性，不写入文件",
+  "command": "tar",
+  "params": [
+    {
+      "name": "archive",
+      "description": "archive",
+      "required": true
+    }
+  ],
+  "args": [
+    "-tzf",
+    "{archive}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "归档",
+    "校验"
+  ]
+}

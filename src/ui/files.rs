@@ -150,7 +150,7 @@ fn draw_preview(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // 选中项一变就登记一次（内部会去重 + 后台解码）
     app.preview.request(&path);
 
-    let title = format!(" 预览 · {} ", app.preview.protocol());
+    let title = format!(" 预览 · {} ", app.preview.label());
     let block = theme::panel(&title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -162,23 +162,34 @@ fn draw_preview(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let is_video = crate::thumbnail::is_video(&path);
     let hint = if app.preview.is_decoding() {
-        format!(
-            "解码中…
+        if is_video {
+            format!("正在用 ffmpeg 取第一帧…\n{name}")
+        } else {
+            format!(
+                "解码中…
 {name}"
-        )
+            )
+        }
     } else if let Some(problem) = app.preview.problem.clone() {
-        format!(
-            "看不了这张：
-{problem}"
-        )
+        // 视频和图片的失败原因差别很大（少装 ffmpeg vs 图片本身坏了），
+        // 标题要说清楚看不了的是哪一个。
+        if is_video {
+            format!("取不到缩略图：\n{problem}")
+        } else {
+            format!("看不了这张：\n{problem}")
+        }
     } else if crate::preview::looks_like_image(&path) {
         String::from("等一下，正在准备预览")
+    } else if is_video {
+        // 走到这里说明缩略图还没有、也没在生成：只可能是这一帧还没落地。
+        format!("视频缩略图准备中…\n{name}")
     } else {
         format!(
             "{name}
 
-这个类型不预览（只画图片）。\n要看内容就用别的工具打开它。"
+这个类型不预览（图片和视频才预览）。\n要看内容就用别的工具打开它。"
         )
     };
 

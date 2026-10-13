@@ -1,0 +1,24 @@
+{
+  "id": "count-lines",
+  "title": "统计文本行数",
+  "description": "统计指定文本文件行数",
+  "command": "wc",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-l",
+    "--",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "文本",
+    "统计"
+  ]
+}

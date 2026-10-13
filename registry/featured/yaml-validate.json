@@ -1,0 +1,24 @@
+{
+  "id": "yaml-validate",
+  "title": "解析 YAML",
+  "description": "用 yq 将 YAML 转为 JSON 进行语法验证",
+  "command": "yq",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-o=json",
+    ".",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "yaml",
+    "开发"
+  ]
+}

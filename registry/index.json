@@ -480,5 +480,9 @@
         }
       ]
     }
-  ]
+  ],
+  "featured": {
+    "index": "featured/index.json",
+    "schema_version": 1
+  }
 }

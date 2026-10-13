@@ -1,0 +1,16 @@
+{
+  "id": "listen-ports",
+  "title": "查看监听端口",
+  "description": "只读列出 TCP/UDP 监听端口",
+  "command": "ss",
+  "params": [],
+  "args": [
+    "-lntup"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "网络",
+    "端口"
+  ]
+}

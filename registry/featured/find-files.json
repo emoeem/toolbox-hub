@@ -1,0 +1,31 @@
+{
+  "id": "find-files",
+  "title": "按名称查找文件",
+  "description": "在指定目录按名称模式查找",
+  "command": "find",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    },
+    {
+      "name": "pattern",
+      "description": "pattern",
+      "required": true
+    }
+  ],
+  "args": [
+    "{path}",
+    "-type",
+    "f",
+    "-iname",
+    "{pattern}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "文件",
+    "搜索"
+  ]
+}

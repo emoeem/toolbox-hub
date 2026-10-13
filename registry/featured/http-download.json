@@ -1,0 +1,31 @@
+{
+  "id": "http-download",
+  "title": "下载到指定文件",
+  "description": "下载前需确认目标与覆盖行为；默认输出到新文件",
+  "command": "curl",
+  "params": [
+    {
+      "name": "output",
+      "description": "output",
+      "required": true
+    },
+    {
+      "name": "url",
+      "description": "url",
+      "required": true
+    }
+  ],
+  "args": [
+    "--fail",
+    "--location",
+    "--output",
+    "{output}",
+    "{url}"
+  ],
+  "safety": "caution",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "网络",
+    "下载"
+  ]
+}

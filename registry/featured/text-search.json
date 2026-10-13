@@ -1,0 +1,31 @@
+{
+  "id": "text-search",
+  "title": "搜索文本内容",
+  "description": "递归搜索指定目录中的文本模式",
+  "command": "grep",
+  "params": [
+    {
+      "name": "pattern",
+      "description": "pattern",
+      "required": true
+    },
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-RIn",
+    "--exclude-dir=.git",
+    "--",
+    "{pattern}",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "文本",
+    "搜索"
+  ]
+}

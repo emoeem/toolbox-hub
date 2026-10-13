@@ -1,0 +1,16 @@
+{
+  "id": "os-release",
+  "title": "查看发行版信息",
+  "description": "读取发行版标识文件",
+  "command": "cat",
+  "params": [],
+  "args": [
+    "/etc/os-release"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "诊断"
+  ]
+}

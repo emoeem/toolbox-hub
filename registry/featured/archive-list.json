@@ -1,0 +1,23 @@
+{
+  "id": "archive-list",
+  "title": "列出 tar 归档内容",
+  "description": "只列出归档条目，不解压",
+  "command": "tar",
+  "params": [
+    {
+      "name": "archive",
+      "description": "archive",
+      "required": true
+    }
+  ],
+  "args": [
+    "-tf",
+    "{archive}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "归档",
+    "文件"
+  ]
+}

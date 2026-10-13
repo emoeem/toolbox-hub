@@ -430,7 +430,10 @@ impl RunningJob {
 /// 给「进程组」发信号（`kill(-pgid)`）。失败返回 false，调用方自己兜底。
 ///
 /// 用组而不是单个 pid：`program` 底下可能还有孙子进程，只杀父进程会把它们留下。
-fn signal_group(pid: u32, signal: libc::c_int) -> bool {
+///
+/// `pub(crate)`：后台任务队列（[`crate::ecosystem`]）取消任务时用的是同一个函数 ——
+/// 「怎么把一个进程组叫停」只该有一处实现，各写一份迟早会分叉。
+pub(crate) fn signal_group(pid: u32, signal: libc::c_int) -> bool {
     // SAFETY: `kill` 是纯系统调用，参数就是 pid 与信号号；负号表示「进程组」。
     unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
 }

@@ -1,0 +1,23 @@
+{
+  "id": "image-info",
+  "title": "读取图片信息",
+  "description": "用 file 查看图片或文件类型",
+  "command": "file",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "--",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "图像",
+    "文件"
+  ]
+}

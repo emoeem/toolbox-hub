@@ -1,0 +1,23 @@
+{
+  "id": "disk-usage",
+  "title": "查看目录大小",
+  "description": "显示目标目录总占用",
+  "command": "du",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-sh",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "磁盘"
+  ]
+}

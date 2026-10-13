@@ -1,0 +1,16 @@
+{
+  "id": "disk-free",
+  "title": "查看磁盘剩余",
+  "description": "显示文件系统空间",
+  "command": "df",
+  "params": [],
+  "args": [
+    "-h"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "系统",
+    "磁盘"
+  ]
+}

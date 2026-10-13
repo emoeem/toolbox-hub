@@ -1,0 +1,29 @@
+{
+  "id": "sed-preview",
+  "title": "预览文本前几行",
+  "description": "只读打印文本文件开头",
+  "command": "sed",
+  "params": [
+    {
+      "name": "count",
+      "description": "count",
+      "required": true
+    },
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    "-n",
+    "1,{count}p",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "文本",
+    "预览"
+  ]
+}

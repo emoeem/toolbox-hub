@@ -26,6 +26,36 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 
+/// 选中一个文件时，预览该从哪儿取图。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// 图片本身，直接解码。
+    Image,
+    /// 视频：先让 ffmpeg 出一张缩略图，再解码那张图。
+    Thumbnail,
+    /// 这个类型不预览（音频、文档、目录…）。
+    None,
+}
+
+/// 预览来源怎么定（抽成纯函数是为了能测：`request` 里剩下的只有「起线程」）。
+pub fn preview_source(path: &Path) -> Source {
+    if looks_like_image(path) {
+        Source::Image
+    } else if crate::thumbnail::is_video(path) {
+        Source::Thumbnail
+    } else {
+        Source::None
+    }
+}
+
+/// 后台线程交回来的结果。
+struct Decoded {
+    path: PathBuf,
+    image: Result<DynamicImage, String>,
+    /// 这是**视频缩略图**而不是图片本身（界面上要如实说明，别让人以为视频长这样）。
+    thumbnail: bool,
+}
+
 /// 当前构建确实能解码这个后缀吗（不支持的格式不去读完整文件试运气）。
 pub fn looks_like_image(path: &Path) -> bool {
     path.extension()
@@ -49,9 +79,11 @@ pub struct Preview {
     /// 正在解码哪个文件。
     pending: Option<PathBuf>,
     /// 解码线程的入口。
-    rx: Option<Receiver<(PathBuf, Result<DynamicImage, String>)>>,
+    rx: Option<Receiver<Decoded>>,
     /// 最近一次失败的原因（显示用）。
     pub problem: Option<String>,
+    /// 现在这张是不是视频缩略图（界面标题据此说明来源）。
+    thumbnail: bool,
 }
 
 impl Default for Preview {
@@ -72,6 +104,7 @@ impl Preview {
             pending: None,
             rx: None,
             problem: None,
+            thumbnail: false,
         }
     }
 
@@ -122,9 +155,14 @@ impl Preview {
         self.pending.is_some() && !self.detected
     }
 
-    /// 当前协议名（界面显示用）。
-    pub fn protocol(&self) -> &str {
-        &self.protocol
+    /// 面板标题：视频缩略图要**说明自己是缩略图** —— 第一帧不是这个视频的样子，
+    /// 别让人以为「视频长这样」。
+    pub fn label(&self) -> String {
+        if self.thumbnail {
+            format!("视频缩略图 · {}", self.protocol)
+        } else {
+            self.protocol.clone()
+        }
     }
 
     /// 这一屏要不要预览（够大才画，太小画了也看不清）。
@@ -137,12 +175,15 @@ impl Preview {
         if self.shown.as_deref() == Some(path) || self.pending.as_deref() == Some(path) {
             return;
         }
-        if !looks_like_image(path) {
-            // 不是图片：把上一张清掉，免得看着像「这个视频长这样」
+        let video = preview_source(path) == Source::Thumbnail;
+
+        if preview_source(path) == Source::None {
+            // 不是图片也不是视频：把上一张清掉，免得看着像「这个视频长这样」
             self.state = None;
             self.shown = None;
             self.pending = None;
             self.problem = None;
+            self.thumbnail = false;
             return;
         }
 
@@ -154,7 +195,21 @@ impl Preview {
         let spawned = thread::Builder::new()
             .name(String::from("preview-decode"))
             .spawn(move || {
-                let _ = tx.send((owned.clone(), decode(&owned)));
+                // 视频先出缩略图再解图：ffmpeg 那一段也要在后台，不然翻到一个视频
+                // 界面就卡住半秒 —— 那正是这个线程存在的理由。
+                let (image, thumbnail) = if video {
+                    match crate::thumbnail::ensure(&owned) {
+                        Ok(png) => (decode(&png), true),
+                        Err(error) => (Err(error), true),
+                    }
+                } else {
+                    (decode(&owned), false)
+                };
+                let _ = tx.send(Decoded {
+                    path: owned,
+                    image,
+                    thumbnail,
+                });
             });
         match spawned {
             Ok(_) => self.rx = Some(rx),
@@ -171,14 +226,15 @@ impl Preview {
             return false;
         };
         match rx.try_recv() {
-            Ok((path, result)) => {
+            Ok(decoded) => {
                 self.rx = None;
                 self.pending = None;
-                match result {
+                self.thumbnail = decoded.thumbnail;
+                match decoded.image {
                     Ok(image) => {
                         if let Some(picker) = self.picker.as_ref() {
                             self.state = Some(picker.new_resize_protocol(image));
-                            self.shown = Some(path);
+                            self.shown = Some(decoded.path);
                         }
                     }
                     Err(error) => {
@@ -220,6 +276,7 @@ impl Preview {
         self.pending = None;
         self.problem = None;
         self.rx = None;
+        self.thumbnail = false;
     }
 }
 
@@ -250,6 +307,22 @@ mod tests {
         assert!(!looks_like_image(Path::new("/tmp/a.png.txt")));
     }
 
+    /// 分支逻辑：图片走解码，视频走缩略图，其余不预览。
+    /// 这三条错了的话，表现是「选中视频什么都不显示」或者「音频也去调 ffmpeg」。
+    #[test]
+    fn the_preview_source_matches_the_file_type() {
+        use super::{Source, preview_source};
+
+        assert_eq!(preview_source(Path::new("/x/a.png")), Source::Image);
+        assert_eq!(preview_source(Path::new("/x/a.JPEG")), Source::Image);
+        assert_eq!(preview_source(Path::new("/x/a.mp4")), Source::Thumbnail);
+        assert_eq!(preview_source(Path::new("/x/a.MKV")), Source::Thumbnail);
+        // 音频和文档都不预览：给 mp3 调 ffmpeg 只会白等一次超时。
+        assert_eq!(preview_source(Path::new("/x/a.mp3")), Source::None);
+        assert_eq!(preview_source(Path::new("/x/notes.txt")), Source::None);
+        assert_eq!(preview_source(Path::new("/x/noext")), Source::None);
+    }
+
     #[test]
     fn small_areas_are_not_worth_previewing() {
         assert!(!Preview::worth_showing(20, 20), "太窄：图会糊成一列");
@@ -257,10 +330,11 @@ mod tests {
         assert!(Preview::worth_showing(40, 12));
     }
 
-    /// 不是图片就把上一张放掉 —— 否则「选中一个 mp4，屏幕上还留着刚才那张图」，
-    /// 看着就像那个视频长这样。
+    /// 换成不预览的类型就把上一张放掉 —— 否则「选中一个 mp3，屏幕上还留着刚才
+    /// 那张图」，看着就像那个音频长这样。
+    /// （视频不走这条路：它有自己的缩略图，见 `preview_source`。）
     #[test]
-    fn non_images_clear_the_previous_image() {
+    fn non_previewable_files_clear_the_previous_image() {
         let mut preview = Preview::new();
         // 造一个假的「已经有图」状态：直接塞一个半块协议进去
         let picker = Picker::halfblocks();
@@ -276,8 +350,8 @@ mod tests {
         preview.shown = Some(PathBuf::from("/tmp/a.png"));
         assert!(preview.has_image());
 
-        preview.request(Path::new("/tmp/b.mp4"));
-        assert!(!preview.has_image(), "换成非图片之后不该还留着上一张");
+        preview.request(Path::new("/tmp/b.txt"));
+        assert!(!preview.has_image(), "换成不预览的类型之后不该还留着上一张");
         assert!(preview.shown.is_none());
     }
 

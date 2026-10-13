@@ -1,0 +1,18 @@
+{
+  "id": "git-diff",
+  "title": "查看 Git 差异",
+  "description": "显示当前工作区差异",
+  "command": "git",
+  "params": [],
+  "args": [
+    "diff",
+    "--"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "git",
+    "开发",
+    "只读"
+  ]
+}

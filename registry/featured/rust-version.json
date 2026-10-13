@@ -1,0 +1,16 @@
+{
+  "id": "rust-version",
+  "title": "查看 Rust 版本",
+  "description": "打印 Rust 编译器版本",
+  "command": "rustc",
+  "params": [],
+  "args": [
+    "--version"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "开发",
+    "rust"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "curl-headers",
+  "title": "查看 HTTP 响应头",
+  "description": "仅请求响应头；目标地址由用户提供",
+  "command": "curl",
+  "params": [
+    {
+      "name": "url",
+      "description": "url",
+      "required": true
+    }
+  ],
+  "args": [
+    "-I",
+    "--max-time",
+    "15",
+    "{url}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "网络",
+    "http"
+  ]
+}

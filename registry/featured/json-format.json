@@ -1,0 +1,23 @@
+{
+  "id": "json-format",
+  "title": "格式化 JSON",
+  "description": "使用 jq 校验并格式化 JSON",
+  "command": "jq",
+  "params": [
+    {
+      "name": "path",
+      "description": "path",
+      "required": true
+    }
+  ],
+  "args": [
+    ".",
+    "{path}"
+  ],
+  "safety": "safe",
+  "source": "toolbox-hub/featured",
+  "tags": [
+    "json",
+    "开发"
+  ]
+}
