@@ -71,6 +71,20 @@ jobs:
       - name: 工具仓库自洽（索引 ↔ 产物 ↔ 源码）
         run: cargo run --quiet -- check registry/
 
+      # 容器 job 里的 git 看不见仓库（`fatal: not a git repository`）。这不是
+      # 猜测 —— Registry 那条比对步骤就是因为这个从加进来那天起一直红着。
+      # 这里把事实记进日志：以后再有人在容器里用 git，先看看这段。
+      - name: 诊断：容器里的 git 能看见什么
+        run: |
+          echo "pwd=$(pwd)"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-（未设置）}"
+          echo "--- cwd 下前 20 项 ---"
+          ls -a | head -20
+          echo "--- git rev-parse ---"
+          git rev-parse --git-dir 2>&1 || echo "（git 找不到仓库：所以容器里的步骤不要用 git）"
+          echo "--- 挂载点 ---"
+          ls -ld /__w /__w/* 2>&1 | head -5
+
       # shell 集成的两条前提，纯字符串断言测不出来：
       #   1. 生成的脚本必须能被**它自己的 shell**解析（bash -n / fish --no-execute）；
       #   2. 回填的那一行必须干净、且没填的参数要留下看得见的占位符。
@@ -183,8 +197,30 @@ jobs:
       - name: 冒烟（真跑外部工具 + 真读数据库/联网）
         run: cargo test -- --ignored
 
-      - name: 打包用的 tarball 还能生成
-        run: bash packaging/make-source-tarball.sh
+
+  # 打包用的源码 tarball 能不能生成。**故意不跑在容器里**：这条步骤原来挂在
+  # smoke job（Arch 容器）下，而容器里的 git 看不见仓库，`git archive` 根本跑不了
+  # —— 它一直红着只是因为那次运行还有别的失败挡在前面没轮到它。
+  # 这个脚本只需要 git / sed / tar，跟 libalpm 无关，放 ubuntu 上反而更真实。
+  packaging:
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 源码 tarball 还能打出来
+        run: |
+          set -euo pipefail
+          bash packaging/make-source-tarball.sh
+          tarball="$(ls packaging/toolbox-hub-*.tar.gz | head -1)"
+          echo "打出来了：$tarball"
+          # 只该装已提交的内容：target/ 这类绝不能进去。
+          tar -tzf "$tarball" | grep -c . | xargs echo "条目数："
+          if tar -tzf "$tarball" | grep -qE '(^|/)target/'; then
+            echo "::error::源码包里混进了 target/ —— git archive 的排除失效了" >&2
+            exit 1
+          fi
 
   core-no-pacman:
     permissions:
