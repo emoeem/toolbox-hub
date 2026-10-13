@@ -14,6 +14,10 @@
 //! | Arch 新闻 | `archlinux.org/feeds/news/` | 用来提醒「有没读过的新闻」，pacsea 的 Arch Status 就是这个意思 |
 
 pub mod health;
+#[cfg(feature = "pacman")]
+pub mod libalpm;
+#[cfg(not(feature = "pacman"))]
+#[path = "libalpm_stub.rs"]
 pub mod libalpm;
 pub mod probe;
 pub mod worker;

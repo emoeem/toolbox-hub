@@ -269,24 +269,31 @@ fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, options: &Confirm, yes: 
 
 // ── 翻页器 ──────────────────────────────────────────────────────────────────
 
-pub fn pager(options: &Pager, file: Option<&Path>) -> Result<Outcome, String> {
-    // 内容来源：给了文件读文件，否则读管道。两个都没有就没得翻。
-    let body = match file {
+fn read_pager_body(
+    file: Option<&Path>,
+    stdin_is_terminal: bool,
+    mut input: impl Read,
+) -> Result<String, String> {
+    match file {
         Some(path) => std::fs::read_to_string(path)
-            .map_err(|error| format!("读不了 {}：{error}", path.display()))?,
-        None if !io::stdin().is_terminal() => {
+            .map_err(|error| format!("读不了 {}：{error}", path.display())),
+        None if !stdin_is_terminal => {
             let mut text = String::new();
-            io::stdin()
+            input
                 .read_to_string(&mut text)
                 .map_err(|error| format!("读不了标准输入：{error}"))?;
-            text
+            Ok(text)
         }
-        None => {
-            return Err(String::from(
-                "没有内容可翻：把输出接进来（`cmd | toolbox-hub ui pager`）或给一个文件路径",
-            ));
-        }
-    };
+        None => Err(String::from(
+            "没有内容可翻：把输出接进来（`cmd | toolbox-hub ui pager`）或给一个文件路径",
+        )),
+    }
+}
+
+pub fn pager(options: &Pager, file: Option<&Path>) -> Result<Outcome, String> {
+    // 测试使用可注入输入；不要在单元测试中读取继承的 stdin，因为某些 PTY/远程执行器
+    // 会一直保持写端打开。
+    let body = read_pager_body(file, io::stdin().is_terminal(), io::stdin().lock())?;
 
     // 没有终端：**原样透传**，这样 `cmd | toolbox-hub ui pager | grep foo` 照样能用。
     if !terminal_available() {
@@ -674,13 +681,16 @@ pub fn terminal_available() -> bool {
 }
 
 /// 一个只画到 `/dev/tty` 的小终端会话。stdout 要留给结果。
-struct Session {
+///
+/// `pub(crate)`：shell widget（[`crate::widget`]）也要在这个会话里画选择器 ——
+/// 谁开 raw mode、谁负责还原，只应该有一处。
+pub(crate) struct Session {
     terminal: Terminal<CrosstermBackend<TtyWriter>>,
 }
 
 impl Session {
     /// 没有终端就返回 `None`（调用方按约定给退出码 2 或走 fallback）。
-    fn open() -> Result<Option<Self>, String> {
+    pub(crate) fn open() -> Result<Option<Self>, String> {
         let Some(tty) = open_tty() else {
             return Ok(None);
         };
@@ -698,7 +708,10 @@ impl Session {
         Ok(Some(Self { terminal }))
     }
 
-    fn draw(&mut self, mut paint: impl FnMut(&mut ratatui::Frame, Rect)) -> Result<(), String> {
+    pub(crate) fn draw(
+        &mut self,
+        mut paint: impl FnMut(&mut ratatui::Frame, Rect),
+    ) -> Result<(), String> {
         self.terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -708,16 +721,16 @@ impl Session {
             .map_err(|error| format!("画不出来：{error}"))
     }
 
-    fn poll(&self, millis: u64) -> Result<bool, String> {
+    pub(crate) fn poll(&self, millis: u64) -> Result<bool, String> {
         event::poll(Duration::from_millis(millis)).map_err(|error| format!("等按键失败：{error}"))
     }
 
-    fn read(&self) -> Result<Event, String> {
+    pub(crate) fn read(&self) -> Result<Event, String> {
         event::read().map_err(|error| format!("读按键失败：{error}"))
     }
 
     /// 可视高度（翻页用）。
-    fn height(&self) -> u16 {
+    pub(crate) fn height(&self) -> u16 {
         self.terminal.size().map(|size| size.height).unwrap_or(24)
     }
 }
@@ -775,7 +788,7 @@ fn pick_keys(options: &Pick) -> String {
 ///
 /// 主界面靠 footer 显示这些；组件是独立开的会话，**没有 footer** ——
 /// 不画出来的话，`ui pager` 打开后你根本不知道按什么退出。
-fn draw_hint(frame: &mut ratatui::Frame, area: Rect, keys: &str) {
+pub(crate) fn draw_hint(frame: &mut ratatui::Frame, area: Rect, keys: &str) {
     // 不带边框：这一行只有一行高，加个 `Borders::TOP` 就把仅有的空间吃光了
     // （面板自己已经有下边框，够当分隔）。
     //
@@ -864,17 +877,12 @@ mod tests {
 
     #[test]
     fn pager_without_any_input_explains_itself() {
-        // 测试环境里 stdin 不是 tty，所以这条走的是「没有内容」那一支；
-        // 关键是不能静默成功（退出码 0）也不能 panic。
-        let result = pager(
-            &Pager {
-                title: String::from("probe"),
-            },
-            None,
-        );
-        // stdin 可能是空的管道（不是 tty）→ 读到空串也算成功透传，这是对的；
-        // 单元测试里只要求它不 panic，并且结论是明确的两种之一。
-        assert!(matches!(result, Ok(Outcome::Ok) | Err(_)));
+        // 用可控的 EOF 输入，不读取测试进程真实 stdin。
+        let result = read_pager_body(None, false, io::Cursor::new(Vec::<u8>::new()));
+        assert_eq!(result.expect("空管道是合法输入"), "");
+        let error = read_pager_body(None, true, io::Cursor::new(Vec::<u8>::new()))
+            .expect_err("终端里没有文件或管道内容应明确报错");
+        assert!(error.contains("没有内容可翻"), "{error}");
     }
 
     #[test]

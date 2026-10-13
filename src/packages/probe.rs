@@ -136,7 +136,11 @@ impl Net {
 pub fn state_for(installed: &HashMap<String, String>, name: &str, version: &str) -> InstalledState {
     match installed.get(name) {
         Some(local) => {
-            InstalledState::from_ordering(::alpm::vercmp(version, local.as_str()), local.clone())
+            #[cfg(feature = "pacman")]
+            let ordering = ::alpm::vercmp(version, local.as_str());
+            #[cfg(not(feature = "pacman"))]
+            let ordering = version.cmp(local.as_str());
+            InstalledState::from_ordering(ordering, local.clone())
         }
         None => InstalledState::NotInstalled,
     }

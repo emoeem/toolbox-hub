@@ -11,10 +11,14 @@ description = "Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管�
 license = "MIT"
 repository = "https://github.com/emoeem/toolbox-hub"
 
+[features]
+default = ["pacman"]
+pacman = ["dep:alpm"]
+
 [dependencies]
 # libalpm 直连：搜索 / 包信息 / 已安装 / 可更新数都走它，不再解析 pacman 的文本输出。
 # 代价是二进制依赖 libalpm.so（Arch 上本来就有），换来的是结构化数据与数量级的提速。
-alpm = "5"
+alpm = { version = "5", optional = true }
 # 发信号用（SIGTERM）。之前是 spawn 一个 `kill` 命令 —— 为了不引依赖而绕的路，
 # 结果既慢又多一个可能不存在的程序。
 libc = "0.2"

@@ -577,6 +577,7 @@ mod tests {
     ///
     /// 这条会真的读本机 pacman 数据库（只读）—— 不算纯 hermetic，
     /// 但它是「常驻线程真的活着」的唯一证据，所以留着。
+    #[cfg(feature = "pacman")]
     #[test]
     fn workers_answer_requests() {
         let Ok(worker) = Worker::start() else {
@@ -667,6 +668,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Response::ThreadGone)));
     }
 
+    #[cfg(feature = "pacman")]
     fn describe(response: &Response) -> &'static str {
         match response {
             Response::ThreadGone => "后台线程没了",
