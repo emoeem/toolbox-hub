@@ -216,7 +216,15 @@ CI 新增 `core-no-pacman` job（ubuntu）+ `msrv` job（1.90 编译一次）。
 | `toolbox-hub check registry/` + 重建后 `git diff` | 索引/产物不是源码该产出的那一份 |
 | **widget 冒烟**：`bash -n` / `fish --no-execute` + 渲染断言 | 生成的脚本语法错、回填结果被污染 |
 | **打包脚本语法**：`bash -n` 三个脚本 | 发版路径的脚本平时没人跑，语法错要等到打 tag 才暴露 |
-| `smoke`（每周）：`cargo test -- --ignored` | 真跑 ffmpeg / 7z / jq / pandoc / exiftool / magick |
+| `smoke`（每周/手动）：`cargo test -- --ignored` | 真跑 ffmpeg / 7z / jq / pandoc / exiftool / magick |
+| `packaging`（ubuntu） | 源码 tarball 还能打出来，且包里不含 `target/` |
+| `check` 里的容器 git 诊断 | 把「容器里的 git 看不见仓库」记进日志，省得下次又踩 |
+
+**容器 job 里不要用 git**（这条是踩出来的）：Arch 容器里 `ls -a` 能看见 `.github`、
+`.gitignore`，**唯独没有 `.git`**，于是 `git status` / `git archive` / `git diff` 一律
+`fatal: not a git repository`。Registry 那条「重建后比对」就是这么红了好些天的
+（已改成 `cp -a` + `diff -r`），打包 tarball 那条也因此在冒烟里从来没真正跑过
+（已挪到 ubuntu 的 `packaging` job）。
 
 ---
 

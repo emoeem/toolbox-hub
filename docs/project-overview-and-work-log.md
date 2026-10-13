@@ -255,6 +255,23 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
   测试数 549 → **559**（默认 feature）。fmt / clippy（两套 feature）/ ldd 复验通过，
   featured 35 条与 registry 可复现性未受影响。
 
+### 2026-10-13（推送后修 CI：三条长期红着的门）
+
+推上去才发现 CI 一直是红的 —— 三处都不是这次改出来的，其中两处已经红了很久。
+
+- **`dependencies_come_from_both_declarations_and_actions` 看宿主装没装 jq**：本地装了
+  jq 所以永远过，容器里没有所以永远红。改成两种如实报告都接受。
+- **冒烟的 `/usr/bin/pac`** 是我这台机器上第三方包提供的路径，容器里没有 →
+  换成 `/etc/pacman.conf`；另外冒烟 job 装上 `fzf`（那条断言要的就是「装了 fzf」）、
+  把 `/usr/bin/vendor_perl` 放进 PATH（Arch 的 exiftool 装在那儿，非交互 shell 的
+  PATH 不含它）。修完手动 dispatch 一次，冒烟从 3 红变成全绿。
+- **容器 job 里 git 看不见仓库**：`ls -a` 有 `.github` / `.gitignore`，就是没有 `.git`，
+  凡是用 git 的步骤必死。Registry 的重建比对改成 `cp -a` + `diff -r`（还更直白），
+  tarball 那条挪到新的 ubuntu job `packaging`。随手在 check 里加了条诊断，
+  把这件事记进日志。
+
+现在推送触发的两个工作流（CI / Registry）都是 success，冒烟手动跑也全绿。
+
 ### 2026-10-10（自动重载 + 桌面通知 + CI 门）
 
 - `cargo fmt --all -- --check` 通过。
