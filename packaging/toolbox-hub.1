@@ -4,7 +4,7 @@
 .\" 1. 中文用 .ds 定义不了，直接写在正文里（groff 的 man 宏对 UTF-8 是透明的）；
 .\" 2. 每个选项都写清楚「它到底干了什么」，而不是把 --help 抄一遍 ——
 .\"    手册页的价值在于把「为什么」也写进去。
-.TH TOOLBOX-HUB 1 "2026-10-01" "toolbox-hub 0.1.0" "用户命令"
+.TH TOOLBOX-HUB 1 "2026-10-13" "toolbox-hub 0.1.0" "用户命令"
 .SH 名称
 toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 工具箱
 .SH 概要
@@ -20,6 +20,9 @@ toolbox-hub \- 把命令行工具包成可发现、可填表、可回看的 TUI 
 .B \-i
 .I 包名
 .RI [ 包名 …]
+.br
+.B toolbox-hub widget
+.BR bash | zsh | fish
 .SH 描述
 .B toolbox-hub
 把「命令复杂、参数众多、难以记忆」的命令行工具，以及你自己的脚本，统一包装成一个
@@ -309,6 +312,136 @@ g / G / Home / End 顶底，q / Esc 退出。
 .B \-\-multi
 （Tab 标记，Enter 收工）、
 .BR \-\-dir-only "（" 只让选目录）。
+.SH 生态命令
+这些子命令\fB不进界面\fR：结果只写标准输出，界面（如果有）画在
+.IR /dev/tty 。
+.SS shell 集成（widget）
+.TP
+.B toolbox-hub widget bash
+.ZB
+.BR widget " " zsh
+.BR widget " " fish
+打印一段 shell 集成脚本。加进 shell 配置后按
+.B Ctrl\-G
+弹出命令选择器：
+.PP
+.RS 4
+.EX
+eval "$(toolbox\-hub widget bash)"        # bash
+eval "$(toolbox\-hub widget zsh)"         # zsh
+toolbox\-hub widget fish | source         # fish
+.EE
+.RE
+.PP
+选中的命令\fB不是被执行\fR，而是成为你正在输入的那一行 —— 回车之前还能改。
+执行与历史都留给 shell 自己做，所以历史里记的是
+.BR uname " 这类真实命令，而不是 " toolbox\-hub 。
+.PP
+三条约定：标准输出\fB只\fR放最终命令（选择器画在
+.IR /dev/tty ）；退出码固定
+.RB （ 0
+选中、
+.B 1
+取消、
+.B 2
+参数错或没有终端）；默认只回填，不执行。
+.TP
+.BR \-\-bin " " \fI可执行文件\fR
+脚本里调用哪一个 \fBtoolbox\-hub\fR（开发时指到
+.IR target/debug/toolbox\-hub ）。
+.TP
+.BR widget " " pick
+打开选择器，把选中的命令写到标准输出。参数会在界面里逐个询问；
+\fB回车留空\fR表示保留
+.B <占位符>
+留给你回去手填 —— 塞一个空字符串会让命令「语法对、语义错」。
+.TP
+.BR widget " " render " " \fIRecipeID\fR " [" key=value " …]"
+非交互：直接渲染成一行命令，不打开界面（脚本与测试用这个）。
+.TP
+.B \-\-run
+\fB直接执行\fR（默认只回填）。即使加了它也用 argv 起进程，绝不拼
+.BR "sh \-c" 。
+标为破坏性的 Recipe 还额外要求
+.BR TOOLBOX_HUB_CONFIRM_DESTRUCTIVE=1 。
+.SS Recipe（精选库）
+.TP
+.BR recipe " " list " [" 目录 "]"
+列出精选 Recipe（默认
+.IR registry/featured ）。
+.TP
+.BR recipe " " check " [" 目录 "]"
+校验索引、字段、安全标记与每个文件的 SHA\-256。
+.TP
+.BR recipe " " run " " \fIRecipe.json\fR " [" key=value " …]"
+执行一条 Recipe。安全级别分三级：
+.B safe
+直接跑；
+.B caution
+要
+.BR \-\-confirm ；
+.B destructive
+要
+.BR \-\-confirm\-destructive "、" \-\-audit " " 说明
+与
+.BR TOOLBOX_HUB_CONFIRM_DESTRUCTIVE=1
+三条齐备，并且会把 id/命令/参数打到标准错误留痕。
+.PP
+危险判定是\fB规则式黑名单，不是沙箱\fR：能拦
+.BR "rm \-fr" "、" "dd of=" "、" "| bash" "、" sudo
+这类写法，拦不住
+.BR "xargs rm \-rf" 、
+别名、以及脚本内部的动作。
+.SS 导入速查表
+.TP
+.BR import " " \fInavi|cheat|tldr\fR " " \fI文件\fR " [" \-\-dry\-run "] [" \-\-out " " 目录 "]"
+把现成的速查表转成 Recipe。每一条都会被分成三类：\fB可导入\fR（能安全拆成程序 \+ argv 模板）、
+\fB仅展示\fR（带管道、重定向、命令替换 —— 从字符串还原 shell 语义一定会出错）、\fB跳过\fR
+（命中危险闸门）。tldr 的示例默认仅展示。
+.B \-\-dry\-run
+只报告不落盘。
+.SS 任务队列
+.TP
+.BR queue " " run " " \fItasks.json\fR " [" \-\-jobs " " N "]"
+跑一个 JSON 任务数组（
+.BR {"id","program","args"} ）。
+执行只用 argv，不经 shell；每个任务独立报告退出码与耗时，一个失败不影响其他任务。
+\fB默认并发是 1\fR（一次跑一个），要并行得显式写
+.BR \-\-jobs " " N 。
+退出码
+.B 127
+表示程序起不来，
+.B 126
+表示被危险闸门拦下。
+.PP
+取消走\fB整个进程组\fR：先 SIGTERM 请任务收尾（给 ffmpeg 之类把输出封成可播文件的机会），
+1 秒宽限期过后整组 SIGKILL。任务是脚本时，它自己拉起的子进程会一起收到 ——
+只杀直接子进程会留下继续写文件的孤儿。
+.PP
+终端里按
+.B Ctrl\-C
+同样走这条路（任务自成进程组之后，Ctrl-C 原本碰不到它们），退出码按惯例给
+.BR 130 。
+取消目前是\fB整队\fR语义，命令行还没有「只取消某一个」的入口。
+.SS 预设与历史
+.TP
+.BR preset " " save|list|show|delete
+参数预设，存在配置目录的
+.IR presets/ "，格式是 TOML（"
+.B preset show
+打的就是这份文本，可以直接拷走）。
+早期版本的
+.B .json
+预设会提示用
+.B preset save
+重存一次。
+名字里不允许有
+.BR / "、" .. 
+（它会直接当文件名用）。
+.TP
+.BR history " " list|replay " " \fI序号\fR
+Recipe 的执行历史与回放。原来的 Recipe 已经不存在时，\fB参数照样保留\fR并提示手动选择替代动作 ——
+历史里最值钱的往往是那串参数。
 .SH 界面按键
 进界面按
 .B ?
@@ -365,7 +498,7 @@ g / G / Home / End 顶底，q / Esc 退出。
 进「包管理」域**不再自动打开它**：和其它六个域一样，进域是动作列表，选中才进视图。
 那个列表是四个入口（搜索并安装 / 已安装·卸载 / Arch 新闻 / 系统维护）+ 三个只有
 命令行能做的查询（正则搜官方源 / 这个文件属于哪个包 / 这个包装了哪些文件）——
-会改系统的动作都在中心里或命令行上（B\-iR / B\-rR / B\-uR / B\-\-clear\-cacheR）。
+会改系统的动作都在中心里或命令行上（\fB\-i\fR / \fB\-r\fR / \fB\-u\fR / \fB\-\-clear\-cache\fR）。
 .PP
 \fB输入是模态的\fR：按
 .B /

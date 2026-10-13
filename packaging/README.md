@@ -66,6 +66,20 @@ cd /tmp/aur-toolbox-hub && git add -A && git commit -m "0.1.0-1" && git push
 
 `.SRCINFO` 是**生成物**，别手改：改了 PKGBUILD 就重新生成一次。
 
+**版本更新不用手改**：`bash packaging/update-aur.sh <AUR checkout 目录> <版本号>` 会更新
+`pkgver`、把校验和从 `SKIP` 换成真实值、重生成 `.SRCINFO`，然后**只把 diff 打出来** ——
+提交和推送永远是人的决定。
+
+## 发行产物的签名
+
+GitHub Release 上的 `*.tar.gz` 带 minisign 签名（`.minisig`），用户侧用
+`bash packaging/verify-release.sh <产物>` 一次验完校验和与签名。
+
+密钥的生成、进 GitHub secret、轮换，以及**这套机制不保证什么**，见
+[`release-signing.md`](release-signing.md)。要点：流水线里没有密钥就**直接失败**，
+不会悄悄发一个未签名的二进制；`packaging/minisign.pub` 还没进仓库之前，
+`verify-release.sh` 会以退出码 `2` 说明「验不了不等于验过了」。
+
 ## 手动装（不打包）
 
 ```bash

@@ -180,7 +180,82 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 验证记录
 
-### 2026-10-10（本轮：自动重载 + 桌面通知 + CI 门）
+### 2026-10-13（本轮：生态升级 —— Recipe / Shell 集成 / 队列与安全 / 缩略图 / 签名）
+
+完整变更与逐条证据见 [`../CHANGELOG-ECOSYSTEM.md`](../CHANGELOG-ECOSYSTEM.md)；
+设计依据（字段映射表、回填协议、危险判定形状、放弃的方案）见
+[`ecosystem-design-notes.md`](ecosystem-design-notes.md)。
+
+- `cargo fmt --check` 通过（退出码 0）。
+- `cargo clippy --all-targets --all-features -- -D warnings` 通过；
+  `--all-targets --no-default-features -- -D warnings` 同样通过。
+- `cargo test`：默认 feature **559 通过 / 0 失败 / 16 ignored**；
+  `--no-default-features` **553 通过 / 0 失败 / 16 ignored**。
+- `ldd` 检查 `--no-default-features` 产物：**没有 libalpm**（核心版不依赖它）。
+- `python3 registry/build-featured.py --check` → 35 条 · SHA-256 全对；
+  `toolbox-hub recipe check registry/featured` → 35 条通过。
+- `toolbox-hub build registry/` 重建：只有 `registry/index.json` 多了 `featured` 指针，
+  `registry/artifacts/` **逐字节未变** —— 可复现构建仍然成立。
+- **shell 集成端到端（真 PTY，`script -qec 'bash --norc -i'`）**：`eval` 生成脚本后按
+  `Ctrl-G` → 过滤 `kernel` → `Enter`，`uname -r` 被回填进输入行并执行成功，
+  `history` 里记的是 `uname -r`；fish 用 `fish -i` 同样跑通。PTY 抓包显示 stdout
+  只有 `uname -r\n`（9 字节），界面内容一个字节都没漏。
+- **队列危险拦截**：任务 `rm -rf <canary>` 退出码 126 被拦，canary 目录里的文件仍在，
+  同队列的 `touch` 任务正常完成 —— 拦截不是「整队罢工」。
+- **minisign 真实签验**（minisign 0.11，与 Ubuntu 24.04 仓库同版本）：签名后自验通过；
+  篡改产物 → 退出 1；未签名 → 退出 1；公钥缺失 → 退出 2 并提示「验不了不等于验过了」。
+  把 `release.yml` 的签名步骤从 YAML 里抽出来本地执行：正常路径成功，
+  「无 secret」「无 `packaging/minisign.pub`」两条路径都**拒绝发布**。
+- **AUR 更新脚本**：临时 git checkout 里真跑 —— `sha256sums=('SKIP')` 被换成真实校验和，
+  `.SRCINFO` 重新生成，`git log` 只有初始提交（**没有**自动提交或推送）。
+- **视频缩略图**：桩 ffmpeg 验「命中缓存不重调 / 文件一变必重生成 / 超时被杀 / 失败不留垃圾」；
+  再用真 ffmpeg 造测试视频、生成缩略图并解码成功。这条真跑抓到了
+  「`-f image2` 按后缀挑编码器，`.tmp` 后缀会写成 JPEG」的 bug（桩程序看不见）。
+- `bash -n` / `fish --no-execute` 校验三种 shell 生成脚本的语法，已进 CI。
+
+### 2026-10-12（测试基线阻塞 + libalpm feature 化）
+
+这两项在 2026-10-13 的验证记录之前完成，原文记录在执行记录里（已删），要点留在这里。
+
+- **`cargo test` 卡住不是死锁**：`components::tests::pager_without_any_input_explains_itself`
+  直接调了生产 `pager()`，而它会从**继承来的 stdin** 读到 EOF。远程终端会话保持 stdin 写端
+  打开，测试于是停在 `read_to_string` 上 —— 表现是「测试跑不完」，很容易误判成分页器子进程
+  死锁或 TTY 锁。
+  修法：抽出 `read_pager_body(file, stdin_is_terminal, input)`，测试注入 `io::Cursor` 并覆盖
+  「空管道」与「交互终端无输入」两条分支；生产管道行为仍然是读到 EOF
+  （`cmd | toolbox-hub ui pager` 的语义没变）。
+  复现命令：`timeout 60s cargo test components::tests::pager_without_any_input_explains_itself -- --exact --nocapture`
+  → 修复前一直跑，修复后 1 passed / 0 failed；随后串行全量 504 passed / 0 failed / 16 ignored。
+- **libalpm 变成 Cargo feature**：`default = ["pacman"]`、`pacman = ["dep:alpm"]`、
+  `alpm = { version = "5", optional = true }`；新增 `src/packages/libalpm_stub.rs` 在禁用时
+  保留类型边界并**明确拒绝**数据库动作（不把「没有数据」伪装成「空数据」）。
+  `cargo check/test/clippy --no-default-features` 全部通过；CI 新增 `core-no-pacman` job。
+  注意：非 pacman 构建里 AUR 状态比较退化为字符串排序，**只是显示层降级**，不是 Arch 版本比较。
+
+### 2026-10-13（收尾补修：cheat front matter / 队列取消语义 / 预设改 TOML）
+
+对着最初那份任务表逐条核对时发现的三处「与计划不符」，补在这里。
+
+- **cheat 的 YAML front matter**：按行硬导时 `syntax: bash`、`tags: [networking, dns]` 会各变成
+  一条「可导入」Recipe。现在 front matter 是文件级元数据：`syntax` 记进导入产物的说明、
+  `tags` 并进标签，**不产出条目**；没有闭合的 `---` 会整份跳过并报出来。
+  复现：`toolbox-hub import cheat <真 cheat 文件> --dry-run` —— 修前 3 条可导入（2 条是垃圾），
+  修后 1 条（真的那条 `dig`）。
+- **队列取消改走进程组**：原来 `child.kill()` 只杀直接子进程，任务是脚本时孙子进程会变孤儿
+  继续写文件；默认并发也不符合计划（是 2，计划写 1）。现在启动 `process_group(0)`、
+  取消时 `kill(-pgid, SIGTERM)` → 1 秒宽限 → 整组 SIGKILL，复用交互式执行层的同一个
+  `signal_group`；默认并发回到 **1**（要并行显式 `--jobs N`）。
+  顺带处理了进程组带来的副作用：任务自成组之后终端 Ctrl-C 碰不到它们（只会杀掉
+  `toolbox-hub` 自己），所以队列自己接住 SIGINT 转成取消，退出码按惯例 130。
+  实测：真发 SIGINT，任务与其孙子进程都消失，退出码 130。
+- **预设改 TOML**（原计划就是 TOML，之前落成了 JSON）：`presets/<名字>.toml`，
+  `preset show` 打的就是这份文本；碰到早期版本的 `.json` 预设会提示用 `preset save` 重存，
+  而不是报「文件不存在」。
+- 新增/更新用例 10 条（front matter 4、队列取消与并发 4、预设 TOML 2），
+  测试数 549 → **559**（默认 feature）。fmt / clippy（两套 feature）/ ldd 复验通过，
+  featured 35 条与 registry 可复现性未受影响。
+
+### 2026-10-10（自动重载 + 桌面通知 + CI 门）
 
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --all-targets --all-features -- -D warnings` 通过。
@@ -214,5 +289,11 @@ ignored 测试涉及本机 `/etc`、真实 `$HOME`、pacman/paru 状态、联网
 
 - ~~确定真实许可证~~：已定为 **MIT**（`LICENSE` + `Cargo.toml` 的 `license` + `PKGBUILD` 的 `license=('MIT')` + `package()` 装到 `/usr/share/licenses/`）。
 - 将 PKGBUILD 的占位 GitHub URL 和本地源码包来源替换为真实仓库/tag 地址，并生成校验和及 `.SRCINFO` 后再发布 AUR。
+  （`packaging/update-aur.sh` 已能把 `SKIP` 换成真实校验和并重生成 `.SRCINFO`，但它只在本地
+  checkout 里改；**交 AUR 前仍要人工审阅并推送**，且 `sha256sums=('SKIP')` 不该出现在 AUR 上。）
+- **生成签名密钥并提交公钥**：`minisign -G -W -p packaging/minisign.pub -s ~/.minisign/toolbox-hub-ci.key`，
+  私钥内容进 GitHub secret `MINISIGN_SECRET_KEY`。在公钥进仓库之前，release 流水线会**故意失败**
+  （拒绝发布未签名产物），`verify-release.sh` 会以退出码 2 说明「验不了不等于验过了」。
+  步骤见 `packaging/release-signing.md`。
 - 当前 CLI 支持包管理操作，但还没有通用的 `toolbox-hub run <manifest-id>` 或 JSON 输出接口；这属于独立的 CLI 产品设计，不在本轮修改范围内。
 - 默认 CI 继续运行格式、Clippy 和常规测试；定时真实环境冒烟测试需要先为每个 ignored 测试准备明确的依赖和隔离策略。

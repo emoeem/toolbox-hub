@@ -26,15 +26,21 @@ cargo run                    # 开发版
 cargo build --release && ./target/release/toolbox-hub    # 更快
 ```
 
-**构建前提**（Arch 上一条命令装齐）：
+**构建前提**按用途分三条路：
 
-```bash
-sudo pacman -S --needed base-devel git rust pkgconf chafa
-```
-
-- `pacman`：提供 `libalpm.so` 与 `libalpm.pc`（Arch 上本来就有）。二进制**动态链接 libalpm** ——
-  包数据层是直连 pacman 的库，不是解析它的输出（见下）。非 Arch 系统上编译过不去，这也是有意的：
-  这个工具箱里一半的动作本来就是 pacman / paru。
+- **Arch Linux（完整包管理功能，默认）**：
+  ```bash
+  sudo pacman -S --needed base-devel git rust pkgconf chafa
+  cargo build --release
+  ```
+  \`pacman\` 提供 \`libalpm.so\` 与 \`libalpm.pc\`。默认的 \`pacman\` Cargo feature 让包数据层直连 libalpm。
+- **其他发行版（核心工具箱，不链接 libalpm）**：需要 Rust 工具链与基础编译工具，运行 \`cargo build --release --no-default-features\`。核心 manifest、表单、argv 执行、历史、UI 组件和 ToolHub repository 不依赖 libalpm；包管理域在这个构建中不可用。
+- **只想验证核心构建**：
+  ```bash
+  cargo check --no-default-features
+  cargo test --no-default-features
+  ```
+  这条路径不要求系统安装 libalpm。非 Arch 的实际发行版尚需 CI 矩阵继续验证。
 - `pkgconf` + **`chafa >= 1.8.0`**（pkg-config 名就叫 `chafa`）：`ratatui-image` 的 `build.rs`
   用 pkg-config 探测它，缺了会直接报 `Failed to find chafa via pkg-config ... Needs version >= 1.8.0`。
   本仓库在 `Cargo.toml` 里关了 `ratatui-image` 的默认 feature、只留 `crossterm`，所以这个探测目前
@@ -62,6 +68,47 @@ sudo pacman -S --needed base-devel git rust pkgconf chafa
 **改了配置自动重载**：`~/.config/toolbox-hub/tools.d/` 或 `tools/` 里一动文件，主界面
 用 inotify 侦测到就自动重新发现一遍工具（以前得手按 `Ctrl-R`）—— 写插件时少按几十次键。
 盯的就是这两个目录：程序自己写的 `state.toml`（收藏、上次工作目录）不会把自己弹回顶部。
+
+## Featured Recipe 仓库、导入与自动化 CLI
+
+项目附带 `registry/featured/`：至少 30 条通用 JSON Recipe，包含 `id/title/description/command/params/safety/source/tags`，每个文件的 SHA-256 记录在 `registry/featured/index.json`。根 `registry/index.json` 的 `featured` 字段指向该独立索引。维护命令：
+
+```bash
+python3 registry/build-featured.py --build   # 重新生成哈希索引
+python3 registry/build-featured.py --check   # 校验数量、字段、安全标记与 SHA-256
+./target/debug/toolbox-hub recipe list
+./target/debug/toolbox-hub recipe check
+```
+
+外部速查导入提供 `navi`、`cheat`、`tldr` 三种格式。`--dry-run` 只报告可导入、仅展示与跳过条目，不写文件；shell 管道/重定向和危险命令不会被当作普通 argv 动作。tldr 示例默认仅展示，需人工转换。
+
+```bash
+toolbox-hub import navi ~/.config/navi/cheats/example.cheat --dry-run
+toolbox-hub import cheat ./network.cheat --out ./imported-recipes
+toolbox-hub import tldr ./pages/common/git.md --dry-run
+```
+
+数据命令还提供 JSON 任务队列（`toolbox-hub queue run tasks.json --jobs N`）、参数预设（`preset save/list/show/delete`）与历史回放（`history list` / `history replay <序号>`）。
+
+队列执行直接使用 `Command::new(program).args(args)`，不经 shell；每个任务独立报告退出码，进程启动失败（`127`）与被拦（`126`）都不影响其他任务。**默认并发是 1**（一次跑一个，符合「按顺序让它干活」的预期），要并行得显式写 `--jobs N`。取消走**整个进程组**：先 SIGTERM 请任务收尾，1 秒后还没走就整组 SIGKILL —— 任务是脚本时它自己拉起的子进程会一起收到，不会留下继续写文件的孤儿（和交互式执行层是同一个 `signal_group`）。
+
+终端里按 Ctrl-C 同样走这条路：因为任务是自成进程组的，Ctrl-C 原本只杀得掉 `toolbox-hub` 自己，所以程序自己接住 SIGINT 并转成取消（退出码 130）。要取消**其中某一个**任务，目前还只有 API 层能做（`CancellationToken`），CLI 是整队取消。
+
+参数预设落在 `<配置目录>/presets/<名字>.toml`，**格式是 TOML**（和 `state.toml`、工具 manifest 一致），可以直接打开改、改坏了报错也看得懂；`preset show` 打的就是这份 TOML 文本，`preset show x > presets/x.toml` 能直接拷走。
+
+Recipe 执行走 `recipe run <recipe.json> [key=value …]`，同样只拼 argv。安全级别是 `safe | caution | destructive`：
+
+| 级别 | 执行要求 |
+| --- | --- |
+| `safe` | 直接跑 |
+| `caution` | 需要 `--confirm`；只标了「读取之外还会写点什么」的动作（例如下载到 `{output}`、打包到 `{output}`） |
+| `destructive` | **默认拦截**。要 `--confirm-destructive` + 非空 `--audit <说明>` + 环境变量 `TOOLBOX_HUB_CONFIRM_DESTRUCTIVE=1` 三条齐了才跑，并且会把 id/source/command/args 打到 stderr 留痕 |
+
+校验会**拒绝**把已知破坏性命令标成 `safe` 或 `caution`（`validate_recipe`），所以不存在「改个字段绕过闸门」这条路。
+
+危险判定是**规则式 denylist，不是沙箱**：它按段切词、看程序名与短选项（`rm -fr`、`rm --recursive --force`、`dd of=`、`mkfs.*`、`chmod -R`、`… | bash`、`sudo`/`doas`、fork bomb 都拦），
+但**拦不住**没写到的写法 —— `xargs rm -rf`、`find . -delete`、别名、脚本内部的动作，以及会在 shell 里展开的变量目标（`rm -rf $DIR` 里的 `$DIR` 是什么它不知道）。
+哪些漏、哪些拦，测试里各有一张明确的清单（`guard_catches_footguns_that_the_old_substring_check_missed` / `guard_documents_what_it_cannot_see`）。
 
 ## 两条加东西的路
 
@@ -112,8 +159,51 @@ foreach = "input"                          # 每个输入各跑一次
 线程里就是「按一下 ↓ 卡一下」），结果只缓存当前这一张 —— 往上往下翻不重复解，
 翻过去就放掉。
 
-视频**不预览**：抓首帧要起 ffmpeg、写临时文件，几百毫秒起，不值得放在翻列表的
-路径上。面板上会直说「这个类型不预览」，不留空白。
+视频**也预览**：选中 mp4/mkv 这类文件时，先让 ffmpeg 抓第一帧（在 `-ss 1` 处取，取不到就退到 0 秒），
+再走同一条解码路径。这一帧会**落盘缓存**，下次翻到同一个视频直接命中，不再起 ffmpeg。
+面板标题会写明「视频缩略图」—— 第一帧不等于这个视频的样子，不能让人误会。
+
+缓存放在 `$XDG_CACHE_HOME/toolbox-hub/thumbs`（`TOOLBOX_HUB_CACHE` 可改），**整个目录随时可以删**，
+删了只会重新生成。缓存键是「绝对路径 + 体积 + mtime」：只按路径做键会踩到缩略图缓存最经典的那个
+bug —— 同名文件换了内容，屏幕上还是旧画面，而且怎么刷新都不变。缓存最多留 512 张，超了从最旧的删。
+
+没装 ffmpeg 不会出事：面板直说「取不到缩略图：没找到 ffmpeg（装一个，或设 `TOOLBOX_HUB_FFMPEG` 指到它）」，
+其余预览照常。ffmpeg 卡住有 8 秒上限，到点杀进程 —— 界面不会被一个坏文件拖住。
+
+音频（mp3/flac…）与文档仍然不预览，面板上直说「这个类型不预览」，不留空白。
+
+## Shell 集成（`widget`）
+
+`toolbox-hub widget bash|zsh|fish` 打印一段 shell 脚本，加进 shell 配置后就多一个快捷键（默认 `Ctrl-G`）。
+按下它打开选择器，选中的 Recipe 变成**你正在输入的这一行**：
+
+```bash
+# bash（~/.bashrc）
+eval "$(toolbox-hub widget bash)"
+# zsh（~/.zshrc）
+eval "$(toolbox-hub widget zsh)"
+# fish（~/.config/fish/config.fish）
+toolbox-hub widget fish | source
+```
+
+按 `Ctrl-G` → 打字过滤 → `Enter` 选中 → 命令落到输入行 → 你还能改 → 回车才执行。
+**执行和写历史都是 shell 自己的事**：历史里出现的是 `uname -r`，不是 `toolbox-hub widget …`。
+
+三条约定（和 `ui` 组件同一套，破坏任何一条就没法用）：
+
+1. **stdout 只放最终命令**，选择器画在 `/dev/tty`。所以 `line=$(toolbox-hub widget pick)` 拿到的是干净的一行。
+2. **退出码固定**：`0` 选中 / `1` 取消 / `2` 参数错或没有终端。脚本里 `if line=$(…); then` 直接可用。
+3. **默认只回填，不执行**。要直接跑得显式加 `--run`，而且即便加了也走 argv，绝不拼 `sh -c`。
+
+参数会在选择器里一个一个问；**回车留空就保留 `<占位符>`**，回去手填 —— 塞一个空字符串会让命令
+「语法对、语义错」。非交互场景用 `widget render`：
+
+```bash
+toolbox-hub widget render git-log count=5      # → git log --oneline -n 5
+toolbox-hub widget render os-release --run     # 直接跑（--run 是显式开启的）
+```
+
+zsh 未在本机实测（开发机上没有 zsh），生成脚本的语法与回调 API 有用例覆盖。
 
 **② 自己的脚本** —— 丢进 `~/.config/toolbox-hub/tools/`，头部加注解即可被发现：
 
@@ -304,6 +394,18 @@ toolbox-hub --clear-cache          # 清包缓存（paccache -rk1）
 
 `toolbox-hub --help` 是权威列表。CLI 与 TUI **共用同一份命令翻译**
 （`packages::PackageOperation` + `escalate`），不会出现两边算出来的命令不一样。
+
+生态那批子命令（`recipe` / `import` / `preset` / `queue` / `history` / `widget`）不走上面这套，
+它们各自在本文里有一节；共同点是**都不进 TUI**，结果只写 stdout。
+
+```bash
+toolbox-hub recipe check registry/featured        # 校验精选库（35 条 + SHA-256）
+toolbox-hub import tldr ./git.md --dry-run        # 先看它打算怎么处理，不落盘
+toolbox-hub preset list                           # 参数预设（TOML，存在配置目录）
+toolbox-hub queue run tasks.json --jobs 4         # 并发跑任务（默认 1；argv，不经 shell）
+toolbox-hub history replay 1                      # 回放第 1 条执行记录
+toolbox-hub widget render git-log count=5         # → git log --oneline -n 5
+```
 
 ## 给脚本用的界面组件（`ui …`）
 
@@ -512,14 +614,25 @@ TUI 启动时会顺手看一眼：索引过期就在后台刷新，查完在状�
 - `F` 扫描有上限 500 个 / 250ms，超了显示 `≥500`；软链接目录不往里钻（脚本的 `fd --follow` 会）；
 - **不是**原生调用 libav：执行层始终是 CLI，好处是稳定、可组合、可预览，代价是没有帧级精度；
 - 交互式脚本（fzf 菜单那类）会接管终端、无法后台化 —— 它们本身就是 UI；
-- 危险度只有 `safe` / `caution` 两级；
+- 危险度分 `safe` / `caution` / `destructive` 三级（见上文那张表）。判定是**规则式 denylist**，
+  能拦 `rm -fr` / `dd of=` / `| bash` / `sudo` 这类写法，**拦不住** `xargs rm -rf`、`find -delete`、
+  别名、脚本内部的动作，也不展开变量。它是第一道闸，不是沙箱；
+- 视频缩略图缓存键是「路径 + 体积 + mtime」，**不是内容指纹**：同一秒内把文件换成同样大小的
+  另一个文件，键不变、缩略图就是旧的。要做到逐字节得先把整个文件读一遍，那比重抓一帧还贵；
+- 缩略图取的是第 1 秒那一帧（取不到退到第 0 秒）：它不是「这个视频的样子」，只是「这一段的样子」；
+- shell 集成三种都生成了，但**只有 bash 与 fish 在本机真跑过端到端**（Ctrl-G → 选择 → 回填 →
+  执行 → 进历史）。zsh 只验了脚本内容与回调 API，没有在真 zsh 里按过键；
 - 取消先 SIGTERM（发给**整个进程组**）：ffmpeg 会把已写部分收尾成一个可播的文件，
   但**不是完整结果**；
 - 官方源搜索是**子串匹配**，不是正则。`pacman -Ss` 那种 `^fzf$` 写进来会被当成
   「去掉锚点的词」（排序本来就把完全同名的排最前）；要正则就用「包管理」域里那条
   `pacman -Ss` 动作；
-- 二进制**动态链接 libalpm**：只支持 Arch（这个工具箱本来就一半是 pacman / paru）；
-- 「可更新数」按本地同步库算，库旧了会偏小（状态行会说出来）。
+- 二进制**动态链接 libalpm**：只支持 Arch（这个工具箱本来就一半是 pacman / paru）。
+  非 Arch 用 `--no-default-features` 构建核心版，那条路径**不链接 libalpm**（`ldd` 可验），
+  代价是包管理域不可用；
+- 「可更新数」按本地同步库算，库旧了会偏小（状态行会说出来）；
+- aarch64 的 Release 产物由 `ubuntu-24.04-arm` 原生 runner 构建，**本轮没有真的打过 tag**，
+  所以「多架构发布」这件事只在本地验证了打包与签名逻辑，没有验证过真实发布。
 
 ## sing-box：一套内置的本机代理运维动作
 
@@ -595,18 +708,51 @@ sudo pacman -U toolbox-hub-*.pkg.tar.zst
 而 `ureq` 的 TLS 后端 `ring` 里有一段汇编，在这两个选项下链接会缺
 `ring_core_0_17_14_*` 符号。PKGBUILD 的 `build()` 里把这两个选项摘掉了。
 
+### 发行产物与签名
+
+打 tag（`v*`）会触发 `.github/workflows/release.yml`，构建 x86_64 与 aarch64 两个
+**核心版**二进制（`--no-default-features`，不链接 libalpm），每个架构产出三个文件：
+
+```text
+toolbox-hub-<版本>-<架构>.tar.gz
+toolbox-hub-<版本>-<架构>.tar.gz.sha256
+toolbox-hub-<版本>-<架构>.tar.gz.minisig     # minisign 签名
+```
+
+下载之后一件不用猜的事：**先验再装**。
+
+```bash
+bash packaging/verify-release.sh toolbox-hub-<版本>-<架构>.tar.gz
+```
+
+三种结局分清楚：`0` 通过；`1` 产物被改过 / 没签名 / 签名不对（**不要装，也不要转发**）；
+`2` 是环境问题（没装 minisign、公钥还没进仓库）。「验不了」不等于「验过了」。
+
+签名用的是 minisign：密钥怎么生成、怎么进 GitHub secret、泄露了怎么轮换，见
+[`packaging/release-signing.md`](packaging/release-signing.md)。流水线里没有密钥就
+**直接失败**，不会悄悄发一个未签名的二进制出去。
+
 ## 开发
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test                       # 快，基本 hermetic
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings   # 核心版（不链接 libalpm）
+cargo test --all-features        # 快，基本 hermetic
+cargo test --no-default-features # 非 Arch 路径
 cargo test -- --ignored          # 冒烟：真跑 ffmpeg / 7z / jq / pandoc / exiftool / magick
 cargo test smoke -- --ignored    # 冒烟：真读 pacman 数据库、真联网（AUR / 新闻）
 cargo build
+bash packaging/verify-release.sh <产物>.tar.gz   # 验发行产物（需要 minisign）
 ```
 
-这三条已经进了 CI（`.github/workflows/ci.yml`，跑在 Arch 容器里 —— 链接 libalpm）。
+这些门都在 CI 里（`.github/workflows/ci.yml`）：`check` 跑在 Arch 容器里（链接 libalpm），
+`core-no-pacman` 跑在 ubuntu 上验无 libalpm 的构建与测试，另外还有 `msrv`（1.90 编译一次）
+与 `smoke`（每周一次真跑外部工具）。CI 里还有两条容易被忽略但很值钱的门：**shell 集成脚本
+必须能被它自己的 shell 解析**（`bash -n` / `fish --no-execute`），以及**发版脚本的语法**——
+那批脚本平时没人跑，语法错要等到打 tag 那天才暴露。
+
+`registry/` 的可复现构建也在 CI 里：重建一遍再 `git diff`，产物对不上就红。
 
 fish 补全在 `completions/toolbox-hub.fish`：
 
