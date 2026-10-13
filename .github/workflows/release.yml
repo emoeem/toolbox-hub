@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建核心版（二进制不链接 libalpm）
+        run: cargo build --locked --release --no-default-features --target ${{ matrix.target }}
+      - name: 打包并计算 SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="toolbox-hub-${version}-${{ matrix.target }}"
+          mkdir -p dist
+          install -Dm755 "target/${{ matrix.target }}/release/toolbox-hub" "dist/${name}/toolbox-hub"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          # 校验和里**只写文件名**（所以先 cd 进 dist）。写成 `dist/xxx.tar.gz` 的话，
+          # 用户下载到本地后 `sha256sum -c` 会去找一个不存在的 dist/ 目录 —— 白白
+          # 让人觉得文件坏了。
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      # Ubuntu 24.04 的 universe 里是 minisign 0.11（和上游 0.11 同版本）。
+      - name: 装 minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+
+      # 发布产物必须带签名：密钥没配好就让这一步红，而不是**悄悄发一个没签名的二进制**
+      # 出去 —— 那种失败没人会发现。密钥怎么生成、放在哪，见 packaging/release-signing.md。
+      #
+      # 这里用**无口令**密钥（-W）：minisign 的密码是从 tty 读的，CI 里没有 tty，
+      # 带口令的密钥在流水线里签不出来。防护靠 GitHub secret + 只在 tag 上跑 + 可轮换。
+      - name: minisign 签名
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="toolbox-hub-${version}-${{ matrix.target }}"
+
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::没有配置 MINISIGN_SECRET_KEY —— 拒绝发布未签名的产物。见 packaging/release-signing.md"
+            exit 1
+          fi
+          if [ ! -f packaging/minisign.pub ]; then
+            echo "::error::packaging/minisign.pub 不在仓库里 —— 签了也没人能验。见 packaging/release-signing.md"
+            exit 1
+          fi
+
+          key="$RUNNER_TEMP/minisign.key"
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+
+          minisign -S -W -s "$key" -m "dist/${name}.tar.gz" \
+            -t "toolbox-hub ${version} ${{ github.repository }} ${GITHUB_REF_NAME}"
+
+          # 立刻自检：签完自己验一遍，签错了现在就知道，而不是等用户来报。
+          minisign -V -p packaging/minisign.pub -m "dist/${name}.tar.gz" -x "dist/${name}.tar.gz.minisig"
+          rm -f "$key"
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          append_body: true
+          body: |
+            ## 校验下载到的产物
+
+            每个 `*.tar.gz` 都带一个 `.tar.gz.minisig`（minisign 签名）和一个 `.tar.gz.sha256`。
+
+            ```bash
+            # 1) 校验和
+            sha256sum -c toolbox-hub-<版本>-<架构>.tar.gz.sha256
+
+            # 2) 签名（公钥就是仓库里的 packaging/minisign.pub）
+            minisign -V -p packaging/minisign.pub -m toolbox-hub-<版本>-<架构>.tar.gz
+            ```
+
+            仓库里带了脚本把两件事一起做（也能直接对着 URL 验）：
+
+            ```bash
+            bash packaging/verify-release.sh toolbox-hub-<版本>-<架构>.tar.gz
+            ```
+
+            签名密钥的生成与轮换见 `packaging/release-signing.md`。

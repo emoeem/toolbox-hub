@@ -57,6 +57,9 @@ jobs:
 
       # 先过校验：包本身、索引 ↔ 产物 ↔ 源码三方是否自洽。
       # 有错时 check 返回 1，这一行就会红。
+      - name: 校验 featured Recipe 索引与 SHA-256
+        run: python3 registry/build-featured.py --check
+
       - name: 校验 registry/
         run: ./target/release/toolbox-hub check registry/
 

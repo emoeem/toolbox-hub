@@ -36,12 +36,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 装工具链
-        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa
+        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa fish
         # chafa：ratatui-image 的**可选**图像后端。当前 feature 只用 crossterm
         # （chafa 的探测在 chafa-dyn / chafa-static 里被 cfg 掉，实测 ldd 里没有
         # libchafa），所以构建其实不需要它；这里仍装上是为了和 packaging/PKGBUILD
         # 声明的运行时依赖保持一致，也免得将来打开 chafa 后端时 CI 才炸。
         # 缺了就直接构建失败（这是这个仓库第一次跑 CI 时踩到的）
+        # fish：下面要拿它验生成的集成脚本能不能被解析。
 
       - name: 缓存 cargo
         uses: actions/cache@v4
@@ -51,6 +52,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: featured Recipe 索引与安全校验
+        run: python3 registry/build-featured.py --check
 
       - name: 格式
         run: cargo fmt --check
@@ -66,6 +70,45 @@ jobs:
       # 用同一条命令 —— 改了 registry/ 却在别的 workflow 上，也能被拦住。
       - name: 工具仓库自洽（索引 ↔ 产物 ↔ 源码）
         run: cargo run --quiet -- check registry/
+
+      # shell 集成的两条前提，纯字符串断言测不出来：
+      #   1. 生成的脚本必须能被**它自己的 shell**解析（bash -n / fish --no-execute）；
+      #   2. 回填的那一行必须干净、且没填的参数要留下看得见的占位符。
+      - name: shell widget 冒烟
+        run: |
+          set -euo pipefail
+          cargo build --quiet
+          bin=./target/debug/toolbox-hub
+
+          "$bin" widget bash | bash -n
+          "$bin" widget fish | fish --no-execute
+
+          line="$("$bin" widget render git-log count=5)"
+          [ "$line" = "git log --oneline -n 5" ] || {
+            echo "回填的那一行不对：$line" >&2; exit 1;
+          }
+          line="$("$bin" widget render git-log)"
+          [ "$line" = "git log --oneline -n <count>" ] || {
+            echo "没填的参数应当留下占位符：$line" >&2; exit 1;
+          }
+
+          if "$bin" widget render no-such-recipe >/dev/null 2>&1; then
+            echo "未知 Recipe 应当以非零退出" >&2; exit 1
+          fi
+          if "$bin" widget nushell >/dev/null 2>&1; then
+            echo "不支持的 shell 应当以非零退出" >&2; exit 1
+          fi
+          echo "✓ widget 脚本可解析，渲染结果干净"
+
+      # 发版路径上的脚本平时没人跑，语法错要等到 tag 那天才暴露 —— 这里先挡一道。
+      - name: 打包/发版脚本语法
+        run: |
+          set -euo pipefail
+          for script in packaging/update-aur.sh packaging/verify-release.sh packaging/make-source-tarball.sh; do
+            bash -n "$script"
+            echo "✓ $script"
+          done
+
 
   # Cargo.toml 声明 `rust-version = "1.90"`，但上面的 check 用的是 Arch 的最新
   # stable —— 拦不住「不小心用了 1.91 才有的 API」这类 MSRV 回归。这一 job 固定
@@ -132,3 +175,19 @@ jobs:
 
       - name: 打包用的 tarball 还能生成
         run: bash packaging/make-source-tarball.sh
+
+  core-no-pacman:
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 格式检查
+        run: cargo fmt --check
+      - name: 无包管理功能编译
+        run: cargo build --locked --no-default-features
+      - name: 无包管理功能测试
+        run: cargo test --locked --no-default-features
