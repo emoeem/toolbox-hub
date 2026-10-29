@@ -655,9 +655,9 @@ fn install_inner(
             if !source.is_file() {
                 return Err(format!("产物里没有索引声明的文件「{}」", file.source));
             }
-            let bytes = fs::read(&source)
-                .map_err(|error| format!("读不了 {}：{error}", source.display()))?;
-            let digest = sha256_bytes(&bytes);
+            // 流式算摘要：载荷可能是几十 MB 的二进制，`fs::read` 为了算个哈希
+            // 把它整个读进内存，峰值内存直接翻倍。
+            let digest = sha256_file(&source)?;
             if let Some(wanted) = &file.sha256
                 && *wanted != digest
             {
@@ -683,10 +683,12 @@ fn install_inner(
                 })?;
                 backups.push((file.target.clone(), backup));
             }
+            // 摘要已经在上面校验过，这一步只负责把内容搬过去：走内核复制，
+            // 不再经过本进程的内存。
             if file.kind == FileKind::Bin {
-                atomic::write_executable(&file.target, &bytes)?
+                atomic::copy_executable(&source, &file.target)?
             } else {
-                atomic::write(&file.target, &bytes)?
+                atomic::copy(&source, &file.target)?
             };
             Ok(InstalledFile {
                 path: file.target.clone(),

@@ -4,20 +4,52 @@
 //! 再也管不了，只能手工清理」，所以一律走这里，不许直接 `fs::write` 覆写。
 
 use std::fs;
+use std::io;
 use std::path::Path;
 
 /// 原子写入（父目录不存在会自动建）。
 pub fn write(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    write_with_mode(target, bytes, None)
+    write_atomic(target, None, |handle| {
+        use std::io::Write;
+        handle
+            .write_all(bytes)
+            .map_err(|error| format!("写不了 {}：{error}", target.display()))
+    })
 }
 
-/// 原子写入并设为 0o755（可执行载荷）。权限在 rename **之前**设好，
-/// 最终文件不会以错误权限存在哪怕一瞬间。
-pub fn write_executable(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    write_with_mode(target, bytes, Some(0o755))
+/// 把 `source` 复制到 `target`（同样先写临时文件再 rename）。
+///
+/// 装包时载荷可能是几十 MB 的二进制：先 `fs::read` 进内存再写一遍，峰值内存
+/// 是文件的两倍。这里走 `io::copy`，内存只有内核的拷贝缓冲。
+pub fn copy(source: &Path, target: &Path) -> Result<(), String> {
+    copy_with_mode(source, target, None)
 }
 
-fn write_with_mode(target: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), String> {
+/// 同 [`copy`]，但落地为 0o755。
+pub fn copy_executable(source: &Path, target: &Path) -> Result<(), String> {
+    copy_with_mode(source, target, Some(0o755))
+}
+
+fn copy_with_mode(source: &Path, target: &Path, mode: Option<u32>) -> Result<(), String> {
+    write_atomic(target, mode, |handle| {
+        let mut input = fs::File::open(source)
+            .map_err(|error| format!("读不了 {}：{error}", source.display()))?;
+        io::copy(&mut input, handle)
+            .map_err(|error| format!("写不了 {}：{error}", target.display()))?;
+        Ok(())
+    })
+}
+
+/// 写盘骨架：临时文件 → 填内容 → 设权限 → rename。
+///
+/// 两种载荷（内存里的字节、磁盘上另一个文件）只有「填内容」这一步不同，
+/// 其余（父目录、临时名、权限位、失败清理）必须完全一致 —— 所以收成一个
+/// 带填充闭包的函数，别让两条路径各写一份。
+fn write_atomic(
+    target: &Path,
+    mode: Option<u32>,
+    fill: impl FnOnce(&mut fs::File) -> Result<(), String>,
+) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("{} 没有父目录", target.display()))?;
@@ -33,13 +65,11 @@ fn write_with_mode(target: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(),
         std::thread::current().id()
     ));
 
-    let fill = || -> Result<(), String> {
+    let run = || -> Result<(), String> {
         use std::io::Write;
         let mut handle = fs::File::create(&temp)
             .map_err(|error| format!("写不了 {}：{error}", temp.display()))?;
-        handle
-            .write_all(bytes)
-            .map_err(|error| format!("写不了 {}：{error}", temp.display()))?;
+        fill(&mut handle)?;
         handle
             .flush()
             .map_err(|error| format!("写不了 {}：{error}", temp.display()))?;
@@ -54,7 +84,7 @@ fn write_with_mode(target: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(),
         Ok(())
     };
 
-    match fill() {
+    match run() {
         Ok(()) => fs::rename(&temp, target).map_err(|error| {
             let _ = fs::remove_file(&temp);
             format!("写不了 {}：{error}", target.display())
@@ -89,6 +119,30 @@ mod tests {
         // 目录里不该留下临时文件。
         let leftovers: Vec<_> = fs::read_dir(base.join(".")).expect("dir").collect();
         assert_eq!(leftovers.len(), 1, "不该有临时文件残留");
+        fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn copy_lands_content_and_mode() {
+        let base = std::env::temp_dir().join(format!("toolbox-hub-atomic3-{}", std::process::id()));
+        let source = base.join("payload.bin");
+        fs::create_dir_all(&base).expect("base");
+        fs::write(&source, b"payload").expect("source");
+        let target = base.join("deep/tool");
+
+        copy_executable(&source, &target).expect("copy");
+        assert_eq!(fs::read(&target).expect("read"), b"payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "可执行载荷必须落地为 0755");
+        }
+
+        // 源文件没了要如实报错，而不是留一个空目标或半截文件。
+        fs::remove_file(&target).expect("rm");
+        assert!(copy(&base.join("nope"), &target).is_err());
+        assert!(!target.exists(), "失败时不该留下目标文件");
         fs::remove_dir_all(&base).expect("cleanup");
     }
 }
