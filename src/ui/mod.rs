@@ -50,6 +50,46 @@ pub(crate) fn display_width(text: &str) -> u16 {
     unicode_width::UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
+/// 按显示宽度**硬裁**到 `width` 列，不加任何省略标记。
+///
+/// 表格列用这个：列宽是固定的，末尾塞个 `…` 既挤掉一个字符，又容易让人以为
+/// 「后面还有、只是没显示」—— 而很多时候只是刚好排满。
+///
+/// 一列一列地加，所以中英混排不会错位；放不下的那个宽字符（比如中文）整个丢掉，
+/// 不会留下半个。`width` 为 0 就返回空串。
+pub(crate) fn clip(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out
+}
+
+/// 按显示宽度截断，**真的截掉了**才在末尾补一个 `…`（省略号自己也占 1 列）。
+///
+/// 跟 [`clip`] 的分工：这里带省略号，用在「一段话被砍了，用户该知道」的地方
+/// （例如工具标题）；表格里那些固定宽度的列用 [`clip`]。
+///
+/// 两个边界值得钉住：`elide("中文", 4)` 是 `"中文"`（放得下就不加省略号，不是
+/// `"中…"`）；`width` 为 0 是空串 —— 一列都放不下，省略号也没地方蹲。
+pub(crate) fn elide(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if usize::from(display_width(text)) <= width {
+        return text.to_string();
+    }
+    let mut out = clip(text, width - 1);
+    out.push('…');
+    out
+}
+
 /// 把一串「` · `」分隔的键位提示塞进给定宽度：**整条整条地丢，绝不切一半**。
 ///
 /// 主界面 footer 与 `toolbox-hub ui …` 那三个组件共用它 —— 硬裁出来的
@@ -316,13 +356,49 @@ mod tests {
         backend::{Backend, TestBackend},
     };
 
-    use super::draw;
+    use super::{clip, display_width, draw, elide};
     use crate::{
         app::App,
         model::{Danger, Domain, RunMode, ToolDefinition},
         providers::{Discovery, Provider},
         registry::Registry,
     };
+
+    /// 表格列用的硬裁：一列都不许超，宽字符整个丢，不留半个。
+    #[test]
+    fn clip_never_exceeds_the_width_and_keeps_wide_chars_whole() {
+        assert_eq!(clip("abcdef", 3), "abc");
+        // 中文一格两列：宽 2 只放得下一个，宽 3 也还只有一个（第二个要 4 列）。
+        assert_eq!(clip("中文", 2), "中");
+        assert_eq!(clip("中文", 3), "中");
+        assert_eq!(clip("中文", 4), "中文");
+        // 混排：`a`(1) + `中`(2) = 3 > 2，所以只留 `a`。
+        assert_eq!(clip("a中", 2), "a");
+        assert_eq!(clip("abc", 0), "");
+
+        // 不变量：任何宽度下都不超宽 —— 表格列宽靠这个对齐。
+        for width in 0..10 {
+            let text = "a中b文c🙂d";
+            assert!(
+                usize::from(display_width(&clip(text, width))) <= width,
+                "width={width} 时裁出了 {} 列",
+                display_width(&clip(text, width))
+            );
+        }
+    }
+
+    /// 带省略号的那种：**真的截掉了**才加 `…`，而 `…` 自己也算一列。
+    #[test]
+    fn elide_marks_only_when_something_was_actually_cut() {
+        assert_eq!(elide("abc", 3), "abc", "刚好排满不算截断");
+        assert_eq!(elide("中文", 4), "中文", "放得下就不该加省略号");
+        assert_eq!(elide("abcdef", 4), "abc…");
+        // 宽度 3 = 一个中文（2 列）+ 省略号（1 列）。
+        assert_eq!(elide("中文", 3), "中…");
+        assert_eq!(elide("abcdef", 1), "…");
+        // 一列都没有，省略号也没地方蹲（旧实现会返回一个超宽的 `…`）。
+        assert_eq!(elide("abcdef", 0), "");
+    }
 
     /// 造一个假的 Provider。用它而不是直接塞工具集，是为了让 App 走完整的
     /// reload 流程 —— 顶部栏的 Provider 名、域计数、二级筛选都来自真实路径。

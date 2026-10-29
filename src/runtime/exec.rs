@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
@@ -186,7 +187,9 @@ pub fn parse_chooser_file(text: &str) -> Vec<PathBuf> {
 ///
 /// 找不到这个程序会返回 `ErrorKind::NotFound`，调用方据此提示「没装」。
 pub fn browse_directories(program: &str, cwd: &Path) -> io::Result<BrowsedBack> {
-    let stamp = std::process::id();
+    // 名字里带 pid + 纳秒（见 [`crate::util::temp_tag`]）：`/tmp` 里可预测的名字
+    // 会被预置成符号链接，等这个外部程序往里写。
+    let stamp = crate::util::temp_tag();
     let dir = std::env::temp_dir();
     let cwd_file = dir.join(format!("toolbox-hub-{stamp}-browse.cwd"));
     let chooser_file = dir.join(format!("toolbox-hub-{stamp}-browse.chosen"));
@@ -336,13 +339,25 @@ pub fn parse_duration(text: &str) -> Option<f64> {
     }
 }
 
+/// 探时长的等待上限。
+///
+/// 这条路径跑在 **UI 线程**上（单文件直接执行时，见 [`crate::app`] 的
+/// `probe_duration_cached`）。ffprobe 会老老实实去**打开**目标文件：落在网络挂载、
+/// 或者一个正在被写入/损坏的文件上时，它可以一直不返回 —— 界面就那么卡住，连
+/// 按键都收不到。给个上限：超时就当探不出来，进度条退化成「已跑时间」，功能不打折。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 探一个媒体文件的总时长（秒）。
 ///
 /// 只有声明了 `duration_from` 的动作才会走到这里 —— 工具箱本身不假设任何工具，
 /// 这是「媒体时长」这一个具体需求的实现。ffprobe 不在、或文件读不出来就返回
 /// `None`，进度条退化成「已跑时间」而已，不影响执行。
+///
+/// 等的时候用 `try_wait` 轮询而不是 `wait_with_output()`：后者会一直阻塞到进程退出，
+/// 而上面那个超时正是为了不让它有机会一直阻塞。stderr 丢掉（`null`）—— `-v error`
+/// 下它本来也几乎没输出，留着管道反而可能被写满卡住 ffprobe。
 pub fn probe_duration(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
+    let mut child = Command::new("ffprobe")
         .args([
             "-v",
             "error",
@@ -352,12 +367,59 @@ pub fn probe_duration(path: &Path) -> Option<f64> {
             "csv=p=0",
         ])
         .arg(path)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    match wait_with_timeout(&mut child, PROBE_TIMEOUT) {
+        WaitOutcome::Exited(_) => {}
+        WaitOutcome::TimedOut | WaitOutcome::Failed(_) => return None,
+    }
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }
     parse_duration(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// [`wait_with_timeout`] 的结果。
+///
+/// 超时和「`try_wait` 自己出错」要分开：调用方对前者往往有专门的说法
+/// （「ffmpeg 超过 N 秒没出图」），对后者只能说「等它失败」。
+pub enum WaitOutcome {
+    /// 进程退出了（退出码可能是非 0，那由调用方判断）。
+    Exited(std::process::ExitStatus),
+    /// 等超时了；进程**已经**被杀掉并收尸。
+    TimedOut,
+    /// `try_wait` 本身失败。
+    Failed(io::Error),
+}
+
+/// 等一个子进程退出；超过 `timeout` 就杀掉它。
+///
+/// 用 `try_wait` 轮询而不是直接 `wait()`：后者会一直阻塞到进程退出，那就没有
+/// 「超时」可言了。轮询间隔 20ms —— 等外部命令出结果这种事不在乎这几十毫秒。
+///
+/// 超时后**先 kill 再 wait**：只 kill 不 wait 会让它变僵尸留在进程表里。
+///
+/// 探时长（[`probe_duration`]）与缩略图（[`crate::thumbnail`]）共用这一份：
+/// 两边原先各写了一遍同样的轮询，改超时策略要改两处。
+pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> WaitOutcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return WaitOutcome::Exited(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return WaitOutcome::TimedOut;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return WaitOutcome::Failed(error),
+        }
+    }
 }
 
 /// 后台任务发回来的事件。
@@ -574,6 +636,14 @@ impl Drop for RunningJob {
     }
 }
 
+/// 单条流最多给「最终输出」留多少行。
+///
+/// 界面只画尾部十几行（`app::TAIL_LINES`），但 `Captured` 里这一份是**全文**，
+/// 而且它要活到任务结束、还要进历史记录。`ffmpeg -v debug`、卡住的 rsync、
+/// 一个跑飞的 `yes`，都能在几分钟里堆到几百 MB —— 那是把内存交给被执行的程序去决定。
+/// 留尾部就够了：真正的结果在最后，前面丢了多少行会写在开头。
+const MAX_CAPTURED_LINES: usize = 4000;
+
 /// 一条流的读线程：逐行发 `Line` / `Progress`，返回攒下来的全文。
 ///
 /// ffmpeg 的进度用 `\n` 分隔，统计行用 `\r`，所以两种都当行分隔符处理。
@@ -583,9 +653,10 @@ fn reader_thread(
     tx: mpsc::Sender<JobEvent>,
 ) -> thread::JoinHandle<String> {
     thread::spawn(move || {
-        let mut collected = String::new();
+        let mut collected: VecDeque<String> = VecDeque::new();
+        let mut dropped = 0usize;
         let Some(stream) = stream else {
-            return collected;
+            return String::new();
         };
 
         let mut reader = BufReader::new(stream);
@@ -620,11 +691,28 @@ fn reader_thread(
                     stderr: is_stderr,
                     text: line.to_string(),
                 });
-                collected.push_str(line);
-                collected.push('\n');
+                collected.push_back(line.to_string());
+                // 超出就丢最老的：界面和「复制输出」都只看尾部，留前面没有意义。
+                if collected.len() > MAX_CAPTURED_LINES {
+                    collected.pop_front();
+                    dropped += 1;
+                }
             }
         }
-        collected
+
+        let mut text = String::new();
+        if dropped > 0 {
+            // 得说出来：否则用户以为程序就输出了这么点，而「真正的原因」可能
+            // 正好在被丢掉的那一段里。
+            text.push_str(&format!(
+                "…（输出太长，前面 {dropped} 行没保留；下面是最后 {MAX_CAPTURED_LINES} 行）\n"
+            ));
+        }
+        for line in collected {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
     })
 }
 
@@ -877,6 +965,45 @@ mod tests {
         assert!(!captured.cancelled);
     }
 
+    /// 输出要有上限：一个跑飞的 `yes`、`ffmpeg -v debug` 不能把内存交给被执行的
+    /// 程序去决定。留尾部（结果在最后），并在开头说清前面丢了多少行 ——
+    /// 不说的话，用户会以为程序就输出了这么点。
+    #[test]
+    fn a_flood_of_output_keeps_only_the_tail() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let Some(program) = super::find_on_path("seq") else {
+            return; // 没有 coreutils 的环境跳过
+        };
+        let argv = vec![String::from("1"), String::from("10000")];
+        let job = spawn_captured(&program, &argv, &PathBuf::from("/tmp"), "seq").expect("spawn");
+        let captured = loop {
+            match job.events.recv_timeout(Duration::from_secs(30)) {
+                Ok(JobEvent::Done(captured)) => break captured,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => panic!("等超时了"),
+                Err(RecvTimeoutError::Disconnected) => panic!("事件通道断了"),
+            }
+        };
+
+        let lines: Vec<&str> = captured.stdout.lines().collect();
+        assert!(
+            lines.len() <= super::MAX_CAPTURED_LINES + 1,
+            "保留的行数要有上限，实际 {} 行",
+            lines.len()
+        );
+        assert!(
+            lines[0].contains("没保留"),
+            "开头要交代丢了多少行：{:?}",
+            lines[0]
+        );
+        assert_eq!(
+            lines.last(),
+            Some(&"10000"),
+            "尾部必须保留 —— 结果通常在最后"
+        );
+    }
+
     /// 取消：长命令要能立刻打断，而且必须明确标成「被取消」。
     /// 任务对象被丢掉时必须把子进程带走 —— 否则退出 TUI 会留下孤儿进程。
     #[test]
@@ -1094,6 +1221,58 @@ mod tests {
             super::browse_directories("definitely-not-a-real-program-xyz", &PathBuf::from("/tmp"))
                 .expect_err("应该报错");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// 探时长那条路跑在 UI 线程上，所以「等」必须有上限：一个不肯退的外部进程
+    /// 不能把界面带走。这里用一个 sleep 30 的进程验证上限真的生效。
+    #[test]
+    fn waiting_for_a_hung_process_gives_up() {
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep 总该有");
+        assert!(
+            matches!(
+                super::wait_with_timeout(&mut child, Duration::from_millis(200)),
+                super::WaitOutcome::TimedOut
+            ),
+            "超时要报 TimedOut，不能混成「等它失败」"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "不该真的等满 30 秒（实际 {:?}）",
+            started.elapsed()
+        );
+        // 杀完了要收尸，否则进程表里留一个僵尸。
+        let _ = child.wait();
+    }
+
+    /// 正常退出的进程要拿到它的状态，不能因为轮询写得不对而误判超时。
+    #[test]
+    fn waiting_for_a_quick_process_returns_its_status() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("true 总该有");
+        match super::wait_with_timeout(&mut child, Duration::from_secs(5)) {
+            super::WaitOutcome::Exited(status) => assert!(status.success()),
+            super::WaitOutcome::TimedOut => panic!("5 秒等一个 true，不该超时"),
+            super::WaitOutcome::Failed(error) => panic!("不该失败：{error}"),
+        }
+    }
+
+    /// 探一个不存在的文件的时长：ffprobe 要么不存在、要么报错退出 —— 都不能 panic，
+    /// 也不能卡住（这条路径在 UI 线程上）。
+    #[test]
+    fn probing_a_missing_file_is_none_and_does_not_hang() {
+        let started = std::time::Instant::now();
+        assert!(super::probe_duration(std::path::Path::new("/dev/null/nope.mp4")).is_none());
+        assert!(
+            started.elapsed() < super::PROBE_TIMEOUT + Duration::from_secs(2),
+            "不该超过探测超时（实际 {:?}）",
+            started.elapsed()
+        );
     }
 
     #[test]

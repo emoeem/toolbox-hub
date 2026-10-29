@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    model::{Danger, Domain, RunMode, ToolDefinition},
+    model::{Domain, ToolDefinition},
     providers::{Discovery, Provider, metadata},
 };
 
@@ -94,8 +94,8 @@ impl ScriptedProvider {
             // 注解脚本自己负责交互，不经过参数表单。
             pin: None,
             action: None,
-            mode: mode_of(head, name),
-            danger: danger_of(head, name),
+            mode: metadata::mode_of(head, name),
+            danger: metadata::danger_of(head, name),
             path,
             ready,
         }
@@ -147,20 +147,6 @@ impl Provider for ScriptedProvider {
         }
         Ok(Discovery::clean(tools))
     }
-}
-
-/// 脚本注解里声明的执行方式；不写就是「接管终端」（FFTools 那批全靠 fzf 交互）。
-fn mode_of(head: &str, name: &str) -> RunMode {
-    metadata::meta(head, name, "mode")
-        .and_then(|raw| RunMode::parse(&raw))
-        .unwrap_or(RunMode::Interactive)
-}
-
-/// 脚本注解里声明的危险度；不写就是安全。
-fn danger_of(head: &str, name: &str) -> Danger {
-    metadata::meta(head, name, "danger")
-        .and_then(|raw| Danger::parse(&raw))
-        .unwrap_or(Danger::Safe)
 }
 
 /// 没写 `domain` 注解时，按脚本名与说明猜一个域。

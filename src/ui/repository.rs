@@ -16,7 +16,7 @@ use crate::{
         repo_view::{Confirm, RepoMode, RepositoryView},
     },
     repository::{cache::CacheState, config::Trust},
-    ui::{overlay, theme},
+    ui::{clip, overlay, theme},
 };
 
 /// 详情区固定留几行。
@@ -573,19 +573,4 @@ fn trust_color(trust: Trust) -> Style {
         Trust::Community => Style::default().fg(theme::YELLOW),
         Trust::Unknown => Style::default().fg(theme::RED),
     }
-}
-
-/// 按显示宽度截断（中文是两格）。
-fn clip(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + ch_width > width {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
-    out
 }

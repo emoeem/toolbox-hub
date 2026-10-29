@@ -106,7 +106,15 @@ fn xdg(variable: &str, fallback: &str) -> PathBuf {
             return path;
         }
     }
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    // `$HOME` 没设（cron / systemd 少配环境）或者是相对路径时，不能就这么 `join`：
+    // 空路径 join 出来是**相对路径**，于是配置、缓存、队列全按当前工作目录解释 ——
+    // 在哪个目录启动就写哪，还会随 `cd` 变，而界面上一点异常都看不出来。
+    // 退到 `/`：路径仍是绝对的，写不进去会老老实实报错（那种环境下本来也没有
+    // 用户的「家」可用）。
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/"));
     home.join(fallback)
 }
 

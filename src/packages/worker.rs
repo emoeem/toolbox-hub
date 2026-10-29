@@ -450,16 +450,9 @@ fn pkgbuild_report(name: &str, check: bool, cwd: &Path) -> Result<PkgbuildReport
     }
 
     // 写到临时文件：检查工具要的是文件，不是管道。名字带 pid + 纳秒时间戳，
-    // 不给 sticky /tmp 里的符号链接攻击留可预测路径。
-    let unique = format!(
-        "toolbox-hub-{}-{}-PKGBUILD",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
-    );
-    let path = std::env::temp_dir().join(unique);
+    // 不给 sticky /tmp 里的符号链接攻击留可预测路径（见 [`crate::util::temp_tag`]）。
+    let path =
+        std::env::temp_dir().join(format!("toolbox-hub-{}-PKGBUILD", crate::util::temp_tag()));
     std::fs::write(&path, &fetched.stdout)
         .map_err(|error| format!("写不了临时文件 {}：{error}", path.display()))?;
 

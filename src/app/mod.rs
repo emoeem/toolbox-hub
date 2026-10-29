@@ -1575,7 +1575,13 @@ impl App {
                     // 不能直接写默认路径，否则覆盖过队列路径时（测试、将来可能的
                     // 多实例）会清错文件。
                     let path = self.queue_path.clone().unwrap_or_else(packages::queue_path);
-                    let _ = packages::save_queue_to(&path, &[]);
+                    // 写不进去得说出来：这里吞掉的话「我清空了队列」不会被记住，
+                    // 下次打开又把旧队列原样读回来（磁盘满、数据目录被删都会这样），
+                    // 而界面上一点提示都没有 —— 用户只会以为工具箱不认账。
+                    // 注意：不因为这个错误中断流程，包已经装完了。
+                    if let Err(error) = packages::save_queue_to(&path, &[]) {
+                        self.message = format!("队列没能清空（下次打开还会看到旧的）：{error}");
+                    }
                 }
             }
             Plan::Upgrade { program } => {

@@ -36,7 +36,7 @@ use crate::{
     app::TextInput,
     components::{Outcome, Session, UNSUPPORTED_CODE, draw_hint},
     ecosystem::{Recipe, RecipeParam, SafetyLevel},
-    ui::{display_width, theme},
+    ui::{elide, theme},
 };
 
 /// 选择器默认绑的按键（只用于文档与提示；真正的绑定写在生成的脚本里）。
@@ -560,7 +560,7 @@ fn draw_picker(
                     theme::FAINT
                 }),
             ),
-            Span::styled(format!("{:<22}", truncate(&recipe.title, 22)), title_style),
+            Span::styled(format!("{:<22}", elide(&recipe.title, 22)), title_style),
             Span::styled(format!("{badge} "), Style::default().fg(color)),
             Span::styled(command, Style::default().fg(theme::DIM)),
         ]));
@@ -653,25 +653,6 @@ fn filter_line(input: &TextInput) -> Line<'static> {
 fn command_preview(recipe: &Recipe) -> String {
     let empty = BTreeMap::new();
     render_line(&recipe.command, &recipe.args, &empty)
-}
-
-/// 按**显示宽度**截断（中文占 2 列，按字符数截会错位）。
-fn truncate(text: &str, width: usize) -> String {
-    if usize::from(display_width(text)) <= width {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let w = usize::from(display_width(&ch.to_string()));
-        if used + w > width.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────

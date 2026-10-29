@@ -578,7 +578,9 @@ fn pick_external(program: &str, options: &Pick) -> Result<ExternalPick, String> 
         );
     }
 
-    let stamp = std::process::id();
+    // pid + 纳秒，不用光秃秃的 pid：`/tmp` 里可预测的名字会被预置成符号链接，
+    // 等这个外部程序把「选中了什么」写进去（见 [`crate::util::temp_tag`]）。
+    let stamp = crate::util::temp_tag();
     let dir = std::env::temp_dir();
     let chooser = dir.join(format!("toolbox-hub-{stamp}-pick.chosen"));
     let cwd_file = dir.join(format!("toolbox-hub-{stamp}-pick.cwd"));

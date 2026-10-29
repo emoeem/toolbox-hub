@@ -29,7 +29,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use sha2::{Digest, Sha256};
@@ -231,19 +231,14 @@ fn run_ffmpeg(
         })?;
 
     // 自己看着时间：坏文件能让 ffmpeg 卡很久，而界面只该等这么一会儿。
-    let deadline = Instant::now() + budget;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("ffmpeg 超过 {} 秒没出图", budget.as_secs()));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(format!("等 ffmpeg 失败：{error}")),
+    // 轮询 + 超时杀进程这一份在 `runtime::wait_with_timeout` 里（探时长也用同一份）。
+    let status = match crate::runtime::wait_with_timeout(&mut child, budget) {
+        crate::runtime::WaitOutcome::Exited(status) => status,
+        crate::runtime::WaitOutcome::TimedOut => {
+            return Err(format!("ffmpeg 超过 {} 秒没出图", budget.as_secs()));
+        }
+        crate::runtime::WaitOutcome::Failed(error) => {
+            return Err(format!("等 ffmpeg 失败：{error}"));
         }
     };
 
@@ -533,7 +528,7 @@ cp "{png}" "$out"
         permissions.set_mode(0o755);
         fs::set_permissions(&hanging, permissions).expect("chmod");
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let error = ensure_with(
             &cache,
             hanging.to_str().expect("utf8"),

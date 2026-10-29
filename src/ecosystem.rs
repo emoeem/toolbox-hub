@@ -1,7 +1,6 @@
 //! Ecosystem helpers: Recipe validation/import, presets, replay and argv queue.
 use crate::runtime::signal_group;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -539,11 +538,13 @@ pub fn validate_recipe(r: &Recipe) -> Result<(), String> {
     }
     Ok(())
 }
+/// 一个文件的 SHA-256。
+///
+/// 转发到 [`crate::repository::install::sha256_file`]：那一份是**流式**读（64KB
+/// 缓冲），这里以前是自己 `fs::read` 整个文件再 digest —— 一份重复的哈希实现，
+/// 而且 registry 的包有多大就吃多少内存。
 pub fn sha256(p: &Path) -> Result<String, String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(fs::read(p).map_err(|e| e.to_string())?)
-    ))
+    crate::repository::install::sha256_file(p)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Preset {

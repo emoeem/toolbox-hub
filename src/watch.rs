@@ -20,11 +20,21 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::providers::{manifest, scripted};
+
+/// 两次重载之间的最小间隔。
+///
+/// 标志位只能把**同一帧**里的多条事件收敛成一次，而主循环是每帧（100ms）都来问的：
+/// 编辑器保存一个文件常常是「写临时文件 → rename」两步、`git checkout` 更是几十个
+/// 文件连发 —— 于是「改一次」变成「连续好几帧各重载一次」，每次都是全量重扫
+/// （列 PATH、读每个脚本头部、解析每个 TOML），白付好几遍。
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// 只有这两个子树里的改动算「用户改了配置」：用户的 TOML manifest 和用户脚本。
 ///
@@ -36,6 +46,9 @@ const USER_CONTENT_DIRS: [&str; 2] = [manifest::USER_DIR, scripted::USER_TOOLS_D
 /// watcher 随结构体一起 drop：句柄没了，监听线程自然收尾，不需要手工停。
 pub struct ConfigWatcher {
     changed: Arc<AtomicBool>,
+    /// 上次真正放行重载的时刻（见 [`Self::take_changed`] 里的冷却）。
+    /// `None` = 还没重载过：第一次事件要立刻放行，不该被还没发生的「上一次」挡住。
+    last_reload: Mutex<Option<Instant>>,
     _watcher: RecommendedWatcher,
 }
 
@@ -70,14 +83,32 @@ impl ConfigWatcher {
         watcher.watch(config_dir, RecursiveMode::Recursive).ok()?;
         Some(Self {
             changed,
+            last_reload: Mutex::new(None),
             _watcher: watcher,
         })
     }
 
     /// 自上次以来用户改过配置没有（读一次就清零）。一次编辑常常触发多条事件，
     /// 标志位把它们收敛成一次重载。
+    ///
+    /// 冷却期里**不消费**标志位，而是把它放回去：主循环是每帧都来问的，下一帧
+    /// （100ms 后）自然还会拿到。反过来写成「冷却期内返回 false 并把标志清掉」，
+    /// 那最后一次改动的事件就被丢了 —— 改了配置却永远不刷新，比多刷几次糟得多；
+    /// 而且主循环空闲时也在 100ms 一轮（`event::poll` 的超时），不会没人来问。
     pub fn take_changed(&self) -> bool {
-        self.changed.swap(false, Ordering::SeqCst)
+        if !self.changed.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        let Ok(mut last) = self.last_reload.lock() else {
+            return true; // 锁坏了就别在冷却上纠缠，重载一次没什么代价
+        };
+        let now = Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < RELOAD_DEBOUNCE) {
+            self.changed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 }
 
@@ -175,6 +206,32 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(flipped, "写了 tools.d 里的 manifest 应当要求重载");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// 冷却只能**推迟**重载，绝不能**丢掉**事件。
+    ///
+    /// 这是这条去抖最容易写错的地方：写成「冷却期内把标志清掉、返回 false」，
+    /// 那最后一次改动的事件就永远消失了 —— 改了配置却再也不刷新，比多刷几次糟得多。
+    #[test]
+    fn debounce_defers_the_flag_instead_of_dropping_it() {
+        let root = temp_dir("debounce");
+        let watcher = ConfigWatcher::spawn(&root).expect("真目录应当挂得上");
+
+        watcher.changed.store(true, Ordering::SeqCst);
+        assert!(watcher.take_changed(), "第一次要放行");
+
+        // 紧接着再来一条（编辑器保存的第二下、git checkout 的第二个文件）。
+        watcher.changed.store(true, Ordering::SeqCst);
+        assert!(!watcher.take_changed(), "冷却期内不该放行");
+        assert!(
+            watcher.changed.load(Ordering::SeqCst),
+            "但标志位得留着 —— 丢掉它，这次改动就永远不会被重载"
+        );
+
+        std::thread::sleep(RELOAD_DEBOUNCE + Duration::from_millis(50));
+        assert!(watcher.take_changed(), "冷却过后要放行，不能一直拖着");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

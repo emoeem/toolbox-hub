@@ -36,6 +36,8 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use crate::model::{Danger, RunMode};
+
 /// 只读文件头部这么多行解析元数据。
 pub const HEAD_LINES: usize = 40;
 const HEAD_BYTES: u64 = 16 * 1024;
@@ -82,6 +84,24 @@ pub fn read_head(path: &Path) -> String {
 /// `internal=true` 的内部件：主菜单、共享库、预览器之类，不该出现在工具列表里。
 pub fn is_internal(head: &str, name: &str) -> bool {
     meta(head, name, "internal").as_deref() == Some("true")
+}
+
+/// 脚本注解里声明的执行方式；不写就是「接管终端」。
+///
+/// 注解脚本（`scripted`）与 FFTools（`fftools`）原本各写了一份逐字节相同的实现，
+/// 语义完全一致 —— 放在底座里，将来改默认值（比如把缺省从 `Interactive` 改成
+/// `Capture`）只需要动一处。
+pub fn mode_of(head: &str, name: &str) -> RunMode {
+    meta(head, name, "mode")
+        .and_then(|raw| RunMode::parse(&raw))
+        .unwrap_or(RunMode::Interactive)
+}
+
+/// 脚本注解里声明的危险度；不写就是安全。
+pub fn danger_of(head: &str, name: &str) -> Danger {
+    meta(head, name, "danger")
+        .and_then(|raw| Danger::parse(&raw))
+        .unwrap_or(Danger::Safe)
 }
 
 /// `requires=` 的解析结果。
