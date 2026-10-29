@@ -326,18 +326,50 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
   脚本跑过）；三个改过的脚本各做了实跑验证（见上）。
 - 已重新执行 `install.sh`，`~/.local/bin` 六个副本与源码逐字节一致。
 
+### 2026-10-29（第五轮：把上一轮「未做」里能安全做的做掉，顺手再挖两个 bug）
+
+- **8 处把 shell 变量拼进 python 源码**（`open('$CONF')`）全部改成走 argv。
+  实测旧写法：`CONF` 里带单引号 → `SyntaxError: unterminated string literal`；
+  新写法同一路径 rc=0。附一条回归：配置目录名含 `'`、`$()`、空格也能正常读。
+  顺带合并了重复判定 —— `switch-tun` / `switch-ebpf` 原来是两次 python 各读一遍
+  配置来判「是 ebpf 还是 tun」，现在一次读全、交给 `case` 判定（三处提示文案各自保留）。
+- **`sing-box-why` 报不出放行建议**：`route_idx` 在没有 reject 规则时是字符串 `?`，
+  直接进 `$((route_idx + 1))` → bash 报「算术语法错误」，`set -u` 再补一刀
+  「SUGGEST: 未绑定的变量」，整份报告一个字都不输出。改成数字才用，否则退化成
+  「广告 reject 规则之前」。两种配置各实测一遍，都出建议。
+- **`sing-box-why` 的 IPv6 目标是坏的，且探测命令经过 shell**：那段用
+  `bash -c "(sleep 2) | timeout 6 openssl s_client -connect {dial}:{port} ..."`，
+  IPv6 不带方括号 → openssl 直接判 `malformed or ambiguous`（实测对比过两种写法）；
+  目标值来自命令行，含分号空格会被 shell 解释。改成 `Popen` + 参数列表 + 自动加
+  方括号 + 关 stdin 后再 kill 兜底。验证方式：用假 `openssl` 记录真实 argv →
+  `[2606:4700:4700::1111]:443`，且 `example.com; touch /tmp/...` 没有被执行。
+- **四个脚本「重启失败」不回滚**：主路径 `systemctl restart` 是裸调用，失败时
+  `set -e` 就地退出，而回滚逻辑排在**后面**的健康检查里 —— 结果配置已经换成新的、
+  服务起不来、脚本一声不响退了。四个脚本统一就地兜住（还原备份 → 再启一次 → exit 1）。
+  验证：假 systemctl 第一次失败第二次成功，四个脚本都是 rc=1、配置还原为旧内容、
+  systemctl 被调用 2 次；旧写法同一场景下配置停在 `NEW`。
+- **`install.rs` 装包不再把整个文件读进内存**：`fs::read` + `sha256_bytes` +
+  `atomic::write` 换成流式 `sha256_file` + `atomic::copy` / `copy_executable`
+  （`io::copy`，内存只有内核拷贝缓冲）。`atomic.rs` 顺手抽出 `write_atomic`
+  填充闭包 —— 两种载荷只差「填内容」这一步，其余（父目录、临时名、权限位、
+  失败清理）必须一致，不该写两遍。`write_executable` 因此没人用了，删掉。
+
+验证：
+- `cargo fmt --check`、`clippy --all-targets --all-features -- -D warnings` 通过；
+  `cargo test --all-features` **567 passed / 16 ignored**，`--no-default-features`
+  **561 passed / 16 ignored**（+1：`copy_lands_content_and_mode`）。
+- `bash -n` 覆盖 `packaging/*.sh` + `scripts/sing-box/*`（8 个文件）；内嵌 python
+  块（含 `PYEOF` 定界符）逐个 `py_compile`。
+- 四个脚本按 CI 同一段本地跑过；改动处都有实跑对比（见上）。
+
 未做（记在这里，别当成已修）：
 - **四个脚本之间还有约 180 行同源代码**（提权重执行、check→备份→替换→重启、
   回滚、出口对比、DNS 探测）。抽公共文件的**真正难点在分发**：`install.sh` 与
   `PKGBUILD` 都是按 `sing-box-*` 通配装的，多一个 `lib.sh` 不会被装走 → 装完六个
   脚本全部 `source: No such file`，而 install.sh 依然报告成功。要么构建期内联展开，
   要么改两处打包清单，得单独决定。
-- `python3 - ... <<PY` 里仍有 8 处把 shell 变量直接拼进 python 源码字符串
-  （`open('$CONF')`）：路径带空格/单引号就语法错，理论上可注入。改成传 argv
-  是现成做法（`switch-ebpf` 已经这么写了），但 8 处挨个改动且需要重跑验证。
-- `install.rs:658` 装包时 `fs::read` 整个文件再 `atomic::write`，大二进制会让内存
-  翻倍；改流式要连 `atomic` 的 API 一起动。
-- `/etc/sing-box/backups` 只增不减，没有轮转。
+- `/etc/sing-box/backups` 只增不减，没有轮转（本机目前是空目录，还没到疼的时候）。
+- `src/app/mod.rs` 4907 行 / 8 个职责可再拆；`ui/` 其余 11 个文件仍无测试。
 
 ### 2026-10-13（本轮：生态升级 —— Recipe / Shell 集成 / 队列与安全 / 缩略图 / 签名）
 
