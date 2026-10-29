@@ -73,11 +73,14 @@ command -v python3 >/dev/null || die "需要 python3"
 
 say "① 前置检查"
 systemctl is-active --quiet "$SERVICE" || die "$SERVICE 不是 active"
-INBOUND_KIND="$(python3 -c "
-import json
-d=json.load(open('$CONF'))
-t=[i.get('type') for i in d.get('inbounds',[])]
-print('ebpf' if 'ebpf' in t else ('tun' if 'tun' in t else 'other'))")"
+# 路径一律走 argv，不拼进源码：配置路径里只要有一个单引号，拼进去就是语法错。
+INBOUND_KIND="$(python3 - "$CONF" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+t = [i.get("type") for i in d.get("inbounds", [])]
+print("ebpf" if "ebpf" in t else ("tun" if "tun" in t else "other"))
+PY
+)"
 [[ $INBOUND_KIND == "ebpf" ]] || die "当前不是 eBPF 模式（是 $INBOUND_KIND）。TUN 模式下容器本来就靠 auto_route 管着，不需要本脚本"
 say "   eBPF 模式确认"
 
@@ -222,7 +225,14 @@ cp -a "$CONF" "$BK" && say "   备份：$BK"
 conf_mode="$(stat -c %a "$CONF" 2>/dev/null || printf 600)"
 staged_json="$(mktemp "$CONF.new.XXXXXX")"
 cp -a "$NEW_JSON" "$staged_json" && chmod "$conf_mode" "$staged_json" && mv -f "$staged_json" "$CONF"
-systemctl restart "$SERVICE"
+# 重启失败（端口被占、unit 起不来）时 `set -e` 会在这里直接退出 —— 下面的健康
+# 检查与回滚都走不到，配置却已经换掉了。所以重启本身失败必须就地兜住。
+if ! systemctl restart "$SERVICE"; then
+  warn "重启失败，正在回滚配置"
+  cp -a "$BK" "$CONF"
+  systemctl restart "$SERVICE" || warn "回滚后仍起不来，请手动检查：$BK"
+  exit 1
+fi
 sleep 3
 
 say "⑥ 健康检查"
@@ -231,10 +241,15 @@ for _ in $(seq 40); do systemctl is-active --quiet "$SERVICE" && break; sleep 0.
 systemctl is-active --quiet "$SERVICE" || { fail="服务未 active"; journalctl -u "$SERVICE" -n 12 --no-pager | sed 's/^/    /'; }
 
 if [[ -z $fail ]]; then
-  secret="$(python3 -c "
-import json
-try: print((json.load(open('$CONF')).get('experimental',{}).get('clash_api',{}) or {}).get('secret',''))
-except Exception: print('')")"
+  secret="$(python3 - "$CONF" <<'PY'
+import json, sys
+try:
+    api = json.load(open(sys.argv[1])).get("experimental", {}).get("clash_api", {}) or {}
+    print(api.get("secret", ""))
+except Exception:
+    print("")
+PY
+)"
   st="$("$BIN" api ebpf --url "$API_URL" --secret "$secret" 2>&1 || true)"
   printf '%s' "$st" | python3 -c "
 import json,sys

@@ -143,8 +143,22 @@ def poll():
         time.sleep(0.03)
 
 t = threading.Thread(target=poll, daemon=True); t.start()
-cmd = f"(sleep 2) | timeout 6 openssl s_client -connect {dial}:{port} -servername {sni} -quiet"
-subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=16)
+# 不走 `bash -c` 拼命令：`dial` / `sni` 来自命令行，含空格、引号、分号时会被
+# shell 当成语法；IPv6 还必须加方括号（否则 openssl 直接判 "malformed or ambiguous"）。
+host = f"[{dial}]" if ":" in dial else dial
+proc = subprocess.Popen(
+    ["openssl", "s_client", "-connect", f"{host}:{port}", "-servername", sni, "-quiet"],
+    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(2)
+try:
+    proc.stdin.close()      # 关 stdin = 原来 `(sleep 2)` 的效果，openssl 读到 EOF 自己退
+except Exception:
+    pass
+try:
+    proc.wait(timeout=6.5)  # 兜底：真挂住了就杀掉，别让整个排查停在这里
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
 time.sleep(0.4); stop.set(); t.join(timeout=2)
 if found:
     print(json.dumps(next(iter(found.values())), ensure_ascii=False))
@@ -248,7 +262,14 @@ fi
 # 被拦 → 给放行办法
 if [[ -n $BLOCKED_AT ]]; then
     route_idx="$(jq -r '[.route.rules | to_entries[] | select(.value.action=="predefined" or .value.action=="reject")][0].key // "?"' "$CONF" 2>/dev/null)"
-    SUGGEST="在 route.rules 第 $((route_idx + 1)) 条（广告 reject）**之前**插入：
+    # 没有 reject 规则时 jq 返回 "?"。直接塞进 `$(( ))` 会让 bash 报
+    # 「算术语法错误」，`set -e` 再把整个报告带走 —— 用户什么都看不到。
+    if [[ $route_idx =~ ^[0-9]+$ ]]; then
+        where="第 $((route_idx + 1)) 条（广告 reject）"
+    else
+        where="广告 reject 规则"
+    fi
+    SUGGEST="在 route.rules $where**之前**插入：
     { \"domain_suffix\": [\"$TARGET\"], \"action\": \"route\", \"outbound\": \"direct\" }
   并在 dns.rules 的广告规则之前插入：
     { \"domain_suffix\": [\"$TARGET\"], \"action\": \"route\", \"server\": \"dns-direct\" }"

@@ -355,7 +355,14 @@ conf_mode="$(stat -c %a "$CONF" 2>/dev/null || printf 600)"
 staged_json="$(mktemp "$CONF.new.XXXXXX")"
 cp -a "$NEW_JSON" "$staged_json" && chmod "$conf_mode" "$staged_json"
 mv -f "$staged_json" "$CONF"
-systemctl restart "$SERVICE"
+# 重启失败（端口被占、unit 起不来）时 `set -e` 会在这里直接退出 —— 下面的健康
+# 检查与回滚都走不到，配置却已经换掉了。所以重启本身失败必须就地兜住。
+if ! systemctl restart "$SERVICE"; then
+  warn "重启失败，正在回滚配置"
+  cp -a "$BK" "$CONF"
+  systemctl restart "$SERVICE" || warn "回滚后仍起不来，请手动检查：$BK"
+  exit 1
+fi
 sleep 2
 
 say "⑥ 健康检查"
@@ -363,10 +370,11 @@ fail=""
 for _ in $(seq 30); do systemctl is-active --quiet "$SERVICE" && break; sleep 0.5; done
 systemctl is-active --quiet "$SERVICE" || fail="服务未 active"
 # 入站模式不同，健康判据不同：TUN 等 tun0；eBPF 没有 tun0，改用「不设代理的请求是否走代理」证明内核接管
-INBOUNDS="$(python3 -c "
-import json
-d=json.load(open('$CONF'))
-print(','.join(str(i.get('type','')) for i in d.get('inbounds',[])))" 2>/dev/null || echo '')"
+INBOUNDS="$(python3 - "$CONF" 2>/dev/null <<'PY' || true
+import json, sys
+print(",".join(str(i.get("type", "")) for i in json.load(open(sys.argv[1])).get("inbounds", [])))
+PY
+)"
 if [[ -z $fail && $INBOUNDS == *tun* ]]; then
   for _ in $(seq 20); do ip link show tun0 >/dev/null 2>&1 && break; sleep 0.5; done
   ip link show tun0 >/dev/null 2>&1 || fail="tun0 未出现"

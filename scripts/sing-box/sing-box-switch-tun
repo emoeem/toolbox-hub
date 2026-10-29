@@ -64,18 +64,17 @@ command -v python3 >/dev/null || die "需要 python3"
 say "① 前置检查"
 systemctl is-active --quiet "$SERVICE" || die "$SERVICE 不是 active，先修好它"
 "$BIN" check -c "$CONF" >/dev/null 2>&1 || die "当前配置 check 不过"
-if ! python3 -c "
-import json,sys
-d=json.load(open('$CONF'))
-sys.exit(0 if any(i.get('type')=='ebpf' for i in d.get('inbounds',[])) else 1)"; then
-  if python3 -c "
-import json,sys
-d=json.load(open('$CONF'))
-sys.exit(0 if any(i.get('type')=='tun' for i in d.get('inbounds',[])) else 1)"; then
-    die "当前已经是 TUN 模式，无需切换"
-  fi
-  die "配置里既没有 ebpf 也没有 tun 入站，本脚本不适用"
-fi
+# 一次读全入站类型：原来两次 python 各读一遍，且都把路径拼进了源码。
+KINDS="$(python3 - "$CONF" <<'PY'
+import json, sys
+print(" ".join(str(i.get("type", "")) for i in json.load(open(sys.argv[1])).get("inbounds", [])))
+PY
+)"
+case " $KINDS " in
+  *" ebpf "*) ;;
+  *" tun "*) die "当前已经是 TUN 模式，无需切换" ;;
+  *) die "配置里既没有 ebpf 也没有 tun 入站，本脚本不适用" ;;
+esac
 say "   服务 active、配置合法、当前是 eBPF 模式"
 
 say "② 取 TUN 入站定义"
@@ -139,7 +138,14 @@ cp -a "$CONF" "$BK" && say "   备份（eBPF 配置）：$BK"
 conf_mode="$(stat -c %a "$CONF" 2>/dev/null || printf 600)"
 staged_json="$(mktemp "$CONF.new.XXXXXX")"
 cp -a "$NEW_JSON" "$staged_json" && chmod "$conf_mode" "$staged_json" && mv -f "$staged_json" "$CONF"
-systemctl restart "$SERVICE"
+# 重启失败（端口被占、unit 起不来）时 `set -e` 会在这里直接退出 —— 下面的健康
+# 检查与回滚都走不到，配置却已经换掉了。所以重启本身失败必须就地兜住。
+if ! systemctl restart "$SERVICE"; then
+  warn "重启失败，正在回滚配置"
+  cp -a "$BK" "$CONF"
+  systemctl restart "$SERVICE" || warn "回滚后仍起不来，请手动检查：$BK"
+  exit 1
+fi
 sleep 2
 
 say "⑥ 健康检查（TUN 判据）"
