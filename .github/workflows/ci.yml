@@ -115,10 +115,17 @@ jobs:
           echo "✓ widget 脚本可解析，渲染结果干净"
 
       # 发版路径上的脚本平时没人跑，语法错要等到 tag 那天才暴露 —— 这里先挡一道。
-      - name: 打包/发版脚本语法
+      # `scripts/sing-box/` 那六个是**独立**的运维脚本（装到 ~/.local/bin，不经过
+      # cargo，也不在别的门禁里）：它们出过一个「python heredoc 少传一个参数」的错，
+      # 语法却是对的，只有 `bash -n` 之外的东西才拦得住 —— 但先把最便宜这道补上。
+      - name: 打包/发版/运维脚本语法
         run: |
           set -euo pipefail
-          for script in packaging/update-aur.sh packaging/verify-release.sh packaging/make-source-tarball.sh; do
+          shopt -s nullglob
+          for script in packaging/*.sh scripts/sing-box/*; do
+            case "$script" in
+              *.md) continue ;;
+            esac
             bash -n "$script"
             echo "✓ $script"
           done
@@ -231,8 +238,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: 格式检查
-        run: cargo fmt --check
+      # 不重复跑 `cargo fmt --check`：fmt 与 feature 无关，check job 已经跑过（全绿
+      # 才会到这一 job），同一个提交在这里再跑一遍得不出新信息。
       - name: 无包管理功能编译
         run: cargo build --locked --no-default-features
       - name: 无包管理功能测试

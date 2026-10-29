@@ -180,6 +180,165 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 验证记录
 
+### 2026-10-28（sing-box 开关收尾：tc 改名 / bypass 真正生效 / 表单对齐）
+
+起点是工作区里改了一半的脚本：`--with-abf`、`--with-lyc-geosite`、`--bypass-cn`、
+`--no-shared`、`--shared-plane` 只进了脚本，表单、测试和文档还停在旧口径。
+
+- **`--bypass-cn` 在 TUN→eBPF 分支被静默丢掉**：参数只在「已是 eBPF」的分支被读取，
+  从 TUN 切过去时勾了等于没勾。现在把挑选逻辑抽成 `bypass_tags()`（bash 函数 + 内嵌
+  python），两条分支共用同一份结果；只从 `outbound=direct` 的规则反推 `geoip*` /
+  `cidr*` 表，并拒绝同时被代理规则引用的表 —— 这条自检是防「`geoip/telegram` 被选进
+  bypass，Telegram 反而变直连」。
+- **`local.data_plane` 没有 `tc`**：本机 v1.14.4-reF1nd 实测 `sing-box check` 直接报
+  `unknown local.data_plane: tc`，`tools ebpf status --local-data-plane tc` 也报
+  invalid；合法值只有 `cgroup` / `socket_assign`。脚本把 `--data-plane tc` 当旧别名
+  映射到 `socket_assign`（并打一行提示），TC 守卫改为按 `socket_assign` 或
+  `shared=packet_rewrite` 触发，不再生成注定 check 不过的配置。
+- **表单补齐**：manifest 增加 `--with-lyc-geosite`、`--bypass-cn`、`--no-shared`、
+  `--shared-plane`，数据面的 `tc` 选项改成 `socket_assign`。`sing_box_actions_drive_the_ops_scripts`
+  改成 8 个审计开关逐个对账，并新增 4 个 eBPF 开关的 argv 断言（以前表单加了、manifest
+  忘写 `flag` 的话，勾了也静默无效）。
+- **计数口径**：audit 头部还写「7 个开关」（漏了 abf），根 README 与 scripts README 写
+  「6 个」—— 统一成 8。
+
+验证（都是抽脚本里**同一份** heredoc 跑的，没有另写一套逻辑）：
+
+- TUN→eBPF + `--bypass-cn`：生成配置 `bypass_rule_set=["geoip/cn"]`，代理表
+  `geoip/telegram` 被排除，`sing-box check` 通过。
+- 已是 eBPF 的四种组合（清除 bypass / 设置 bypass / 关闭 shared / `socket_assign` 接管）：
+  `sing-box check` 全部通过。
+- 审计 `--with-abf` + `--with-lyc-geosite` + `--nxdomain-ads`：用
+  `/usr/share/sing-box-rule-sets` 里的真规则集生成配置，`sing-box check` 通过；广告规则
+  同时吃到 adblockfilters 并改成 NXDOMAIN，`lyc/*` 只加在同类规则上。
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`
+  通过；`cargo test --all-features` **559 passed / 16 ignored**，
+  `cargo test --no-default-features` **553 passed / 16 ignored**。
+- `bash -n` 四支脚本、两处脚本里的全部内嵌 Python 块 `py_compile` 通过。
+
+未做：没有在 root 下跑完整切换/修复流程（会重启 `sing-box`、可能断网），只验证到
+「生成的配置能过 `sing-box check`」这一层。
+
+随后已执行 `./scripts/sing-box/install.sh`，`~/.local/bin` 下 6 个脚本与源码对齐。
+
+### 2026-10-28（第二轮：UI 线程不卡 / 写盘不再静默 / 重载去抖 / 哈希去重）
+
+上一条把脚本那层收尾了，这轮扫的是主程序本身（73 个 `.rs`、约 4.6 万行）。先说一个
+**否证**：生产代码里的 `unwrap` / `expect` / `panic!` 是 **0** —— `app/mod.rs` 那 106 处
+`.expect(` 全在 2928 行之后的测试模块里，manifest / `packages.toml` / `state.toml` 的解析
+失败也各有退路（warning / 默认值 / `unwrap_or_default`）。所以「配置写错导致崩」这条路
+已经堵住了。真正留下的是下面四条。
+
+- **UI 线程上唯一的挂死点**：`probe_duration`（`src/runtime/exec.rs`）在按 Enter 执行单
+  文件动作时同步拉起 `ffprobe` 并 `output()` 无限期等。ffprobe 会真的去**打开**目标文件，
+  落在网络挂载或正在被写入的文件上就一直不返回 —— 界面卡死，连按键都收不到。改成
+  `spawn` + `try_wait` 轮询 + 3 秒上限，超时 kill 并收尸（`src/runtime/exec.rs:339`）。
+  等待逻辑抽成 `wait_with_timeout`，好用 `sleep 30` 直接测「不肯退的进程会被放弃」。
+- **清空队列写盘失败被静默吞掉**（`src/app/mod.rs:1582`）：`let _ = save_queue_to(&path, &[])`。
+  上一处（关界面时）有注释说明「写不进去也不该拦住关界面」，这一处没有 —— 磁盘满或数据
+  目录被删时，用户清空队列后下次打开会看到**旧队列复活**，而界面上没有任何提示。改成
+  把错误挂到 `self.message`（不中断流程，包已经装完了）。
+- **配置热重载没有去抖**（`src/watch.rs`）：标志位只能把同一帧内的多条事件收敛成一次，
+  而主循环每帧（100ms）都来问，于是编辑器的一次保存（写临时文件 → rename）或一次
+  `git checkout`（几十个文件连发）会变成连续好几帧各全量重扫一次。加 300ms 冷却。
+  **关键不变量**：冷却期里把标志位**放回去**而不是清掉 —— 清掉就等于把最后一次改动丢了，
+  改了配置却永远不刷新，比多刷几次糟得多（`debounce_defers_the_flag_instead_of_dropping_it`
+  这条测试钉的就是它）。主循环空闲时也在 100ms 一轮，不会没人来问。
+- **`ecosystem::sha256` 是第二份哈希实现**（`src/ecosystem.rs:542`）：`fs::read` 整个文件
+  再 digest，包有多大就吃多少内存；而 `repository::install::sha256_file` 是流式读（64KB
+  缓冲）。删掉重复那份，改成转发。
+
+验证：`cargo fmt --check` 通过；`clippy --all-targets --all-features -- -D warnings` 通过；
+`cargo test --all-features` **563 passed / 16 ignored**，`--no-default-features`
+**557 passed / 16 ignored**（两条都 +4，就是本轮新增的 4 条）。
+
+### 2026-10-28（第三轮：三份重复实现收敛，顺手补上边界 bug）
+
+上一轮的四条修完，接着清「同一段逻辑写了好几遍」这一堆 —— 这类重复不会立刻出错，
+但改语义时漏掉一处就变成 bug（下面第 3 条就是这么暴露的）。
+
+- **`mode_of` / `danger_of` 逐字节重复**：`providers/fftools.rs` 与 `providers/scripted.rs`
+  各有一份完全相同的实现（连注释都一样）。挪进两个 Provider 共用的底座
+  `providers/metadata.rs`（`metadata::mode_of` / `metadata::danger_of`），以后改
+  「注解没写时的默认值」只动一处。
+- **三份「按显示宽度截断」**：收进 `ui/mod.rs`，语义明确分开 ——
+  - `clip(text, width)`：硬裁、不加标记，**表格列**用。`ui/repository.rs` 那张表的
+    13 处调用原来用的是本文件里的私有同名函数（已删）。
+  - `elide(text, width)`：**真截掉了**才补 `…`，用在「用户该知道被砍了」的地方
+    （`widget.rs` 的 recipe 标题，原来叫 `truncate`，已删）。
+  - 顺手修了旧 `truncate` 的边界：`width == 0` 时它仍然 `push('…')`，返回一个**比
+    宽度还宽**的字符串；现在返回空串。
+- **「等子进程，超时就杀」写了两遍**：`thumbnail.rs` 的 `run_ffmpeg` 早就有 deadline +
+  `kill` + `wait`；上一轮我又给 `probe_duration` 写了一遍。现在收敛成
+  `runtime::wait_with_timeout`，返回 `WaitOutcome::{Exited, TimedOut, Failed}` ——
+  超时和「`try_wait` 自己失败」必须分开，两边调用方的措辞不一样。**这也是上一轮那个
+  判断的旁证**：项目对「外部进程可能挂住」是有意识的，`probe_duration` 只是漏了。
+
+验证（全绿）：
+- `cargo fmt --check`、`clippy --all-targets --all-features -- -D warnings` 通过；
+- `cargo test --all-features` **565 passed / 16 ignored**，`--no-default-features`
+  **559 passed / 16 ignored**（各 +2：`clip` 的宽度不变量、`elide` 的「没截就不加省略号」）；
+- 缩略图原有的 `a_hanging_ffmpeg_is_killed_at_the_budget` 在换成共用实现后照旧通过
+  —— 说明收敛没改它的行为（300ms 预算、错误文案「没出图」都还在断言里）。
+
+### 2026-10-29（第四轮：运维脚本里三个真 bug + 临时文件名 / CI 门禁）
+
+前三轮都在 Rust 侧，这轮把 `scripts/sing-box/` 六个脚本逐个当代码读了一遍（它们
+装在 `~/.local/bin`，不经过 cargo，之前也没有任何 CI 覆盖）。挖出三个真 bug，
+其中第一个是**功能直接不可用**。
+
+- **`sing-box-container-proxy` 少传一个参数，`--enable` 主路径必崩**：python 那段读
+  `sys.argv[4]`（`data_plane`），调用处只传了 3 个 → `IndexError`，而脚本是
+  `set -Eeuo pipefail`，于是「配置正要开始改」的时候直接死掉。补齐第四个参数。
+  实测：旧写法 `rc=1 / IndexError: list index out of range`，新写法 `rc=0` 且生成的
+  `shared.data_plane` 正确。
+- **`sing-box-status --strict` 永远 exit 0**：`bad()` 里 `problems=$((problems + 1))`，
+  但 `bad()` **总是**在 `$(bad)` 命令替换里调用 —— 那是子 shell，改的是副本。所以
+  父进程恒为 0：末尾永远打「全部正常」，`--strict` 也永远成功。把计数落到临时文件
+  （子 shell 也能追加），结尾数一次。实测拿一份只有 tun 入站、服务却是 active 的配置
+  跑：**修前 rc=0 / 「全部正常」，修后「有 1 项异常」/ rc=1**。
+- **`sing-box-audit` 在改配置之前就会静默退出**：`ls "$RULE_DIR"/*.srs | awk`，
+  没有 `.srs` 时 `ls` 退非零，`pipefail` 让整条管道失败、`set -e` 直接把脚本带走 ——
+  用户看到的是「脚本什么都没做」。补 `|| true`（实测旧写法 rc=2 且不再往下走）。
+- 顺带一处：`sing-box-status` 把 `leak_default` 写成了 `leakhit_default`（变量根本
+  不存在，`${leakhit_default:+…}` 永远为空）—— 走系统解析器命中的那半边从来不会显示。
+- **`/tmp` 里可预测的临时文件名**：`components.rs`（`-pick.chosen` / `-pick.cwd`）
+  与 `runtime/exec.rs`（`-browse.cwd` / `-browse.chosen`）都只用 pid 做名字。粘性
+  目录里可预测 = 别人能先建同名符号链接，等外部文件管理器往里写。抽
+  `util::temp_tag()`（pid + 纳秒），三处共用（`packages/worker.rs` 那份内联写法
+  一并收敛 —— 它本来就是对的，只是没被抽出来）。
+- **`$HOME` 缺失时配置写进当前目录**：`config.rs` 的 `xdg()` 用
+  `var_os("HOME").unwrap_or_default()`，空路径 `join` 出来是**相对路径** —— 在哪个目录
+  启动就写哪，还会随 `cd` 变，界面上一声不响。改成只在 `HOME` 是绝对路径时采用，
+  否则退到 `/`（那种环境下写不进去会老实报错，而不是默默污染 cwd）。
+- **后台输出没有上限**：`reader_thread` 的 `collected` 是全文累积，而界面只画尾部
+  十几行。`ffmpeg -v debug` / 跑飞的 `rsync` 能把常驻内存推到几百 MB。改成保留最后
+  4000 行，开头一行写清「前面 N 行没保留」。
+- **CI 补上脚本门禁**：以前只对 `packaging/*.sh` 跑 `bash -n`，`scripts/sing-box/`
+  六个完全在外。现在一起过；同时删掉 `core-no-pacman` job 里重复的
+  `cargo fmt --check`（fmt 与 feature 无关，check job 已经跑过）。
+
+验证：
+- `cargo fmt --check`、`clippy --all-targets --all-features -- -D warnings` 通过；
+  `cargo test --all-features` **566 passed / 16 ignored**，`--no-default-features`
+  **560 passed / 16 ignored**（+1：`a_flood_of_output_keeps_only_the_tail`）。
+- `bash -n` 覆盖 `packaging/*.sh` + `scripts/sing-box/*`（8 个文件，本地按 CI 同一段
+  脚本跑过）；三个改过的脚本各做了实跑验证（见上）。
+- 已重新执行 `install.sh`，`~/.local/bin` 六个副本与源码逐字节一致。
+
+未做（记在这里，别当成已修）：
+- **四个脚本之间还有约 180 行同源代码**（提权重执行、check→备份→替换→重启、
+  回滚、出口对比、DNS 探测）。抽公共文件的**真正难点在分发**：`install.sh` 与
+  `PKGBUILD` 都是按 `sing-box-*` 通配装的，多一个 `lib.sh` 不会被装走 → 装完六个
+  脚本全部 `source: No such file`，而 install.sh 依然报告成功。要么构建期内联展开，
+  要么改两处打包清单，得单独决定。
+- `python3 - ... <<PY` 里仍有 8 处把 shell 变量直接拼进 python 源码字符串
+  （`open('$CONF')`）：路径带空格/单引号就语法错，理论上可注入。改成传 argv
+  是现成做法（`switch-ebpf` 已经这么写了），但 8 处挨个改动且需要重跑验证。
+- `install.rs:658` 装包时 `fs::read` 整个文件再 `atomic::write`，大二进制会让内存
+  翻倍；改流式要连 `atomic` 的 API 一起动。
+- `/etc/sing-box/backups` 只增不减，没有轮转。
+
 ### 2026-10-13（本轮：生态升级 —— Recipe / Shell 集成 / 队列与安全 / 缩略图 / 签名）
 
 完整变更与逐条证据见 [`../CHANGELOG-ECOSYSTEM.md`](../CHANGELOG-ECOSYSTEM.md)；
