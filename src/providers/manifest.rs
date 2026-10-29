@@ -1080,7 +1080,7 @@ mod tests {
             assert_eq!(tool.mode, RunMode::Interactive, "{id} 要 sudo 密码");
         }
 
-        // 审计的 6 个开关 → 6 个 argv 元素，一个都不能少
+        // 审计的 8 个开关 → 8 个 argv 元素，一个都不能少
         let audit = by_id(&discovery, "manifest:sing-box-audit");
         let action = audit.action.as_ref().expect("审计动作带参数表单");
         let mut values = action.default_values();
@@ -1092,12 +1092,13 @@ mod tests {
             "pkg_paths",
             "nxdomain",
             "abf",
+            "lyc_geosite",
         ] {
             values.set(key, "true");
         }
         let argv = action
             .build_argv(&values)
-            .expect("六个开关都填了，应能构建");
+            .expect("八个开关都填了，应能构建");
         for flag in [
             "--with-cncidr",
             "--with-direct-list",
@@ -1106,6 +1107,7 @@ mod tests {
             "--use-package-paths",
             "--nxdomain-ads",
             "--with-abf",
+            "--with-lyc-geosite",
         ] {
             assert!(
                 argv.iter().any(|arg| arg == flag),
@@ -1126,6 +1128,28 @@ mod tests {
         assert!(
             argv.iter().any(|arg| arg == "cgroup"),
             "默认数据面应是 cgroup：{argv:?}"
+        );
+
+        // 新开关也得真的拼进 argv：表单里加了、manifest 忘了 flag 的话，勾了等于没勾
+        let mut values = action.default_values();
+        values.set("bypass_cn", "true");
+        values.set("shared", "virbr0");
+        values.set("shared_plane", "socket_assign");
+        values.set("no_shared", "true");
+        let argv = action.build_argv(&values).expect("新开关应能构建");
+        for flag in ["--bypass-cn", "--shared", "--shared-plane", "--no-shared"] {
+            assert!(
+                argv.iter().any(|arg| arg == flag),
+                "切 eBPF 少了 {flag}：{argv:?}"
+            );
+        }
+        assert!(
+            argv.iter().any(|arg| arg == "virbr0"),
+            "接口名没进 argv：{argv:?}"
+        );
+        assert!(
+            argv.iter().any(|arg| arg == "socket_assign"),
+            "下游数据面没进 argv：{argv:?}"
         );
     }
 

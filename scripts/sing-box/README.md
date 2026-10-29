@@ -24,12 +24,13 @@
 | 动作 | 脚本 | 干什么 |
 | --- | --- | --- |
 | sing-box 体检 | `sing-box-status` | **只读**：模式 / 入站 / 出口 / 分流 / DNS 拦截 / 规则集构成 / 备份，一屏看完 |
-| sing-box 审计修复 | `sing-box-audit` | 补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则；6 个可选开关 |
-| sing-box 切到 eBPF | `sing-box-switch-ebpf` | TUN → eBPF（本机流量在内核 socket 层接管）；可选数据面与下游接口 |
+| sing-box 审计修复 | `sing-box-audit` | 补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则；8 个可选开关 |
+| sing-box 切到 eBPF | `sing-box-switch-ebpf` | TUN → eBPF（本机流量在内核 socket 层接管）；可选数据面、下游接口与 CN 段绕过 |
 | sing-box 切回 TUN | `sing-box-switch-tun` | eBPF → TUN（**容器 / 虚拟机也能被代理**：TUN 用 `auto_route` 覆盖转发流量） |
 | sing-box 容器代理 | `sing-box-container-proxy` | 在 podman 网桥上开 eBPF `shared` 数据面，让 rootful 容器也走代理 |
 
-`--fast`（体检）、6 个 `--with-*`（审计）、`--data-plane`、`--shared`、`--from`、`--iface`、`--disable`
+`--fast`（体检）、8 个审计开关（`--with-*` / `--use-package-paths` / `--nxdomain-ads`）、
+`--data-plane`、`--bypass-cn`、`--shared` / `--no-shared`、`--shared-plane`、`--from`、`--iface`、`--disable`
 这些开关在动作表单里就是一个个勾选框/输入框，不用记。
 
 ## 几个踩过的坑（都写进脚本了，这里备查）
@@ -38,8 +39,8 @@
    而 `systemd-resolved` 不把 REFUSED 转告客户端（它当成"上游坏了"去重试其他上游），于是
    应用每个广告域名都要等到超时。改成 `predefined` + `rcode: NXDOMAIN` 后是正常应答，
    应用**秒失败**并做负缓存。
-2. **预检 `--mode local` 全绿 ≠ TC 可用**：`local` 只覆盖 cgroup 数据面；`tc` / `shared`
-   （`packet_rewrite`）走的是 TC 路径，只有 `--mode all` 才涉及，而它在这台机器上是
+2. **预检 `--mode local` 全绿 ≠ TC 可用**：`local` 只覆盖 cgroup 数据面；`socket_assign`
+   与 `shared`（`packet_rewrite`）走的是 TC 路径，只有 `--mode all` 才涉及，而它在这台机器上是
    `inconclusive`（36 项 unknown）。实跑会失败于
    `register TC eBPF TCP listener: operation not supported` ——
    所以脚本会在动配置**之前**先拦下来，别白重启一轮。
@@ -51,6 +52,12 @@
    （任何缓存都命不中），免得被缓存骗成"没拦住"。
 5. **健康判据要跟着模式走**：TUN 看 `tun0` 是否出现；eBPF 没有 `tun0`，改用
    **"不设任何代理的请求是否等于代理出口"** —— 这才是"内核接管生效"的铁证。
+6. **`local.data_plane` 没有 `tc`**：v1.14.4-reF1nd 只认 `cgroup` / `socket_assign`，
+   写 `tc` 会在 `sing-box check` 阶段被拒（`unknown local.data_plane: tc`）。脚本把
+   `--data-plane tc` 当旧别名映射到 `socket_assign`，避免生成注定 check 不过的配置。
+7. **`bypass_rule_set` 只能放直连 IP 表**：命中的目标会绕过 eBPF，混进代理表
+   （曾自动挑出过 `geoip/telegram`）就会把该代理的流量变成直连。脚本只从
+   `outbound=direct` 的规则里反推 `geoip*` / `cidr*` 表，并拒绝同时被代理规则引用的表。
 
 ## 和 pkgbuild 仓库里那份的关系
 

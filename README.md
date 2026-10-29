@@ -647,8 +647,8 @@ TUI 启动时会顺手看一眼：索引过期就在后台刷新，查完在状�
 | 动作 | 干什么 |
 | --- | --- |
 | **sing-box 体检** | 只读：模式 / 入站 / 出口 / 分流 / DNS 拦截 / 规则集构成 / 备份，一屏看完（`--fast` 跳过联网检查） |
-| **sing-box 审计修复** | 补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则；6 个开关（国内 IP 表 / 直连清单 / 广告补漏 / DNS 故障转移组 / 规则集走包路径 / 广告改 NXDOMAIN） |
-| **sing-box 切到 eBPF** | TUN → eBPF：本机流量在内核 socket 层接管；可选数据面 `cgroup`/`tc`、可一并接管下游接口 |
+| **sing-box 审计修复** | 补 anti-AD 广告表、刷新 geoip/cn、清理冗余规则；8 个开关（国内 IP 表 / 直连清单 / 广告补漏 / 聚合广告表 / DNS 故障转移组 / 规则集走包路径 / 广告改 NXDOMAIN / lyc 增强 geosite） |
+| **sing-box 切到 eBPF** | TUN → eBPF：本机流量在内核 socket 层接管；可选数据面 `cgroup`/`socket_assign`、可一并接管下游接口、CN IP 段可绕过 |
 | **sing-box 切回 TUN** | eBPF → TUN：**容器 / 虚拟机也能被代理**（TUN 用 `auto_route` 覆盖转发流量） |
 | **sing-box 容器代理** | 在 podman 网桥上开 eBPF `shared` 数据面，让 rootful 容器也走代理 |
 
@@ -659,10 +659,12 @@ PKGBUILD 已经把它们放进 `/usr/bin`。细节与踩过的坑见 [`scripts/s
 也要能看见回滚日志），只有体检是 `safe` + `capture`。有测试盯着这条策略
 （`sing_box_actions_drive_the_ops_scripts`），以后谁把开关名写错、或者忘了标危险度，CI 会红。
 
-**诚实提醒**：`tc` 数据面与 `shared` 都依赖内核的 TC eBPF 支持，而**本机内核不支持**
+**诚实提醒**：`socket_assign` 数据面与 `shared` 都依赖内核的 TC eBPF 支持，而**本机内核不支持**
 （实跑报 `register TC eBPF TCP listener: operation not supported`）；注意预检
 `--mode local` 全绿**并不代表** TC 可用（那 28 项要 `--mode all` 才涉及，结果是 inconclusive）。
 所以脚本会在动配置**之前**先拦下这两条路，并提示容器改用 `--network=host`。
+（v1.14.4-reF1nd 的配置字段里**没有** `tc`：本地数据面只认 `cgroup` / `socket_assign`，
+脚本把旧的 `--data-plane tc` 当别名映射到 `socket_assign`，不会再生成 check 不过的配置。）
 
 ## 「打包」域：给你自己的 Arch 软件仓库用
 

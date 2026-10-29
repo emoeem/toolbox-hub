@@ -117,6 +117,14 @@ default = "false"
 help = "217heidai/adblockfilters：215k 条域名后缀（EasyPrivacy / AdGuard 全家桶 / OISD…）。实测与 anti-AD 只重叠 35%，对照组 27 个域名 0 误伤"
 
 [[action.argument]]
+key = "lyc_geosite"
+label = "加 lyc 增强 geosite"
+kind = "toggle"
+flag = "--with-lyc-geosite"
+default = "false"
+help = "lyc8503 的增强 geosite（Loyalsoldier 移植）：官方 cn 约 8.7k 条后缀，这份约 11 万，作为补充并集匹配；需要 sing-box-rule-sets 包里有 lyc-geosite-*.srs"
+
+[[action.argument]]
 key = "nxdomain"
 label = "广告改 NXDOMAIN"
 kind = "toggle"
@@ -127,16 +135,16 @@ help = "DNS 广告拦截从 reject(REFUSED) 改成 predefined(NXDOMAIN)：system
 [[action]]
 id = "sing-box-to-ebpf"
 name = "sing-box 切到 eBPF"
-summary = "把 TUN 入站换成 eBPF 入站（本机流量在内核 socket 层接管）"
+summary = "把 TUN 入站换成 eBPF 入站（本机流量在内核 socket 层接管）；已是 eBPF 时调整数据面 / 下游接管 / CN 段绕过"
 domain = "网络"
 tags = ["sing-box", "模式"]
 program = "sing-box-switch-ebpf"
 mode = "interactive"
 danger = "caution"
 install = "./scripts/sing-box/install.sh"
-input = "当前配置（TUN，或已是 eBPF 时只改数据面）"
+input = "当前配置（TUN，或已是 eBPF 时调整选项）"
 output = "切换后的配置 + 备份 + eBPF 专属健康检查"
-features = "内核能力预检；健康判据是「不设代理的请求是否走代理」；失败自动回滚到 TUN"
+features = "内核能力预检；TC 路径（socket_assign / packet_rewrite）不可用时提前拦住；健康判据是「不设代理的请求是否走代理」；失败自动回滚到 TUN"
 
 [[action.argument]]
 key = "data_plane"
@@ -144,10 +152,10 @@ label = "数据面"
 kind = "choice"
 flag = "--data-plane"
 default = "cgroup"
-help = "cgroup = 内核 socket 钩子（推荐）；tc = 跟随默认接口，但需要内核支持 TC eBPF —— 不支持时脚本会提前拦住"
+help = "cgroup = 内核 socket 钩子（推荐）；socket_assign = TC 路径，需要内核支持 TC eBPF，可抓到 pasta 的包 —— 不支持时脚本会提前拦住"
 choices = [
   { label = "cgroup（推荐）", value = "cgroup" },
-  { label = "tc（接口级，可抓到 pasta 的包）", value = "tc" },
+  { label = "socket_assign（TC 路径，可抓到 pasta 的包）", value = "socket_assign" },
 ]
 
 [[action.argument]]
@@ -156,6 +164,34 @@ label = "一并接管下游接口"
 kind = "text"
 flag = "--shared"
 help = "留空 = 只接管本机。填接口名（如 virbr0 / podman0）则同时接管从该接口进来的流量；该路径同样依赖 TC，本机不支持时会提前拦住"
+
+[[action.argument]]
+key = "shared_plane"
+label = "下游数据面"
+kind = "choice"
+flag = "--shared-plane"
+default = "packet_rewrite"
+help = "只在填了「一并接管下游接口」时生效：packet_rewrite 兼容性最好，socket_assign 是另一条 TC 实现（可配合容器场景试）"
+choices = [
+  { label = "packet_rewrite（默认）", value = "packet_rewrite" },
+  { label = "socket_assign", value = "socket_assign" },
+]
+
+[[action.argument]]
+key = "no_shared"
+label = "关闭下游接管"
+kind = "toggle"
+flag = "--no-shared"
+default = "false"
+help = "已是 eBPF 时把 shared 关掉（回到只接管本机）。和「一并接管下游接口」同时填时，本开关优先"
+
+[[action.argument]]
+key = "bypass_cn"
+label = "CN IP 段绕过 eBPF"
+kind = "toggle"
+flag = "--bypass-cn"
+default = "false"
+help = "只从 outbound=direct 的规则里挑 IP 表（geoip*/cidr*）放进 local.bypass_rule_set；命中的目标直接绕过 eBPF。混进代理表的会被拒绝"
 
 [[action]]
 id = "sing-box-to-tun"

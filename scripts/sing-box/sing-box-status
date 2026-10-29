@@ -41,11 +41,18 @@ fi
 [[ -r $CONF ]] || { printf '读不到 %s（需要能看到该文件；它通常是 644）\n' "$CONF"; exit 2; }
 command -v jq >/dev/null || { printf '缺少 jq：sudo pacman -S jq\n'; exit 2; }
 
+# `bad()` **总是**在 `$(bad)` 这种命令替换里被调用 —— 那是子 shell，里面
+# `problems=$((problems+1))` 改的是子 shell 自己的副本，父进程永远看到 0。
+# 后果不是「少报一个数」：末尾会一直打「全部正常」，`--strict` 也永远 exit 0，
+# 把真问题说成没事。所以计数落到文件上（子 shell 也能追加），最后数一次。
+COUNT_FILE="$(mktemp "${TMPDIR:-/tmp}/sing-box-status.XXXXXX")"
+trap 'rm -f "$COUNT_FILE"' EXIT
 problems=0
 # 输出helper统一吞掉 EPIPE：`sing-box-status | head` 这种用法不该让体检报错中止
 row() { printf '  %-10s %s\n' "$1" "$2" 2>/dev/null || true; }
 ok()   { printf '%s✓%s' "$C_OK" "$C_OFF" 2>/dev/null || true; }
-bad()  { printf '%s✗%s' "$C_BAD" "$C_OFF" 2>/dev/null || true; problems=$((problems + 1)); }
+# 先记数再打印：输出被 EPIPE 打断时，这一条照样要算进去。
+bad()  { printf 'x' >> "$COUNT_FILE"; printf '%s✗%s' "$C_BAD" "$C_OFF" 2>/dev/null || true; }
 warn() { printf '%s!%s' "$C_WARN" "$C_OFF" 2>/dev/null || true; }
 
 printf '\n%s sing-box 体检%s  %s\n' "$C_DIM" "$C_OFF" "$(date '+%F %T')" 2>/dev/null || true
@@ -140,7 +147,7 @@ if (( FAST == 0 )); then
     elif [[ -z $leakhit && -z $leak_default ]]; then
         row DNS "$(ok) 广告域名被拦（$probe）"
     else
-        row DNS "$(bad) 广告域名仍可解析：${leakhit:-}${leakhit_default:+ / $leakhit_default}"
+        row DNS "$(bad) 广告域名仍可解析：${leakhit:-}${leak_default:+ / $leak_default}"
     fi
     echo_val="$(dig +short +time=4 TXT o-o.myaddr.l.google.com 2>/dev/null | tr -d '"' | head -1 || true)"
     [[ -n $echo_val ]] && row 解析出口 "${echo_val}（应为 Cloudflare / 代理侧）"
@@ -152,6 +159,9 @@ if [[ -d $bk_dir ]]; then
     row 备份 "$(ls -1t "$bk_dir" 2>/dev/null | head -3 | tr '\n' ' ')"
 fi
 printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF" 2>/dev/null || true
+# 到这里才数：全脚本的 `bad()` 都已经跑完了。
+problems="$(wc -c < "$COUNT_FILE" | tr -d ' ')"
+problems="${problems:-0}"
 if (( problems == 0 )); then
     printf ' %s全部正常%s\n\n' "$C_OK" "$C_OFF" 2>/dev/null || true
 else
