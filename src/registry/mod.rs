@@ -242,6 +242,7 @@ mod tests {
 
     fn tool(name: &str, domain: Domain, tags: &[&str], summary: &str) -> ToolDefinition {
         ToolDefinition {
+            mcp: None,
             id: format!("test:{name}"),
             name: name.to_string(),
             provider: "Test".to_string(),

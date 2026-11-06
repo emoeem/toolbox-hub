@@ -17,6 +17,9 @@
 //! | `mode` | 否 | `interactive`（接管终端，默认）或 `capture`（收进内置输出视图） |
 //! | `danger` | 否 | `caution` 表示会改动用户没点名的文件，执行前要再确认一次 |
 //! | `internal` | 否 | `true` 表示内部件（主菜单、共享库、预览器），不收录 |
+//! | `mcp` | 否 | `true` 表示显式声明可被 MCP 调用；还要过 `mcp.toml` 白名单 |
+//! | `mcp-name` / `mcp-description` | 否 | 给 AI 看的工具名与说明 |
+//! | `mcp-effects` | 否 | 逗号分隔的副作用：`read` / `write` / `network` / `system` / `privileged` / `interactive` / `destructive` / `shell`（通用命令执行器） |
 //!
 //! 例：
 //!
@@ -36,7 +39,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use crate::model::{Danger, RunMode};
+use crate::model::{Danger, McpExposure, RunMode, ToolEffects};
 
 /// 只读文件头部这么多行解析元数据。
 pub const HEAD_LINES: usize = 40;
@@ -102,6 +105,41 @@ pub fn danger_of(head: &str, name: &str) -> Danger {
     meta(head, name, "danger")
         .and_then(|raw| Danger::parse(&raw))
         .unwrap_or(Danger::Safe)
+}
+
+/// 脚本头部声明的 MCP 暴露；没写 `mcp=true` 就是 `None`（默认拒绝）。
+///
+/// 支持 `mcp-name` / `mcp-description` / `mcp-effects`。`mcp-effects` 是逗号分隔的
+/// 副作用名：`read` / `write` / `network` / `system` / `privileged` / `interactive` /
+/// `destructive`。和 Manifest 一样，这只是声明，还得过 `mcp.toml` 白名单。
+///
+/// 注意：脚本没有参数表单，服务层不会接受调用方传来的任意 argv ——
+/// 「显式声明可被调用」不等于「允许 AI 附加任意命令行参数」。
+pub fn mcp_exposure(head: &str, name: &str) -> Option<McpExposure> {
+    if meta(head, name, "mcp").as_deref().map(str::trim) != Some("true") {
+        return None;
+    }
+    Some(McpExposure {
+        name: meta(head, name, "mcp-name")
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        description: meta(head, name, "mcp-description")
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        effects: meta(head, name, "mcp-effects").map(|raw| {
+            let items = split_list(&raw);
+            ToolEffects {
+                filesystem_read: items.iter().any(|item| item == "read"),
+                filesystem_write: items.iter().any(|item| item == "write"),
+                network_access: items.iter().any(|item| item == "network"),
+                system_mutation: items.iter().any(|item| item == "system"),
+                requires_privilege: items.iter().any(|item| item == "privileged"),
+                interactive: items.iter().any(|item| item == "interactive"),
+                destructive: items.iter().any(|item| item == "destructive"),
+                arbitrary_command: items.iter().any(|item| item == "shell"),
+            }
+        }),
+    })
 }
 
 /// `requires=` 的解析结果。
@@ -205,8 +243,8 @@ pub fn clear_command_cache() {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_LINES, clear_command_cache, command_exists, dependencies, is_internal, meta,
-        read_head, split_list,
+        HEAD_LINES, clear_command_cache, command_exists, dependencies, is_internal, mcp_exposure,
+        meta, read_head, split_list,
     };
     use crate::util::path::command_available;
 
@@ -252,6 +290,30 @@ mod tests {
         assert!(!is_internal("# t:internal=false\n", "t"));
         assert!(!is_internal("# t:internal=1\n", "t"));
         assert!(!is_internal("# t:summary=x\n", "t"));
+    }
+
+    /// 默认拒绝：没写 `mcp=true` 的脚本绝不能被 AI 调用。
+    #[test]
+    fn mcp_exposure_is_opt_in() {
+        assert!(mcp_exposure("# t:summary=x\n", "t").is_none());
+        assert!(mcp_exposure("# t:mcp=trueish\n", "t").is_none());
+        assert!(
+            mcp_exposure("# u:mcp=true\n", "t").is_none(),
+            "前缀必须匹配脚本名"
+        );
+    }
+
+    #[test]
+    fn mcp_exposure_keeps_name_description_and_declared_effects() {
+        let head = "# t:mcp=true\n# t:mcp-name= my_system_info \n\
+                    # t:mcp-description=查看系统信息\n# t:mcp-effects=read, network\n";
+        let exposure = mcp_exposure(head, "t").expect("显式启用");
+        assert_eq!(exposure.name.as_deref(), Some("my_system_info"));
+        assert_eq!(exposure.description.as_deref(), Some("查看系统信息"));
+        let effects = exposure.effects.expect("副作用声明");
+        assert!(effects.filesystem_read);
+        assert!(effects.network_access);
+        assert!(!effects.filesystem_write);
     }
 
     #[test]

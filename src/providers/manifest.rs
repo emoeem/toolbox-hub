@@ -22,7 +22,8 @@ use serde::Deserialize;
 
 use crate::{
     model::{
-        Action, ArgKind, ArgPlacement, Argument, Choice, Danger, Domain, RunMode, ToolDefinition,
+        Action, ArgKind, ArgPlacement, Argument, Choice, Danger, Domain, McpExposure, RunMode,
+        ToolDefinition, ToolEffects,
     },
     providers::{Discovery, Provider, metadata},
 };
@@ -346,8 +347,56 @@ struct ManifestAction {
     mode: Option<String>,
     #[serde(default)]
     danger: Option<String>,
+    /// 是否显式声明「可以被 MCP 调用」。不写＝不暴露（默认拒绝）。
+    ///
+    /// 内联写法最省事：`mcp = { enabled = true, name = "disk_free" }`。
+    /// 这里只是**声明**，真正能否调用还由 `mcp.toml` 的白名单决定。
+    #[serde(default)]
+    mcp: Option<ManifestMcp>,
     #[serde(default)]
     argument: Vec<ManifestArgument>,
+}
+
+/// `[action.mcp]` / `mcp = { … }`。
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct ManifestMcp {
+    enabled: bool,
+    name: Option<String>,
+    description: Option<String>,
+    effects: Option<ManifestEffects>,
+}
+
+/// `[action.mcp.effects]`：作者声明的副作用。
+///
+/// 这些是**附加**声明，不能用来把命令本身推断出来的风险抹掉 —— 策略层取并集，
+/// 见 `crate::security::effects::infer`。
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct ManifestEffects {
+    filesystem_read: bool,
+    filesystem_write: bool,
+    network_access: bool,
+    system_mutation: bool,
+    requires_privilege: bool,
+    interactive: bool,
+    destructive: bool,
+    arbitrary_command: bool,
+}
+
+impl ManifestEffects {
+    fn into_effects(self) -> ToolEffects {
+        ToolEffects {
+            filesystem_read: self.filesystem_read,
+            filesystem_write: self.filesystem_write,
+            network_access: self.network_access,
+            system_mutation: self.system_mutation,
+            requires_privilege: self.requires_privilege,
+            interactive: self.interactive,
+            destructive: self.destructive,
+            arbitrary_command: self.arbitrary_command,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +512,34 @@ impl ManifestAction {
                 ))
             })?,
         };
+        // MCP 暴露声明：只有 `capture` 动作能声明（无终端是硬前提），
+        // 并且必须显式写 enabled = true。写错了在发现阶段就报，别等 AI 调用时才发现。
+        let mcp = match self.mcp.as_ref() {
+            Some(declared) if declared.enabled => {
+                if mode != RunMode::Capture {
+                    return Err(complain(&format!(
+                        "声明了 mcp，但 mode 是 {mode:?}；MCP 只接受 capture"
+                    )));
+                }
+                Some(McpExposure {
+                    name: declared
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string),
+                    description: declared
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string),
+                    effects: declared.effects.map(ManifestEffects::into_effects),
+                })
+            }
+            _ => None,
+        };
+
         let program = self.program.trim().to_string();
         // native 动作的 `program` 是**界面名**（`package-center`），不是命令：
         // 拿它去探依赖只会得到「依赖缺失」—— 实拍踩到过，那一项因此沉到列表底部。
@@ -475,6 +552,7 @@ impl ManifestAction {
         let ready = deps.is_ready();
 
         Ok(ToolDefinition {
+            mcp,
             id: format!("{provider_id}:{id}"),
             name: self.name.trim().to_string(),
             provider: provider_label.to_string(),
@@ -649,7 +727,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{ManifestProvider, bundled_action_count, bundled_native_actions};
+    use super::{ManifestFile, ManifestProvider, bundled_action_count, bundled_native_actions};
     use crate::{
         model::Domain,
         providers::{Discovery, Provider},
@@ -670,6 +748,81 @@ mod tests {
         ManifestProvider::new(Vec::new())
             .discover()
             .expect("内置 manifest 必须能解析")
+    }
+
+    /// 从一段 TOML 解析出第一个动作（只测 MCP 声明，其它字段从简）。
+    fn action_from(text: &str) -> crate::model::ToolDefinition {
+        let parsed: ManifestFile = toml::from_str(text).expect("manifest 应能解析");
+        parsed.action[0].build().expect("动作应能构建")
+    }
+
+    fn manifest(extra: &str) -> String {
+        format!(
+            r#"
+[[action]]
+id = "demo"
+name = "演示"
+summary = "演示动作"
+domain = "系统"
+program = "sh"
+mode = "capture"
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn mcp_exposure_is_opt_in_in_manifests() {
+        assert!(action_from(&manifest("")).mcp.is_none());
+        assert!(
+            action_from(&manifest(r#"mcp = { enabled = false, name = "x" }"#))
+                .mcp
+                .is_none(),
+            "只写字段不算启用"
+        );
+    }
+
+    #[test]
+    fn mcp_declaration_keeps_name_description_and_effects() {
+        let tool = action_from(&manifest(
+            r#"mcp = { enabled = true, name = "disk_free", description = "查看磁盘空间", effects = { filesystem_read = true, network_access = true } }"#,
+        ));
+        let mcp = tool.mcp.expect("显式启用");
+        assert_eq!(mcp.name.as_deref(), Some("disk_free"));
+        assert_eq!(mcp.description.as_deref(), Some("查看磁盘空间"));
+        let effects = mcp.effects.expect("副作用声明");
+        assert!(effects.filesystem_read);
+        assert!(effects.network_access);
+        assert!(!effects.filesystem_write);
+    }
+
+    #[test]
+    fn mcp_exposure_requires_capture_mode() {
+        let text = manifest(r#"mcp = { enabled = true }"#)
+            .replace("mode = \"capture\"", "mode = \"interactive\"");
+        let parsed: ManifestFile = toml::from_str(&text).expect("解析");
+        let error = parsed.action[0]
+            .build()
+            .expect_err("交互动作不该能声明 MCP");
+        assert!(error.contains("capture"), "{error}");
+    }
+
+    #[test]
+    fn bundled_read_only_actions_declare_mcp() {
+        let discovery = bundled_discovery();
+        let declared: Vec<&str> = discovery
+            .tools
+            .iter()
+            .filter(|tool| tool.mcp.is_some())
+            .map(|tool| tool.id.as_str())
+            .collect();
+        assert!(declared.contains(&"manifest:disk-space"));
+        assert!(declared.contains(&"manifest:boot-errors"));
+        assert!(!declared.contains(&"manifest:directory-usage"));
+        assert!(
+            declared.iter().all(|id| id.starts_with("manifest:")),
+            "首批只声明内置只读动作: {declared:?}"
+        );
     }
 
     fn by_id<'a>(discovery: &'a Discovery, id: &str) -> &'a crate::model::ToolDefinition {

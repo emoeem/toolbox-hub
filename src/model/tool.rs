@@ -65,6 +65,74 @@ impl Danger {
     }
 }
 
+/// 一件工具**实际**会产生的副作用。
+///
+/// 与 [`Danger`] 完全独立：`Danger::Caution` 的意思是「TUI 里执行前要再确认一次」，
+/// 是给人看的提示；这里描述的是「这个命令到底会读文件、写文件、联网还是改系统」，
+/// 是给权限策略看的。P0 审计（§5）已经实证：`Safe` 的动作照样会写文件、联网，
+/// 所以绝不能把 `Danger::Safe` 当成只读。
+///
+/// 缺省全为 `false`。但**「全 false」不等于只读授权**：策略层还会从真正要跑的
+/// 程序与 `base_argv` 独立推断（见 `crate::security::effects`），声明只能加限制，
+/// 不能把推断出来的风险抹掉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolEffects {
+    pub filesystem_read: bool,
+    pub filesystem_write: bool,
+    pub network_access: bool,
+    pub system_mutation: bool,
+    pub requires_privilege: bool,
+    pub interactive: bool,
+    /// 破坏性操作（删除、覆盖、清理、格式化……）。
+    pub destructive: bool,
+    /// 这条命令本身是通用命令执行器（`sh -c …`、`bash -c …` 之类）。
+    ///
+    /// 即使参数永远按 argv 传、不经过 shell，把「跑任意命令」的工具交给 AI
+    /// 也等于交出了整台机器。独立标出来，策略层默认一律拒绝。
+    pub arbitrary_command: bool,
+}
+
+impl ToolEffects {
+    /// 是不是严格只读（不写、不联网、不改系统、不提权、不交互）。
+    pub fn read_only(self) -> bool {
+        !self.filesystem_write
+            && !self.network_access
+            && !self.system_mutation
+            && !self.requires_privilege
+            && !self.interactive
+            && !self.destructive
+            && !self.arbitrary_command
+    }
+
+    /// 两个来源取并集：作者声明的风险**不能覆盖掉**独立推断出的风险。
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            filesystem_read: self.filesystem_read || other.filesystem_read,
+            filesystem_write: self.filesystem_write || other.filesystem_write,
+            network_access: self.network_access || other.network_access,
+            system_mutation: self.system_mutation || other.system_mutation,
+            requires_privilege: self.requires_privilege || other.requires_privilege,
+            interactive: self.interactive || other.interactive,
+            destructive: self.destructive || other.destructive,
+            arbitrary_command: self.arbitrary_command || other.arbitrary_command,
+        }
+    }
+}
+
+/// 「这件工具允许被 AI 调用」的**声明**，来自 Manifest 或脚本注解。
+///
+/// 注意这只是声明，不是授权：`mcp.toml` 里还得有对应的白名单项。
+/// `None`（`ToolDefinition::mcp` 缺省）＝ 没有声明，默认拒绝。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpExposure {
+    /// 自定义 MCP 工具名；不写就由 id 推导（P3 做名称规范化）。
+    pub name: Option<String>,
+    /// 给 AI 看的一句话说明；不写就用 `summary`。
+    pub description: Option<String>,
+    /// 作者声明的副作用；`None` 表示完全由策略层推断。
+    pub effects: Option<ToolEffects>,
+}
+
 /// 一个可执行的工具箱条目。
 ///
 /// 由 [`crate::providers::Provider`] 产出、[`crate::registry::Registry`] 聚合，
@@ -118,6 +186,11 @@ pub struct ToolDefinition {
     pub path: PathBuf,
     /// [`ToolDefinition::requires`] 是否全部满足。
     pub ready: bool,
+    /// 是否显式声明了 MCP 暴露（`None` = 没声明 = 默认拒绝）。
+    ///
+    /// 存在这里而不是放在侧表里：Provider 产出的每个工具自带身份、参数、执行方式与
+    /// 暴露声明，目录与策略层只读消费，不会出现「工具换了但侧表没更新」的错配。
+    pub mcp: Option<McpExposure>,
 }
 
 impl ToolDefinition {
@@ -234,6 +307,7 @@ mod tests {
 
     fn tool(name: &str, domain: Domain) -> ToolDefinition {
         ToolDefinition {
+            mcp: None,
             id: format!("test:{name}"),
             name: name.to_string(),
             provider: "Test".to_string(),

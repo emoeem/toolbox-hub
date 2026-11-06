@@ -8,6 +8,8 @@ mod argument;
 mod domain;
 mod tool;
 
-pub use argument::{Action, ArgKind, ArgPlacement, Argument, ArgumentValues, Choice};
+pub use argument::{
+    Action, ArgKind, ArgPlacement, Argument, ArgumentValue, ArgumentValues, Choice, TypedValues,
+};
 pub use domain::Domain;
-pub use tool::{Danger, RunMode, ToolDefinition};
+pub use tool::{Danger, McpExposure, RunMode, ToolDefinition, ToolEffects};

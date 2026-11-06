@@ -35,6 +35,7 @@ impl FftoolsProvider {
         let ready = deps.is_ready();
 
         ToolDefinition {
+            mcp: metadata::mcp_exposure(head, name),
             id: format!("{}:{name}", self.id()),
             name: name.to_string(),
             provider: self.label().to_string(),

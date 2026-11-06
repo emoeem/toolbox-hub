@@ -850,7 +850,12 @@ fn execute_form(app: &mut App, cwd: &Path) -> Result<(), Box<dyn std::error::Err
                             .as_ref()
                             .map(|action| action.ok_exit_codes.clone())
                             .unwrap_or_else(|| vec![0]),
-                        values: values.pairs(),
+                        // 与 record_run 同一套脱敏规则：后台任务收尾时写的
+                        // 「回填再改」取值里不能留 sensitive 参数的原值（S-01）。
+                        values: match tool.action.as_ref() {
+                            Some(action) => action.redacted_values(&values).pairs(),
+                            None => values.pairs(),
+                        },
                         argv,
                         record_argv,
                         total_seconds,

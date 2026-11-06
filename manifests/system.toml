@@ -1,4 +1,8 @@
 # 系统域：常见只读巡检动作。缺少可选命令时会在列表里显示安装提示。
+#
+# 下面几条的 `mcp = { … }` 只是「作者声明这个动作可以被 AI 调用」，**不是授权**：
+# 还得在 ~/.config/toolbox-hub/mcp.toml 的 [exposure] allow 里逐个点名才会真正暴露。
+# 没写 mcp 的动作一律不进入 MCP 工具列表（默认拒绝）。
 
 [[action]]
 id = "disk-space"
@@ -13,6 +17,7 @@ danger = "safe"
 install = "自带（coreutils）"
 input = "挂载点"
 output = "磁盘用量表"
+mcp = { enabled = true, name = "disk_space", description = "查看文件系统总量、已用与剩余空间", effects = { filesystem_read = true } }
 
 [[action.argument]]
 key = "path"
@@ -55,6 +60,7 @@ danger = "safe"
 install = "自带（systemd）"
 input = "无"
 output = "错误日志"
+mcp = { enabled = true, name = "boot_errors", description = "查看本次启动以来的错误级别系统日志" }
 
 [[action]]
 id = "failed-units"
@@ -83,6 +89,7 @@ danger = "safe"
 install = "自带（util-linux）"
 input = "无"
 output = "块设备树"
+mcp = { enabled = true, name = "block_devices", description = "查看块设备、文件系统与挂载点" }
 
 [[action]]
 id = "pci-devices"
@@ -97,3 +104,4 @@ danger = "safe"
 install = "sudo pacman -S pciutils"
 input = "无"
 output = "PCI 设备与驱动列表"
+mcp = { enabled = true, name = "pci_devices", description = "列出 PCI 设备及当前绑定的内核驱动" }

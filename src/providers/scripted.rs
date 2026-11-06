@@ -77,6 +77,7 @@ impl ScriptedProvider {
             .unwrap_or_else(|| guess_domain(name, &summary));
 
         ToolDefinition {
+            mcp: metadata::mcp_exposure(head, name),
             id: format!("{}:{name}", self.id()),
             name: name.to_string(),
             provider: self.label().to_string(),
@@ -275,6 +276,25 @@ mod tests {
         assert_eq!(tool.features.as_deref(), Some("多线程"));
         assert_eq!(tool.requires.len(), 2);
         assert!(!tool.ready, "缺一个依赖就不该算就绪");
+    }
+
+    /// P2-03：本地脚本必须自己写 `mcp=true`，注解是自述，不是自动授权。
+    #[test]
+    fn mcp_exposure_is_opt_in_for_local_scripts() {
+        let plain = provider(Vec::new()).definition(
+            "my-tool",
+            PathBuf::from("/tmp/my-tool"),
+            "# my-tool:summary=普通脚本\n",
+        );
+        assert!(plain.mcp.is_none(), "没写注解就不暴露");
+
+        let exposed = provider(Vec::new()).definition(
+            "my-tool",
+            PathBuf::from("/tmp/my-tool"),
+            "# my-tool:summary=系统信息\n# my-tool:mcp=true\n# my-tool:mcp-name=my_system_info\n",
+        );
+        let mcp = exposed.mcp.expect("显式声明");
+        assert_eq!(mcp.name.as_deref(), Some("my_system_info"));
     }
 
     #[test]

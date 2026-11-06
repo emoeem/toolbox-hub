@@ -4,8 +4,8 @@
 //!
 //! | 目录 | 放什么 | 默认 | 覆盖 |
 //! | --- | --- | --- | --- |
-//! | **配置** | `state.toml`（收藏）、`tools.d/`（你的 manifest）、`tools/`（你的脚本）、`packages.toml` | `~/.config/toolbox-hub` | `--config-dir` > `TOOLBOX_HUB_CONFIG` |
-//! | **数据** | 执行历史、安装队列、搜索历史、已读新闻、输出留存 | `~/.local/share/toolbox-hub` | `--data-dir` > `TOOLBOX_HUB_DATA` |
+//! | **配置** | `state.toml`（收藏）、`tools.d/`（你的 manifest）、`tools/`（你的脚本）、`packages.toml`、`mcp.toml`（AI 调用白名单，见 `security/policy`） | `~/.config/toolbox-hub` | `--config-dir` > `TOOLBOX_HUB_CONFIG` |
+//! | **数据** | 执行历史、安装队列、搜索历史、已读新闻、输出留存、MCP 审计 | `~/.local/share/toolbox-hub` | `--data-dir` > `TOOLBOX_HUB_DATA` |
 //!
 //! 为什么要分开：配置是换机器时要**带走**的东西，数据是可再生的。`--config-dir`
 //! 只挪配置；想让整套（含数据）都进一个目录，两个参数都给。
