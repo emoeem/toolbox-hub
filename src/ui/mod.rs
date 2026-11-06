@@ -439,6 +439,7 @@ mod tests {
         summary: &str,
     ) -> ToolDefinition {
         ToolDefinition {
+            mcp: None,
             id: id.to_string(),
             name: name.to_string(),
             provider: provider.to_string(),
@@ -1359,6 +1360,7 @@ mod tests {
             success: true,
             elapsed: std::time::Duration::from_millis(12),
             cancelled: false,
+            truncated: false,
         };
         app.open_viewer(
             crate::app::Viewer::from_captured(std::slice::from_ref(&captured)).expect("有输出"),

@@ -203,6 +203,172 @@ impl ArgumentValues {
     }
 }
 
+/// 类型化参数取值。
+///
+/// 表单（[`ArgumentValues`]）把所有东西都存成字符串，多值靠分隔符拼起来 ——
+/// 这对键盘输入够用，但对外部调用方（服务层 / MCP）有两个问题：
+///
+/// 1. 值里本来就有分隔符时无法表达（路径里带逗号很常见）；
+/// 2. 开关和文本分不开，调用方得猜 `"true"` 到底是不是「打开」。
+///
+/// 所以再引入这一层：**只描述值本身，不描述怎么拼 argv**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArgumentValue {
+    /// 单值文本。
+    Text(String),
+    /// 开关。
+    Bool(bool),
+    /// 多值。每一项就是一个 argv 元素，**不再拆分**。
+    List(Vec<String>),
+}
+
+/// 一组类型化取值（键有序）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypedValues {
+    entries: BTreeMap<String, ArgumentValue>,
+}
+
+impl TypedValues {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&mut self, key: &str, value: ArgumentValue) {
+        self.entries.insert(key.to_string(), value);
+    }
+
+    pub fn set_text(&mut self, key: &str, value: impl Into<String>) {
+        self.set(key, ArgumentValue::Text(value.into()));
+    }
+
+    pub fn set_bool(&mut self, key: &str, value: bool) {
+        self.set(key, ArgumentValue::Bool(value));
+    }
+
+    pub fn set_list(&mut self, key: &str, values: Vec<String>) {
+        self.set(key, ArgumentValue::List(values));
+    }
+
+    pub fn get(&self, key: &str) -> Option<&ArgumentValue> {
+        self.entries.get(key)
+    }
+
+    /// 按声明顺序遍历（未知键排在后面 —— 校验会先把它们拦住）。
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ArgumentValue)> {
+        self.entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 把表单取值归一成类型化取值：多值按分隔符拆、开关按 `"true"` 判。
+    ///
+    /// 这是**兼容层**：TUI 仍然填字符串，但构建 argv 走的是同一条
+    /// [`Action::build_argv_typed`]，所以界面预览和外部调用不会各算一套。
+    pub fn from_form(values: &ArgumentValues, arguments: &[Argument]) -> Self {
+        let mut typed = Self::new();
+        for argument in arguments {
+            let Some(raw) = values.get(&argument.key) else {
+                continue;
+            };
+            match argument.kind {
+                ArgKind::Toggle => typed.set_bool(&argument.key, raw == "true"),
+                _ if argument.repeatable => {
+                    typed.set_list(&argument.key, argument.split_values(raw));
+                }
+                _ => typed.set_text(&argument.key, raw),
+            }
+        }
+        typed
+    }
+
+    /// 把 `sensitive` 字段的值换成 `***`（其余原样）。
+    ///
+    /// 服务层的审计、命令摘要、执行历史都从这里取「可以落盘/可以回传」的那一份，
+    /// 不再各自写一遍脱敏规则。
+    pub fn redacted(&self, arguments: &[Argument]) -> Self {
+        let mut out = Self::new();
+        for (key, value) in self.entries.iter() {
+            let sensitive = arguments
+                .iter()
+                .any(|argument| argument.key == *key && argument.sensitive);
+            out.set(
+                key,
+                if sensitive {
+                    // 连「有几个值」都不留：敏感字段整个替换成一个占位符。
+                    ArgumentValue::Text(String::from("***"))
+                } else {
+                    value.clone()
+                },
+            );
+        }
+        out
+    }
+
+    /// `sensitive` 字段当前真正用到的值（用于把命令摘要里出现的地方抹掉）。
+    ///
+    /// 列表要逐项收集：`flag_join` 会把值和 flag 贴成一个 argv 元素，
+    /// 只按「整元素相等」比对会漏掉那种形状。
+    pub fn secrets(&self, arguments: &[Argument]) -> Vec<String> {
+        let mut secrets = Vec::new();
+        for (key, value) in &self.entries {
+            let sensitive = arguments
+                .iter()
+                .any(|argument| argument.key == *key && argument.sensitive);
+            if !sensitive {
+                continue;
+            }
+            match value {
+                ArgumentValue::Text(text) if !text.is_empty() => secrets.push(text.clone()),
+                ArgumentValue::List(items) => {
+                    secrets.extend(items.iter().filter(|item| !item.is_empty()).cloned())
+                }
+                _ => {}
+            }
+        }
+        secrets
+    }
+
+    /// 审计摘要：键 → 一行文字（敏感字段已是 `***`，长值截断）。
+    ///
+    /// 未声明的键一律记成 `<unknown>`：宁可丢信息，也不能把来路不明的值写进日志。
+    pub fn summary(&self, arguments: &[Argument]) -> BTreeMap<String, String> {
+        let redacted = self.redacted(arguments);
+        redacted
+            .entries
+            .iter()
+            .map(|(key, value)| {
+                let declared = arguments.iter().any(|argument| argument.key == *key);
+                let text = if !declared {
+                    String::from("<unknown>")
+                } else {
+                    match value {
+                        ArgumentValue::Text(text) => text.clone(),
+                        ArgumentValue::Bool(on) => on.to_string(),
+                        ArgumentValue::List(items) => items.join(", "),
+                    }
+                };
+                (key.clone(), truncate_utf8(&text, 200))
+            })
+            .collect()
+    }
+}
+
+/// 按 UTF-8 字符边界截断（`String::truncate` 遇到多字节字符会 panic）。
+fn truncate_utf8(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// 一个动作：要执行的程序 + 无参数部分 + 表单字段。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
@@ -239,6 +405,76 @@ pub struct Action {
     pub foreach: Option<String>,
 }
 
+/// 一个参数归一化之后的形态。
+enum Resolved {
+    /// 不参与 argv（空值，或者关闭的开关）。
+    Skip,
+    /// 开关打开：追加它的 flag。
+    Flag,
+    /// 单值。
+    Value(String),
+    /// 多值，每一项各占一个 argv 元素。
+    Items(Vec<String>),
+}
+
+/// 把类型化取值按参数声明归一成 [`Resolved`]。
+///
+/// 必填校验放在这里：`Skip` 只对可选项成立，必填项为空一律报错，不替用户猜。
+fn resolve(argument: &Argument, values: &TypedValues) -> Result<Resolved, String> {
+    if argument.kind == ArgKind::Toggle {
+        return match values.get(&argument.key) {
+            None | Some(ArgumentValue::Bool(false)) => Ok(Resolved::Skip),
+            Some(ArgumentValue::Bool(true)) => Ok(Resolved::Flag),
+            Some(_) => Err(format!("「{}」是开关，只接受 true / false", argument.label)),
+        };
+    }
+
+    let items: Vec<String> = match values.get(&argument.key) {
+        None => Vec::new(),
+        Some(ArgumentValue::Text(raw)) => {
+            let text = raw.trim();
+            if text.is_empty() {
+                Vec::new()
+            } else if argument.repeatable {
+                // 文本仍按分隔符理解：TUI 的表单值就是从这条路进来的。
+                argument.split_values(text)
+            } else {
+                vec![text.to_string()]
+            }
+        }
+        Some(ArgumentValue::List(values)) => values
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(ArgumentValue::Bool(_)) => {
+            return Err(format!("「{}」需要文本值，不是开关", argument.label));
+        }
+    };
+
+    if items.is_empty() {
+        if argument.required {
+            return Err(format!("「{}」是必填项", argument.label));
+        }
+        return Ok(Resolved::Skip);
+    }
+
+    if !argument.repeatable {
+        let mut iter = items.into_iter();
+        let value = iter.next().unwrap_or_default();
+        if iter.next().is_some() {
+            return Err(format!(
+                "「{}」只接受一个值（多值要在 manifest 里声明 repeatable = true）",
+                argument.label
+            ));
+        }
+        return Ok(Resolved::Value(value));
+    }
+
+    Ok(Resolved::Items(items))
+}
+
 impl Action {
     /// 构造 argv（**不含程序名**）。
     ///
@@ -252,6 +488,23 @@ impl Action {
     ///
     /// 全程只做字符串拼接，**不经过 shell**。
     pub fn build_argv(&self, values: &ArgumentValues) -> Result<Vec<String>, String> {
+        // 表单值先归一成类型化取值，再走同一条构建路径 —— 界面预览、TUI 执行和
+        // 服务层 / MCP 调用因此永远得到同一条命令，不会各写一份「差不多」的逻辑。
+        self.build_argv_typed(&TypedValues::from_form(values, &self.arguments))
+    }
+
+    /// 用类型化取值构造 argv（**不含程序名**）。
+    ///
+    /// 与 [`Action::build_argv`] 的区别只有输入形态：多值用 [`ArgumentValue::List`]
+    /// 直接给，**不经过分隔符字符串**，所以单个值里带逗号（路径常见）也不会被拆开。
+    ///
+    /// 规则与 [`Action::build_argv`] 完全一致：
+    ///
+    /// 1. `base_argv` 原样打头；
+    /// 2. 再按 [`ArgPlacement`] 分三段（Leading → Middle → Trailing），段内按声明顺序；
+    /// 3. 值为空的参数整个跳过；必填项为空直接报错；
+    /// 4. 多值带 flag 时按 `flag_join` / `repeat_flag` 展开。
+    pub fn build_argv_typed(&self, values: &TypedValues) -> Result<Vec<String>, String> {
         let mut phases: [Vec<String>; 3] = std::array::from_fn(|_| Vec::new());
 
         for argument in &self.arguments {
@@ -260,35 +513,26 @@ impl Action {
                 ArgPlacement::Middle => 1,
                 ArgPlacement::Trailing => 2,
             };
-            let value = values.get(&argument.key).unwrap_or("").trim().to_string();
 
-            if argument.required && argument.kind != ArgKind::Toggle && value.is_empty() {
-                return Err(format!("「{}」是必填项", argument.label));
-            }
-
-            if argument.kind == ArgKind::Toggle {
-                if values.is_on(&argument.key)
-                    && let Some(flag) = &argument.flag
-                {
-                    phases[slot].push(flag.clone());
+            match resolve(argument, values)? {
+                Resolved::Skip => {}
+                Resolved::Flag => {
+                    if let Some(flag) = &argument.flag {
+                        phases[slot].push(flag.clone());
+                    }
                 }
-                continue;
-            }
-
-            if value.is_empty() {
-                continue;
-            }
-
-            // 多值：拆成多个 argv 元素。带 flag 时按 `repeat_flag` 决定是
-            // 「一个 flag 后面平铺」（`-S a b c`）还是「每个值一个 flag」（`-i a -i b`）。
-            // `foreach` 的批量字段每次只有一个值，两种写法都会得到 `-S <一个>`。
-            if argument.repeatable {
-                let items = argument.split_values(&value);
-                if argument.required && items.is_empty() {
-                    return Err(format!("「{}」是必填项", argument.label));
-                }
-
-                match &argument.flag {
+                Resolved::Value(value) => match &argument.flag {
+                    Some(flag) if argument.flag_join => {
+                        // 贴成一个元素，例如 7z 的 `-mx9` / `-o/tmp/dir`
+                        phases[slot].push(format!("{flag}{value}"));
+                    }
+                    Some(flag) => {
+                        phases[slot].push(flag.clone());
+                        phases[slot].push(value);
+                    }
+                    None => phases[slot].push(value),
+                },
+                Resolved::Items(items) => match &argument.flag {
                     Some(flag) if argument.flag_join => {
                         for item in items {
                             phases[slot].push(format!("{flag}{item}"));
@@ -305,21 +549,7 @@ impl Action {
                         phases[slot].extend(items);
                     }
                     None => phases[slot].extend(items),
-                }
-                continue;
-            }
-
-            match &argument.flag {
-                Some(flag) => {
-                    if argument.flag_join {
-                        // 贴成一个元素，例如 7z 的 `-mx9` / `-o/tmp/dir`
-                        phases[slot].push(format!("{flag}{value}"));
-                    } else {
-                        phases[slot].push(flag.clone());
-                        phases[slot].push(value);
-                    }
-                }
-                None => phases[slot].push(value),
+                },
             }
         }
 
@@ -335,26 +565,59 @@ impl Action {
     /// 按**值**精确匹配：先取所有 sensitive 参数当前的取值，argv 里等于这些值的元素
     /// 一律替换。这样不依赖参数在 argv 的位置，也不会误伤别的参数。
     pub fn redacted(&self, values: &ArgumentValues, argv: &[String]) -> Vec<String> {
-        let secrets: Vec<&str> = self
-            .arguments
-            .iter()
-            .filter(|argument| argument.sensitive)
-            .filter_map(|argument| values.get(&argument.key))
-            .filter(|value| !value.is_empty())
-            .collect();
+        let mut secrets: Vec<String> = Vec::new();
+        for argument in self.arguments.iter().filter(|item| item.sensitive) {
+            let Some(raw) = values.get(&argument.key) else {
+                continue;
+            };
+            if argument.repeatable {
+                secrets.extend(argument.split_values(raw));
+            } else if !raw.is_empty() {
+                secrets.push(raw.to_string());
+            }
+        }
 
         if secrets.is_empty() {
             return argv.to_vec();
         }
         argv.iter()
             .map(|item| {
-                if secrets.contains(&item.as_str()) {
-                    String::from("***")
-                } else {
-                    item.clone()
+                let mut masked = item.clone();
+                for secret in &secrets {
+                    // 整元素相等时一个字符也照抹；只在别的元素里做「包含」替换时
+                    // 才要求至少两个字符，免得密码是 "a" 时把 "--all" 搅成 "--***ll"。
+                    let applies = item == secret || (secret.len() >= 2 && item.contains(secret));
+                    if applies {
+                        masked = masked.replace(secret, "***");
+                    }
                 }
+                masked
             })
             .collect()
+    }
+
+    /// 把表单取值里 `sensitive` 字段的值换成 `***`（P2-08 / 审计 S-01）。
+    ///
+    /// 历史文件除了 argv 还存一份「当时的表单取值」用来回填。以前这份是**原样**
+    /// 落盘的，`sensitive = true` 的密码 / token 会明文留在磁盘上。这里补上同一套
+    /// 规则：执行用真值，落盘用脱敏后的值。
+    pub fn redacted_values(&self, values: &ArgumentValues) -> ArgumentValues {
+        let mut out = ArgumentValues::new();
+        for (key, value) in values.pairs() {
+            let sensitive = self
+                .arguments
+                .iter()
+                .any(|argument| argument.key == key && argument.sensitive);
+            out.set(
+                &key,
+                if sensitive && !value.is_empty() {
+                    "***".to_string()
+                } else {
+                    value
+                },
+            );
+        }
+        out
     }
 
     /// 按声明的缺省值初始化一份取值（打开表单时的初值）。
@@ -381,7 +644,7 @@ impl Action {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, ArgKind, ArgPlacement, Argument, ArgumentValues, Choice};
+    use super::{Action, ArgKind, ArgPlacement, Argument, ArgumentValues, Choice, TypedValues};
 
     /// 一个模仿 yt-dlp 的动作：`base` + 带 flag 的选项 + 末尾的位置参数。
     fn action() -> Action {
@@ -715,6 +978,76 @@ mod tests {
         assert_eq!(
             action.build_argv(&values).expect("应能构建"),
             vec!["--no-mtime", "-f", "best", "-f", "worst", "a.mp4"]
+        );
+    }
+
+    /// 表单取值与类型化取值必须生成**逐元素相同**的 argv。
+    ///
+    /// 这条是兼容层的契约：TUI 的预览、TUI 的执行、服务层 / MCP 的调用都依赖
+    /// 「同一组参数只有一种命令」。
+    #[test]
+    fn typed_and_form_values_build_the_same_argv() {
+        let mut action = action();
+        action.arguments[0].repeatable = true; // 链接改成多值
+        let mut values = action.default_values();
+        values.set("url", "a.jpg, b.jpg");
+        values.set("quality", "best");
+        values.set("subtitles", "true");
+
+        let typed = TypedValues::from_form(&values, &action.arguments);
+        assert_eq!(
+            action.build_argv(&values),
+            action.build_argv_typed(&typed),
+            "两条路只能差在输入形态，不能差在结果"
+        );
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["--no-mtime", "-f", "best", "--write-subs", "a.jpg", "b.jpg"]
+        );
+    }
+
+    /// 类型化列表**不再拆分**：值里带逗号（路径常见）也原样保留。
+    #[test]
+    fn a_typed_list_keeps_separators_inside_a_value() {
+        let mut action = action();
+        action.arguments[0].repeatable = true;
+
+        let mut typed = TypedValues::new();
+        typed.set_list("url", vec![String::from("a,b.jpg"), String::from("c.jpg")]);
+        typed.set_text("quality", "");
+        typed.set_bool("subtitles", false);
+
+        assert_eq!(
+            action.build_argv_typed(&typed).expect("应能构建"),
+            vec!["--no-mtime", "a,b.jpg", "c.jpg"],
+            "列表的每一项就是一个 argv 元素"
+        );
+    }
+
+    #[test]
+    fn a_non_repeatable_field_rejects_several_typed_values() {
+        let mut typed = TypedValues::new();
+        typed.set_list("url", vec![String::from("a.jpg"), String::from("b.jpg")]);
+
+        assert!(
+            action()
+                .build_argv_typed(&typed)
+                .expect_err("没声明 repeatable 就不该接受多个值")
+                .contains("只接受一个值")
+        );
+    }
+
+    #[test]
+    fn a_switch_rejects_a_text_value() {
+        let mut typed = TypedValues::new();
+        typed.set_text("subtitles", "yes");
+        typed.set_text("url", "u");
+
+        assert!(
+            action()
+                .build_argv_typed(&typed)
+                .expect_err("开关只认布尔")
+                .contains("只接受 true / false")
         );
     }
 

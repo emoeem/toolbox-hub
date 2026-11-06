@@ -279,6 +279,11 @@ pub struct Captured {
     pub elapsed: Duration,
     /// 是不是被用户取消的（取消也算「没成功」，但原因不一样）。
     pub cancelled: bool,
+    /// 输出是否被截断过（任一条流超过 [`MAX_CAPTURED_LINES`]）。
+    ///
+    /// 以前只有开头那行提示文字能看出来；调用方（服务层 / MCP）需要一个**结构化**
+    /// 的标记，否则只能去匹配中文提示。
+    pub truncated: bool,
 }
 
 impl Captured {
@@ -576,8 +581,8 @@ pub fn spawn_captured(
     let finished_flag = Arc::clone(&cancelled);
     let finished_label = label.clone();
     thread::spawn(move || {
-        let out = stdout_reader.join().ok().unwrap_or_default();
-        let err = stderr_reader.join().ok().unwrap_or_default();
+        let (out, out_truncated) = stdout_reader.join().ok().unwrap_or_default();
+        let (err, err_truncated) = stderr_reader.join().ok().unwrap_or_default();
         // 等子进程退出，但**不在持锁状态里阻塞**。
         //
         // `Child::wait()` 需要 `&mut Child`，也就是必须在锁里调用：一旦它在那
@@ -609,6 +614,7 @@ pub fn spawn_captured(
             success: status.is_some_and(|status| status.success()),
             elapsed: started.elapsed(),
             cancelled: finished_flag.load(Ordering::SeqCst),
+            truncated: out_truncated || err_truncated,
         })));
     });
 
@@ -651,12 +657,12 @@ fn reader_thread(
     stream: Option<impl io::Read + Send + 'static>,
     is_stderr: bool,
     tx: mpsc::Sender<JobEvent>,
-) -> thread::JoinHandle<String> {
+) -> thread::JoinHandle<(String, bool)> {
     thread::spawn(move || {
         let mut collected: VecDeque<String> = VecDeque::new();
         let mut dropped = 0usize;
         let Some(stream) = stream else {
-            return String::new();
+            return (String::new(), false);
         };
 
         let mut reader = BufReader::new(stream);
@@ -712,7 +718,7 @@ fn reader_thread(
             text.push_str(&line);
             text.push('\n');
         }
-        text
+        (text, dropped > 0)
     })
 }
 
@@ -742,6 +748,7 @@ pub fn run_captured(
         success: output.status.success(),
         elapsed,
         cancelled: false,
+        truncated: false,
     })
 }
 
@@ -825,6 +832,7 @@ mod tests {
         use crate::model::{Action, Danger, Domain, RunMode, ToolDefinition};
 
         let tool = ToolDefinition {
+            mcp: None,
             id: String::from("probe"),
             name: String::from("探针"),
             provider: String::from("test"),
@@ -898,6 +906,7 @@ mod tests {
             success: true,
             elapsed: Duration::from_millis(1200),
             cancelled: false,
+            truncated: false,
         };
 
         let body = captured.body();
@@ -919,6 +928,7 @@ mod tests {
             success: false,
             elapsed: Duration::from_millis(0),
             cancelled: false,
+            truncated: false,
         };
         assert!(captured.body().contains("没有任何输出"));
         assert!(captured.summary().contains("被信号终止"));

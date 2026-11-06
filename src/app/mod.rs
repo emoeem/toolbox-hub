@@ -1390,6 +1390,7 @@ impl App {
                 success: true,
                 elapsed: std::time::Duration::ZERO,
                 cancelled: false,
+                truncated: false,
             };
             if let Some(viewer) = Viewer::from_captured(&[captured]) {
                 self.open_viewer(viewer);
@@ -2769,9 +2770,14 @@ impl App {
         let mut full = vec![tool.path.display().to_string()];
         full.extend(argv.iter().cloned());
         // 表单还开着的时候顺手把取值抄一份 —— 历史里的「回填再改」全靠它。
+        // 表单取值也要脱敏：历史里除了 argv 还存一份「回填再改」用的值，
+        // 以前这份是明文落盘的（P0 审计 S-01）。执行用真值，落盘用脱敏后的值。
         let values = self
             .form_values()
-            .map(|values| values.pairs())
+            .map(|values| match tool.action.as_ref() {
+                Some(action) => action.redacted_values(values).pairs(),
+                None => values.pairs(),
+            })
             .unwrap_or_default();
         self.record_history(&tool.id, &tool.name, &full, &values, success, millis);
     }
@@ -2942,6 +2948,7 @@ mod tests {
 
     fn tool(name: &str, domain: Domain, tags: &[&str]) -> ToolDefinition {
         ToolDefinition {
+            mcp: None,
             id: format!("test:{name}"),
             name: name.to_string(),
             provider: "Test".to_string(),
@@ -3448,6 +3455,7 @@ mod tests {
             success: true,
             elapsed: std::time::Duration::from_millis(30),
             cancelled: false,
+            truncated: false,
         };
 
         let mut app = action_app();
@@ -4214,6 +4222,85 @@ mod tests {
         app.apply_filter();
         assert!(app.open_form());
         app
+    }
+
+    /// S-01 回归：历史里除了 argv 还有一份「回填再改」用的表单取值，
+    /// 以前那份是**明文**落盘的，`sensitive = true` 的密码/token 会留在磁盘上。
+    #[test]
+    fn history_never_persists_sensitive_form_values() {
+        use crate::model::{Action, ArgKind, ArgPlacement, Argument, ArgumentValues};
+
+        let secret = "s3cr3t-token-value";
+        // 用默认域（媒体）：App 启动后只显示当前域，放别的域会选不中工具。
+        let mut tool = tool("带密码的工具", Domain::Media, &["编辑"]);
+        tool.mode = RunMode::Capture;
+        tool.action = Some(Action {
+            program: String::from("echo"),
+            base_argv: Vec::new(),
+            arguments: vec![Argument {
+                key: String::from("token"),
+                label: String::from("令牌"),
+                kind: ArgKind::Text,
+                default: None,
+                choices: Vec::new(),
+                required: true,
+                flag: None,
+                flag_join: false,
+                placement: ArgPlacement::Trailing,
+                sensitive: true,
+                repeatable: false,
+                repeat_flag: false,
+                separator: String::from(","),
+                source: None,
+                dir_only: false,
+                help: None,
+            }],
+            duration_from: None,
+            limit_from: None,
+            foreach: None,
+            ok_exit_codes: vec![0],
+            allow_empty: false,
+        });
+
+        let mut values = ArgumentValues::new();
+        values.set("token", secret);
+        let argv = vec![secret.to_string()];
+        // 调用方按既有契约负责脱敏 argv；这里只验证**取值列**也被脱敏。
+        let redacted_argv = tool.action.as_ref().expect("动作").redacted(&values, &argv);
+
+        let dir = std::env::temp_dir().join(format!(
+            "toolbox-hub-test-sensitive-{}-{}",
+            std::process::id(),
+            "history"
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("history.log");
+        let _ = std::fs::remove_file(&file);
+
+        let mut app = App::new(
+            Registry::from_tools(vec![tool.clone()]),
+            PathBuf::from("/tmp/bin"),
+            ReloadReport::default(),
+        );
+        app.state = crate::state::State::default();
+        app.state_path = dir.join("state.toml");
+        app.history_path = Some(file.clone());
+        app.apply_filter();
+        assert!(app.open_form(), "表单要能打开");
+        app.form.as_mut().expect("表单").values.set("token", secret);
+
+        app.record_run(&tool, &redacted_argv, true, 1);
+
+        let text = std::fs::read_to_string(&file).expect("历史文件");
+        assert!(!text.contains(secret), "敏感值不能出现在历史文件里: {text}");
+        let entries = crate::history::load_from(&file, 10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].values.get("token").map(String::as_str),
+            Some("***")
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// 「最近使用」是带缓存的，但**写完一条新历史必须作废** ——
