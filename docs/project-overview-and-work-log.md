@@ -180,6 +180,196 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 验证记录
 
+### 2026-11-07（P3：真正的 MCP stdio Server —— 入口 / 动态注册 / tools/call / 结构化输出 / 连接测试）
+
+按计划书 P3 与 [`p0-baseline-audit.md`](p0-baseline-audit.md) §9 白名单执行；安全面全部走 P2 的
+`security/` 与 `service/gateway.rs`，`mcp/` 自身不碰子进程。
+
+交付（新增 `src/mcp/`，约 2000 行 + 集成测试）：
+
+- **P3-01 入口**：`toolbox-hub mcp stdio`（main.rs 独立非 TUI 分支，先于 TUI 初始化判断）。
+  stdout 只承载协议；日志与诊断统一 stderr；`--config-dir` / `--data-dir` 与其他子命令同源；
+  客户端关 stdin 后干净退出（无孤儿子进程，集成测试覆盖）。
+- **P3-02 动态注册**：启动时读 Registry 快照 + MCP Policy，`tools/list` 只返回通过策略的工具；
+  `mcp/names.rs`（NameRegistry）把原始 id 规范化为 `toolbox_manifest_<action>` 等合法 MCP 名，
+  冲突消解且映射稳定（单元测试 6 例）。
+- **P3-03 tools/call 流水线**：名称映射 → 取 ToolDefinition → JSON 解析 → schema 检查
+  （`mcp/schema.rs`，Manifest 参数声明到 JSON Schema 的映射）→ 确认门槛（Elicitation，
+  客户端 initialize 时声明能力才可用）→ 网关执行。未知工具 `-32602`；缺参数走
+  `isError + structuredContent.error_kind`；全部拒绝路径发生在启动子进程之前。
+- **P3-04 结构化输出**：content[0].text + structuredContent（status / exit_code / duration_ms /
+  truncated / stdout / stderr / 脱敏命令摘要），脱敏唯一出处仍是 P2 的 `TypedValues`。
+- **审计**：每次 call 落 `mcp-audit.jsonl`（completed / denied 两种决策实测在场）。
+- **P0-08 关闭（ADR-001）**：协议版本钉 2025-06-18，传输自研不引 rmcp，升级触发条件
+  （P4 Tasks / HTTP 传输 / 客户端生态）写入 [`adr-001`](adr-001-mcp-protocol-version-and-transport.md)。
+  顺手修掉一处真实规范偏差：initialize 原来盲目回显客户端请求的版本（等于宣称实现
+  2026-07-28 语义），现按规范始终回自支持版本，新增协商降级集成测试
+  `server_negotiates_to_the_version_it_implements`。
+- **P3-05 连接测试**（tests/mcp_protocol.rs，真实子进程 + 行协议对话，非内部 dispatcher）：
+  协议协商 / tools/list 形状（name/description/inputSchema/annotations.readOnlyHint）/
+  tools/call 中文+特殊字符+空格+逗号原样进 argv（注入串 `$(touch ...)` 只当普通字节）/
+  未知工具 / 缺参数 / 策略拒绝（审计 denied）/ 无孤儿退出 / 版本协商降级。
+  超时与截断由 P1 服务层测试覆盖（`a_hanging_command_is_killed_at_the_deadline`、
+  `truncation_never_splits_a_utf8_character`、`summary_tells_timeout_cancel_and_truncation_apart`）。
+
+验证：
+
+- `cargo fmt --check`；`clippy --all-targets`（两套 feature，`-D warnings`）通过。
+- `cargo test --all-features` **663 passed / 16 ignored**（P2 后 630 + 新增 33，含协商修复 1 例）；
+  `--locked --no-default-features` **657 passed / 0 failed**。
+- `cargo +1.90.0 build --locked`（MSRV）通过。
+- `check registry/` 85 项（featured 1 警告为存量）、`recipe check` 35 条、
+  `build-featured.py --check`（35 条 / SHA-256）通过。
+
+未做（记在这里，P4）：MCP Tasks（2025-11-25 起的规范能力，需按 ADR-001 升级协商）、
+并发上限的策略化配置面、实时进度通知、Registry 热更新后的 listChanged、
+审计与执行历史查询面、`ensure_template()` 已在 mcp 入口挂载但 TUI 侧入口未挂。
+
+
+### 2026-11-06（P0：MCP 升级基线审计与架构冻结）
+
+按 `Toolbox Hub 2.0` 计划书执行 P0，**只读审计 + 文档**，未改源码 / 脚本 / 配置，未提交。
+完整报告见 [`p0-baseline-audit.md`](p0-baseline-audit.md)。
+
+基线（HEAD `c45c4ca`，工作区干净）：
+
+- `cargo fmt --check` 通过；`clippy --all-targets --all-features -- -D warnings` 通过。
+- `cargo test --all-features` **567 passed / 16 ignored**；`--no-default-features`
+  **561 passed / 16 ignored**；`cargo +1.90.0 build --locked` 通过（MSRV 实测）。
+- `check registry/`（9 个插件包）、`recipe check registry/featured`（35 条）、
+  `python3 registry/build-featured.py --check`（35 条 / SHA-256）全部通过。
+
+审计结论（只列需要后续动手的）：
+
+- **执行入口有 6 条**（TUI 捕获队列 / 交互单动作 / 交互多选 / 提权安装 / ecosystem
+  Recipe 与队列 / CLI 包管理），没有统一执行服务；`foreach` 展开只存在于 `App`。
+- **`ArgumentValues` 是字符串表**，多值靠分隔符拆，无法无损承接 MCP 数组输入。
+- **`Danger` 只是 TUI 确认位**：`pkg-center`（能装能卸、走 sudo）标的是 `safe`，
+  不能映射成 MCP 只读权限；需要独立 `ToolEffects`。
+- **S-01（真实缺陷）**：历史只脱敏 `argv`，`values` 原样落盘（`app/mod.rs:2772`、
+  `:2800`），`sensitive = true` 的值会泄漏 —— P2-08 必须修。
+- **S-02（真实缺陷）**：Recipe 参数是纯字符串替换进 argv（`ecosystem.rs:1173`），
+  没有 flag / 位置约束，存在参数注入（不是 shell 注入）—— P5 接入前必修。
+- 计划书三处偏差：`Curated` 实为 `Manifest`；`check` 不校验精选 Recipe；
+  MCP 规范 / `rmcp` 版本未核实（P0-08 留到 P3 前补 ADR）。
+
+下一步（P1 门禁已通过）：新增 `src/service/`（Catalog / Typed Argument / Executor /
+Result / Error），只改 `main.rs`、`model/argument.rs`、`runtime/exec.rs`，
+不动 `app/`、`ui/`、`ecosystem.rs`、`scripts/sing-box/`。
+
+### 2026-11-06（P2：MCP 安全地基 —— 副作用建模 / mcp.toml 策略 / 授权网关 / 审计 / S-01）
+
+按计划书 P2 与 [`p0-baseline-audit.md`](p0-baseline-audit.md) §9 白名单执行。
+本批**只建安全层**：没有接 MCP Server（P3），`security/` 目前只有测试调用，
+`main.rs` 里 `#[allow(dead_code)]` 显式声明，不伪装使用。
+
+**模型**（`model/tool.rs`、`model/argument.rs`）：
+
+- `ToolEffects`：读 / 写 / 联网 / 改系统 / 提权 / 交互 / 破坏性 / 通用命令执行器，
+  与 `Danger` 完全独立 —— `Danger::Safe` 是 TUI 的确认提示，不是只读证明（审计 §5）。
+- `McpExposure`：「允许被 AI 调用」的**声明**，挂在 `ToolDefinition::mcp` 上；
+  `None`＝没声明＝默认拒绝。
+- `TypedValues::redacted / secrets / summary`：脱敏与审计摘要的唯一出处；
+  `Action::redacted` 升级为支持 `flag_join` 形状（`-o/tmp/secret` 也能抹）与多值敏感字段。
+
+**Provider 声明**：
+
+- Manifest：`[action.mcp]`（`enabled` / `name` / `description` / `effects`），
+  只接受 `capture`，发现阶段即报错；内置 `system.toml` 给 4 个只读巡检动作
+  （disk-space / boot-errors / block-devices / pci-devices）加了声明。
+- 本地脚本注解：`mcp` / `mcp-name` / `mcp-description` / `mcp-effects`（`read`、
+  `write`、`network`、`system`、`privileged`、`interactive`、`destructive`、`shell`）。
+  Curated / Repository 工具复用 Manifest 的构建路径，自动获得同一语义。
+
+**安全层**（新增 `src/security/`）：
+
+- `effects.rs`：从程序名 / base_argv / 参数声明**独立推断**副作用，再与作者声明取
+  并集 —— 伪造 `danger = safe` + 「无副作用」声明抹不掉 `sudo` / `rm -rf`
+  （`forged_safe_metadata_cannot_hide_privilege_or_destruction`）。
+  `systemctl --failed` 这类只读巡检不误伤；`sh -c` 标为通用命令执行器。
+- `policy.rs`：`mcp.toml`（配置目录）。判定顺序：启用 → 显式声明 → deny 名单 →
+  allow 名单 → 依赖 → 执行模式 → 风险（默认全拒）→ 参数合法 → 路径范围 →
+  确认能力 → 授权。**fail-closed**：文件缺失 / 字段拼错退回全拒绝并在
+  `Loaded::problem` 说明；`ensure_template()` 写带注释模板。
+  `[paths] allowed_dirs` 非空时工作目录与路径参数都必须在范围内（词法归一化，
+  `../` 逃不掉）；路径值以 `-` 开头直接拒（选项注入）。
+- `approval.rs`：需要确认（`Caution` 或非只读）而客户端无确认能力 → 拒绝，
+  绝不「先跑再说」。stdio 客户端首期无确认能力。
+- `audit.rs`：JSONL（数据目录 `mcp-audit.jsonl`），只记元数据 —— 时间、工具 id、
+  客户端、授权结果、退出码、耗时、**脱敏后的参数摘要**；原始请求 / 输出 / 敏感值
+  一律不落盘，也绝不写 stdout（MCP 协议流归协议）。
+- `service/gateway.rs`：`ToolGateway` —— 唯一 AI 可调用入口。`list()` 只返回通过
+  策略的工具；`call()` 在**启动子进程之前**完成全部拒绝路径，超时 / 输出字节
+  上限 / 并发（上限直接拒绝，不排队）都由策略统一决定。
+
+**S-01 修复**（`app/mod.rs`、`app/input.rs`）：历史文件的 `values` 列（回填再改用）
+此前明文落盘，现与 argv 同一套 `redacted_values` 脱敏；回归测试
+`history_never_persists_sensitive_form_values` 覆盖 argv 与取值两列。
+
+未做（记在这里，P3）：MCP Server 接线、工具名规范化、Elicitation 确认流程、
+`ensure_template()` 的首次运行调用点。
+
+验证：
+
+- `cargo fmt --check`；`clippy --all-targets`（两套 feature，`-D warnings`）通过。
+- `cargo test --all-features` **630 passed / 16 ignored**（P1 后 592 + 新增 38）；
+  `--no-default-features` **624 passed**（586 + 38）。
+- `cargo +1.90.0 build --locked`（MSRV）通过。
+- `recipe check` 35 条、`check registry/` 85 项通过（`featured` 警告为存量）。
+
+### 2026-11-06（P1：统一 Tool Service —— 类型化参数 / ToolCatalog / 无终端执行器）
+
+按计划书 P1 与 [`p0-baseline-audit.md`](p0-baseline-audit.md) §9 的白名单执行；
+未触碰 TUI 行为、`ui/` 渲染、`ecosystem.rs` 与冻结的 `scripts/sing-box/`。
+
+变更：
+
+- **argv 构建收敛成一条路径**（`model/argument.rs`）：新增 `ArgumentValue`
+  （Text / Bool / List）与 `TypedValues`；`Action::build_argv_typed` 是唯一的
+  构建实现，`build_argv` 退化为「表单字符串 → 类型化」的兼容层。两条路不可能
+  再各算各的（契约测试 `typed_and_form_values_build_the_same_argv`）。
+- **多值不再被分隔符吃掉**：类型化 `List` 的每一项就是一个 argv 元素，
+  路径里带逗号（`a,b.jpg`）也能原样保留 —— 字符串形式仍按分隔符理解（兼容）。
+- **`Captured` 增加 `truncated` 字段**（`runtime/exec.rs`）：以前截断只能靠
+  开头那行中文提示判断；现在 reader 直接返回标记，服务层不用解析文字。
+- **新增 `src/service/`**：
+  - `catalog`：Registry 的**稳定快照**（域 → 置顶 → 名字 → id 排序）；
+    重复 id「先注册的胜出」—— 先按输入顺序去重再排序，顺序不能反过来决定身份；
+  - `argument`：进入执行器前的校验（未声明的键 / 类型不对 / 未声明 repeatable
+    却给了多个值），静默丢参数在服务层是不允许的；
+  - `error`：稳定 `kind()`（`unknown_tool` / `not_ready` / `unsupported_mode` …），
+    将来 CLI / MCP 直接映射状态码；
+  - `execution`：`execute(&ExecutionRequest) -> Result<ExecutionResult>`，
+    复用 `spawn_captured` 的进程组与输出上限；超时走 SIGTERM → 2s 宽限 →
+    SIGKILL；成功按动作声明的 `ok_exit_codes` 判；缺省值自动叠加（与 TUI 打开
+    表单时的初值一致）；`interactive` / `native` / 缺依赖在构造请求时就拒绝。
+- `main.rs` 挂 `#[allow(dead_code)] mod service`：P3 MCP 服务端接线之前只有
+  测试调用，显式声明而不是伪装使用。
+
+偏差（已评估）：`Captured` 加字段导致 `app/mod.rs`、`ui/mod.rs` 各一处测试
+构造点补 `truncated: false` —— 编译期同步，无行为变化。
+
+验证：
+
+- `cargo fmt --check` 通过；`clippy --all-targets`（两套 feature、`-D warnings`）通过。
+- `cargo test --all-features` **592 passed / 16 ignored**（基线 567 + 新增 25）；
+  `--no-default-features` **586 passed / 16 ignored**（基线 561 + 新增 25）。
+- `cargo +1.90.0 build --locked` 通过（MSRV）。
+- 超时测试用 `sh -c 'sleep 5'` 实测：300ms 截止即整组终止，耗时 < 4s。
+- 服务层只 import `model` / `registry` / `runtime`，无 Ratatui 依赖。
+
+P1 验收对照（计划书 §11.3 / 审计报告 §9.3）：
+
+- TUI 行为、默认值、argv 顺序、历史脱敏（argv）不退化 —— 仅 `Captured` 构造点同步；
+- 超时 / 取消 / 截断 / `ok_exit_codes` / 未知键均有测试；
+- 基线 567 / 561 不减，反而 +25。
+
+未做（记在这里）：
+
+- `foreach` 的批量展开仍只在 `App::form_build_runs`；MCP 要支持批量执行前，
+  先把它下沉到服务层（P2 的事，动了就要和 TUI 的 `{stem}` 替换语义对齐）。
+- 敏感值脱敏仍只覆盖 argv，`values` 落盘未脱敏（P0 审计 S-01，P2-08 处理）。
+
 ### 2026-10-28（sing-box 开关收尾：tc 改名 / bypass 真正生效 / 表单对齐）
 
 起点是工作区里改了一半的脚本：`--with-abf`、`--with-lyc-geosite`、`--bypass-cn`、

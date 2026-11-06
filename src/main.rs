@@ -17,6 +17,7 @@ mod config;
 mod dynamic;
 pub mod ecosystem;
 mod history;
+mod mcp;
 mod media;
 mod model;
 mod notifications;
@@ -26,6 +27,13 @@ mod providers;
 mod registry;
 mod repository;
 mod runtime;
+// 服务层：目前只有测试在调用，MCP 服务端（P3）接手后会成为主路径。
+// 在那之前显式允许「暂时没人用」，免得 `-D warnings` 把已经写好、测过的能力
+// 当成死代码删掉。
+#[allow(dead_code)]
+mod security;
+#[allow(dead_code)]
+mod service;
 mod state;
 mod thumbnail;
 mod ui;
@@ -68,6 +76,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 生态数据命令不进入 TUI；结果只写 stdout，执行层仅使用 argv。
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    // MCP 服务端同样不进 TUI：stdout 只承载协议，诊断走 stderr（见 mcp 模块）。
+    if raw_args.first().is_some_and(|arg| arg == "mcp") {
+        if let Err(error) = mcp::run_cli(&raw_args) {
+            eprintln!("toolbox-hub: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if raw_args.first().is_some_and(|arg| {
         matches!(
             arg.as_str(),
@@ -138,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 工具目录解析顺序：命令行给的位置参数 > `FZF_FFTOOLS_BIN_DIR` > `$HOME/.local/bin`。
-fn resolve_bin_dir(from_args: Option<PathBuf>) -> PathBuf {
+pub(crate) fn resolve_bin_dir(from_args: Option<PathBuf>) -> PathBuf {
     from_args
         .or_else(|| env::var_os("FZF_FFTOOLS_BIN_DIR").map(PathBuf::from))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin")))
