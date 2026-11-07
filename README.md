@@ -417,6 +417,46 @@ toolbox-hub tools show manifest:disk-space --json          # 单件工具的完�
 toolbox-hub tools run manifest:disk-space --input-json '{}' --output json
 ```
 
+## MCP Server：让 AI 直接调用工具箱
+
+toolbox-hub 同时是一个标准 MCP（Model Context Protocol）stdio 服务器。在支持 MCP 的
+AI 客户端里加一条配置即可：
+
+```json
+{
+  "mcpServers": {
+    "toolbox-hub": { "command": "/usr/local/bin/toolbox-hub", "args": ["mcp", "stdio"] }
+  }
+}
+```
+
+安全模型，默认全拒绝：
+
+- 工具必须**显式声明**可被调用（脚本注解 `mcp=true` 或 Manifest `[action.mcp]`，写法见
+  [`docs/plugin-authoring.md`](docs/plugin-authoring.md)），并且进入配置目录 `mcp.toml` 的
+  `[exposure] allow` 名单，两关全过才会出现在 `tools/list`。
+- 副作用与界面上的 `danger` 无关、由系统独立推断再与声明取并集：伪造「安全」抹不掉
+  `sudo` / `rm -rf`。非只读工具要求客户端支持确认（elicitation），否则列表不可见。
+- **所有拒绝都发生在启动子进程之前**；超时 / 输出字节上限 / 并发上限由 `[limits]` 统一决定。
+- 每次调用落审计（数据目录 `mcp-audit.jsonl`）：只记元数据与脱敏后的参数摘要，
+  原始输出与敏感值一律不落盘。
+
+能力一览：
+
+| 能力 | 说明 |
+|---|---|
+| 动态注册 | Manifest 动作、注解脚本、（可选）Recipe 走同一网关；工具名规范化且映射稳定 |
+| MCP Tasks | `tools/call` 带 `task` 字段即异步任务，`tasks/get` / `tasks/result` / `tasks/cancel`；取消走进程组终止，无孤儿子进程（2025-11-25 协商） |
+| 实时进度 | `notifications/progress`，1 秒节流；没有真实总量就不给百分比 |
+| Resources | `toolbox://catalog` / `toolbox://domains` / `toolbox://tools/{id}` 三类只读资源 |
+| 热更新 | `tools.d/`、`tools/`、`mcp.toml` 变更自动重建目录并广播 `list_changed`；坏配置跳过不崩 |
+| Recipe 接入 | `mcp.toml` `[recipes] dirs` 指向精选库：SHA-256 校验 + 与 `recipe run` 逐元素等价的形状证明才注册，选项注入面清零 |
+
+版本钉在 MCP 2025-06-18，客户端请求 2025-11-25 及以上时协商升级以开放 Tasks；
+协议决策见 [`docs/adr-001-mcp-protocol-version-and-transport.md`](docs/adr-001-mcp-protocol-version-and-transport.md)。
+`mcp stdio` 的 stdout 只承载协议、诊断走 stderr；上一节的 `tools … --json` 子命令与 MCP
+共用同一套策略与结果结构，可直接当作脚本化的 MCP 测试入口。
+
 ## 给脚本用的界面组件（`ui …`）
 
 写脚本时缺的往往不是功能而是**界面**：挑一个输入文件、确认一次、翻一页长输出。

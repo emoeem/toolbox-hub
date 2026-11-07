@@ -118,6 +118,30 @@ hint = "sudo pacman -S coreutils"
 | `allow_empty` | | 允许不带任何参数运行（默认不允许，防止忘了写 `base_argv`） |
 | `ok_exit_codes` | | 哪些退出码也算成功，例如 `[0, 1]` |
 | `pin` | | 在本域里置顶（越小越靠前） |
+
+### 让 AI 调用你的动作（MCP）
+
+两道门都过，动作才会出现在 AI 的工具列表（详见 `mcp.toml`，默认全拒绝）：
+
+1. **作者声明**。Manifest 动作加子表（`effects` 取 `read` / `write` / `network` / `system` /
+   `privileged` / `interactive` / `destructive`，如实声明，推断层会与声明取并集）：
+
+   ```toml
+   [[action]]
+   id = "summary"
+   [action.mcp]
+   enabled = true
+   name = "my_tool_summary"
+   description = "查看系统信息（只读）"
+   effects = ["read"]
+   ```
+
+   本地脚本用头部注解：`# my-tool:mcp=true`、`# my-tool:mcp-name=…`、
+   `# my-tool:mcp-description=…`、`# my-tool:mcp-effects=read`。
+2. **用户授权**。配置目录 `mcp.toml` 的 `[exposure] allow` 点名工具 id；
+   `[execution]` 各风险位默认全关。非只读动作还需要客户端支持确认（elicitation）。
+
+诚实声明是硬要求：`danger = "safe"` 阻止不了副作用推断，伪造声明只会被并集逻辑戳穿。
 | `foreach` | | 批量：指定一个字段，**每个取值各跑一次** |
 | `duration_from` `limit_from` | | 进度条的总时长从哪个参数（文件）探 |
 

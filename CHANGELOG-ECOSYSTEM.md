@@ -3,6 +3,27 @@
 这一轮把「一个 TUI 工具箱」补成了「一个可以被脚本和别人复用的工具箱生态」。下面按**用户能感知到的变化**写，
 每条都附**实际跑过的验证**；没验证的一律写在最后一节，不混在「已完成」里。
 
+---
+
+## 2.0：MCP 升级（P0-P5，2026-11-07 完成）
+
+把工具箱从「TUI + CLI 生态」升级成「AI 可安全调用的 MCP 服务器」。六个阶段各自验收，
+全记录见 [`docs/project-overview-and-work-log.md`](docs/project-overview-and-work-log.md)，
+协议决策见 [`docs/adr-001`](docs/adr-001-mcp-protocol-version-and-transport.md)。要点：
+
+- 统一 Tool Service：argv 构建收敛为类型化一条路，多值参数不再被分隔符吃掉。
+- 安全地基：副作用独立推断（伪造 safe 声明无效）+ `mcp.toml` fail-closed 策略 +
+  授权网关（全部拒绝在启动子进程之前）+ JSONL 审计（只记元数据）。
+- MCP stdio Server：动态注册、名称规范化、结构化结果、elicitation 确认、
+  MCP Tasks 异步任务与取消（进程组终止无孤儿）、实时进度通知、工具目录热更新、
+  只读 Resources、Recipe 接入（SHA-256 + 无损形状证明，选项注入面清零）。
+- CLI：`tools list / show / run --json` 与 MCP 同一套策略与结果。
+- 历史遗留安全修复：敏感表单值不再明文落盘（S-01）。
+
+**验证**：`cargo test --all-features` 716 passed / 0 failed；`--no-default-features` 710 / 0；
+fmt / clippy 双 feature（-D warnings）/ MSRV 1.90.0 / registry 85 项 / recipe 35 条全绿；
+MCP 集成测试为真实子进程 stdio 对话（协议协商、调用、取消、注入拒绝、无孤儿）。
+
 验证基线：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
 `cargo clippy --all-targets --no-default-features -- -D warnings` 全部退出 0；
 `cargo test` 默认 feature **559 passed / 0 failed / 16 ignored**，`--no-default-features` **553 / 0 / 16**。
