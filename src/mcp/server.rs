@@ -16,7 +16,10 @@
 //!
 //! 消息按顺序处理（一次一条）：并发上限由网关策略兜底，协议层不排队不乱序。
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use serde_json::{Value, json};
 
@@ -29,21 +32,35 @@ use crate::{
         policy::SafetyPolicy,
     },
     service::{
-        catalog::ToolCatalog, error::ServiceError, gateway::ToolGateway, result::ExecutionResult,
+        catalog::ToolCatalog,
+        error::ServiceError,
+        gateway::{ConcurrencyLimiter, ToolGateway},
+        result::ExecutionResult,
     },
 };
 
 use super::{
     names::NameRegistry,
     protocol::{self, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PROTOCOL_VERSION},
+    reload::HotReload,
     schema::{input_schema, values_from_json},
 };
 
 /// 一台 MCP 服务端。状态只有连接本身的那点：协商出来的能力、名称表、请求计数。
+///
+/// `catalog` / `auditor` / `limiter` 在 `Arc` 后面：热更新（P4-04）时整体换入
+/// 新快照，已在处理的请求拿的仍是旧 `Arc`，不会引用失效对象。
 pub struct McpServer {
-    catalog: ToolCatalog,
+    catalog: Arc<ToolCatalog>,
     policy: SafetyPolicy,
-    auditor: Auditor,
+    auditor: Arc<Auditor>,
+    /// 同步调用与（将来的）后台任务共享的并发预算（P4-02）；上限可热更新。
+    limiter: Arc<ConcurrencyLimiter>,
+    /// 热更新信箱（与 watcher 线程共享）。
+    reload: Arc<HotReload>,
+    /// 服务端要主动推给客户端的通知行（list_changed 等），主循环在写完当前
+    /// 请求的响应后统一排空。
+    outgoing: Arc<Mutex<Vec<String>>>,
     names: NameRegistry,
     initialized: bool,
     client_name: String,
@@ -62,15 +79,102 @@ pub type Elicit<'a> = &'a mut dyn FnMut(u64, &str, Value) -> Option<Value>;
 impl McpServer {
     pub fn new(catalog: ToolCatalog, policy: SafetyPolicy, auditor: Auditor) -> Self {
         Self {
-            catalog,
-            policy,
-            auditor,
+            catalog: Arc::new(catalog),
+            policy: policy.clone(),
+            auditor: Arc::new(auditor),
+            limiter: Arc::new(ConcurrencyLimiter::new(policy.config.max_concurrent())),
+            reload: Arc::new(HotReload::new()),
+            outgoing: Arc::new(Mutex::new(Vec::new())),
             names: NameRegistry::default(),
             initialized: false,
             client_name: String::from("unknown"),
             client_elicitation: false,
             next_request_id: 1_000_000,
         }
+    }
+
+    /// 热更新信箱的把手（交给 watcher 线程）。
+    pub fn reload_handle(&self) -> Arc<HotReload> {
+        Arc::clone(&self.reload)
+    }
+
+    /// 待推送通知队列的把手（主循环排空后写 stdout）。
+    pub fn outgoing_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.outgoing)
+    }
+
+    /// 换入 watcher 产出的新快照（P4-04）。快照是整体构建好的，换入即生效；
+    /// 授权工具清单的内容真的变了才发 `notifications/tools/list_changed`。
+    pub fn apply_reload(&mut self) {
+        let Some(snapshot) = self.reload.take() else {
+            return;
+        };
+        let before = self.authorized_signature();
+        self.catalog = snapshot.catalog;
+        self.policy = snapshot.policy;
+        if let Some(problem) = snapshot.problem {
+            eprintln!("toolbox-hub mcp: {problem}");
+        }
+        // 审计位置与并发上限跟着新策略走；限制器原地改上限，预算不清零。
+        self.auditor = Arc::new(Auditor::new(
+            self.policy.config.audit_path(),
+            self.policy.config.audit.enabled,
+        ));
+        self.limiter.set_max(self.policy.config.max_concurrent());
+        self.rebuild_names();
+        if before != self.authorized_signature() {
+            self.push_outgoing(protocol::notification(protocol::LIST_CHANGED));
+        }
+    }
+
+    /// 授权工具清单的内容签名（id + 摘要 + Schema），用于判断「列表真的变了吗」。
+    fn authorized_signature(&self) -> Vec<String> {
+        let caps = ClientCapabilities {
+            confirmation: self.client_elicitation,
+        };
+        let gateway = ToolGateway::new(
+            &self.catalog,
+            &self.policy,
+            &self.auditor,
+            caps,
+            self.client_name.clone(),
+            Arc::clone(&self.limiter),
+        );
+        gateway
+            .list()
+            .iter()
+            .map(|tool| {
+                format!(
+                    "{}\u{1}{}\u{1}{}",
+                    tool.id,
+                    tool.summary,
+                    input_schema(tool)
+                )
+            })
+            .collect()
+    }
+
+    fn push_outgoing(&self, line: String) {
+        self.outgoing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line);
+    }
+
+    /// 名称表按「这次连接实际可授权的工具」重建（initialize 与热更新共用）。
+    fn rebuild_names(&mut self) {
+        let caps = ClientCapabilities {
+            confirmation: self.client_elicitation,
+        };
+        let gateway = ToolGateway::new(
+            &self.catalog,
+            &self.policy,
+            &self.auditor,
+            caps,
+            self.client_name.clone(),
+            Arc::clone(&self.limiter),
+        );
+        self.names = NameRegistry::build(gateway.list());
     }
 
     /// 处理一行输入，返回**要写回 stdout 的行**（通知类消息返回空）。
@@ -122,17 +226,7 @@ impl McpServer {
 
         // 名称表按「这次连接实际可授权的工具」建：支持 elicitation 的客户端
         // 能看到（策略放行的）需要确认的工具；无确认能力的看不到。
-        let caps = ClientCapabilities {
-            confirmation: self.client_elicitation,
-        };
-        let gateway = ToolGateway::new(
-            &self.catalog,
-            &self.policy,
-            &self.auditor,
-            caps,
-            self.client_name.clone(),
-        );
-        self.names = NameRegistry::build(gateway.list());
+        self.rebuild_names();
         self.initialized = true;
 
         // 协议版本：只实现 2025-06-18。规范要求不支持客户端请求的版本时
@@ -140,7 +234,8 @@ impl McpServer {
         // 等于宣称实现了未实现的语义（如 2025-11-25 起的 Tasks）。
         Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {"listChanged": false}},
+            // P4-04：热更新已实现，声明 listChanged 并在清单变化时发通知。
+            "capabilities": {"tools": {"listChanged": true}},
             "serverInfo": {
                 "name": "toolbox-hub",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -158,6 +253,7 @@ impl McpServer {
             &self.auditor,
             caps,
             self.client_name.clone(),
+            Arc::clone(&self.limiter),
         );
         let tools: Vec<Value> = gateway
             .list()
@@ -267,6 +363,7 @@ impl McpServer {
             &self.auditor,
             caps,
             self.client_name.clone(),
+            Arc::clone(&self.limiter),
         );
         // 工作目录 = 服务端进程的启动目录（MCP 客户端没有「当前目录」概念）。
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -517,8 +614,79 @@ mod tests {
         assert_eq!(response["result"]["serverInfo"]["name"], "toolbox-hub");
         assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(
-            response["result"]["capabilities"]["tools"]["listChanged"],
-            false
+            response["result"]["capabilities"]["tools"]["listChanged"], true,
+            "P4-04 热更新已实现，要声明 listChanged"
+        );
+        cleanup(&fixture);
+    }
+
+    /// P4-04：换入热更新快照后，目录、名称表整体更新；授权清单内容真的变了
+    /// 才发 `notifications/tools/list_changed`；内容没变就不发。
+    #[test]
+    fn a_reload_snapshot_swaps_atomically_and_notifies_only_on_real_changes() {
+        use crate::security::policy::SafetyPolicy;
+
+        // 快照里的策略把审计指回测试目录，避免热更新把 Auditor 换到真实数据目录。
+        let policy_for = |allow: &str, dir: &PathBuf| -> SafetyPolicy {
+            let text = format!(
+                "[mcp]\nenabled = true\n[exposure]\ndefault = \"deny\"\nallow = [{allow}]\ndeny = []\n[audit]\npath = \"{}\"\n",
+                dir.join("audit.jsonl").display()
+            );
+            SafetyPolicy::new(toml::from_str(&text).expect("配置"))
+        };
+
+        let mut fixture = Fixture::new(vec![tool("test:echo", false)], config(""));
+        initialize(&mut fixture.server, false);
+
+        // 相同内容（同一件工具）的新快照：换入但不发通知。
+        let same = crate::mcp::reload::ReloadSnapshot {
+            catalog: std::sync::Arc::new(ToolCatalog::new(vec![tool("test:echo", false)])),
+            policy: policy_for("\"test:echo\"", &fixture.dir),
+            problem: None,
+        };
+        fixture.server.reload_handle().store(same);
+        fixture.server.apply_reload();
+        assert!(
+            fixture
+                .server
+                .outgoing_handle()
+                .lock()
+                .expect("锁")
+                .is_empty()
+        );
+
+        // 新增一件授权工具：换入并发通知；tools/list 立即看到新工具。
+        let mut extra = tool("test:extra", false);
+        extra.summary = String::from("新来的");
+        let grown = crate::mcp::reload::ReloadSnapshot {
+            catalog: std::sync::Arc::new(ToolCatalog::new(vec![tool("test:echo", false), extra])),
+            policy: policy_for("\"test:echo\", \"test:extra\"", &fixture.dir),
+            problem: None,
+        };
+        fixture.server.reload_handle().store(grown);
+        fixture.server.apply_reload();
+        let outgoing = fixture
+            .server
+            .outgoing_handle()
+            .lock()
+            .expect("锁")
+            .drain(..)
+            .collect::<Vec<_>>();
+        assert_eq!(outgoing.len(), 1, "清单变了才发一次通知：{outgoing:?}");
+        assert!(
+            outgoing[0].contains("notifications/tools/list_changed"),
+            "{outgoing:?}"
+        );
+
+        let responses = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#,
+            &mut no_elicit(),
+        );
+        let parsed: Value = serde_json::from_str(&responses[0]).expect("合法");
+        assert_eq!(
+            parsed["result"]["tools"].as_array().expect("数组").len(),
+            2,
+            "新快照立即生效"
         );
         cleanup(&fixture);
     }

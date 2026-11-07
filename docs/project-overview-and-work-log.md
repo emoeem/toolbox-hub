@@ -180,6 +180,109 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 验证记录
 
+### 2026-11-07（P4：MCP 并发预算共享 / 工具目录热更新 / 任务生命周期审计 —— Tasks 调研完成、实现留待下批）
+
+按计划书 P4 与 [`p0-baseline-audit.md`](p0-baseline-audit.md) §9 白名单执行（src/mcp、src/service、
+src/security，未触碰 app/、ui/、ecosystem.rs、registry/、scripts/）。本批时限内完成 P4-02 / P4-04 /
+P4-05 三项并全部验证通过；P4-01（MCP Tasks）与 P4-03（实时进度）在止损点前未落地，协议调研已
+完成，实施要点全部记录在下面的「未做」里。
+
+变更：
+
+- **P4-02 并发预算共享**（`service/gateway.rs`）：`ConcurrencyLimiter` 改为可共享实例
+  （`max` 用 `AtomicUsize`，新增 `set_max` / `max` / `active`），`ToolGateway::new` 接收
+  调用方传入的 `Arc<ConcurrencyLimiter>`。这修掉了一个 P2 遗留的结构性问题：此前网关
+  每次构造都新建一个 limiter（active 恒为 0），并发上限在跨请求维度上从未真正生效。
+  现在整个服务端共用一份预算，超上限一律直接拒绝（不排队），语义与 P2 一致。
+  `set_max` 让热更新改 `mcp.toml` 的 `max_concurrent` 时上限原地生效、预算不清零。
+- **P4-04 工具目录热更新**（新增 `mcp/reload.rs`，接入 `mcp/server.rs` + `mcp/mod.rs`）：
+  - watcher 线程每秒对 `tools.d/`、`tools/`、`mcp.toml` 做 mtime + 大小指纹轮询
+    （与 `watch.rs` 同一条边界：`state.toml` 等程序自写文件不计入）；指纹变化即重跑
+    发现与目录构建，产出**完整**的 `ReloadSnapshot` 放进一次性信箱。
+  - 主循环在每条消息前 `apply_reload`：catalog / policy / auditor 整体换入（全部在
+    `Arc` 或 Clone 之后，换入即生效，不存在半初始化状态），并发上限原地调新，
+    名称表从新目录整体重建（不增量注册，重复 id 不可能出现）。
+  - 授权清单的**内容签名**（id + summary + inputSchema）前后对比，真的变了才发
+    `notifications/tools/list_changed`（协议事实：modelcontextprotocol.io/specification/
+    2025-11-25/server/tools，`listChanged` 能力 + 该通知在 2025-06-18 与 2025-11-25
+    同名同义）。能力声明相应改为 `tools.listChanged = true`。
+  - 非法 Manifest 由既有发现层逐文件跳过（watcher 真线程测试覆盖：坏 TOML 后下一次
+    变更照常重建，服务端不崩）；`ToolCatalog` 排序只由内容决定（P1 已验），相同目录
+    内容产生相同顺序与相同名字。
+  - 通知队列挂在 `McpServer::outgoing_handle()`，主循环写完当前响应后排空，stdout
+    仍归协议独占（主线程独占写入）。
+- **P4-05 任务生命周期审计字段**（`security/audit.rs`）：`AuditRecord` 新增
+  `task_id`（可缺省，序列化时省略，旧记录天然兼容）；`Auditor` 新增 `with_task_tag`
+  副本机制 —— 带标记的副本写下的每一条记录（含网关的 `completed` / `denied`）自动
+  携带 `task_id`，新增 `created` / `progress` / `cancelled` 三个生命周期写入方法。
+  纪律不变：只记元数据与脱敏摘要，原始请求、输出、敏感值一律不落盘。
+  `progress` 条目的 `reason` 预留给统一进度数据的 JSON 串（见「未做」P4-03）。
+
+P4-01 调研结论（协议事实已核实，2026-11-07，来源：modelcontextprotocol.io/specification/
+2025-11-25/basic/utilities/tasks 与 /server/tools、/basic/lifecycle、/client/elicitation）：
+
+- Tasks 是 2025-11-25 引入的**实验性**能力。创建 = `tools/call` params 带 `task: {ttl?}`
+  字段，服务端立即回 `CreateTaskResult{task: {taskId, status:"working", createdAt,
+  lastUpdatedAt, ttl, pollInterval, statusMessage?}}`；查询 = `tasks/get{taskId}`；
+  结果 = `tasks/result{taskId}`（非终态必须阻塞到终态，响应 result 内必须带
+  `_meta["io.modelcontextprotocol/related-task"]={taskId}`）；取消 = `tasks/cancel{taskId}`
+  （终态再取消回 `-32602`；取消必须在响应前转成 `cancelled` 终态，且此后不得再变）。
+- 服务端能力声明：`capabilities.tasks = {cancel:{}, requests:{tools:{call:{}}}}`；
+  `tasks/list` 按规范安全建议**不声明**（stdio 无请求方识别："receivers that cannot
+  identify requestors SHOULD NOT declare the tasks.list capability"）。
+- 工具级协商：`tools/list` 每件工具带 `execution.taskSupport: "optional"`。
+- 状态机：working → completed / failed / cancelled（isError=true 的工具结果 → failed）；
+  taskId 必须为字符串且不可猜测（无授权上下文时要用加密安全随机源，可读 /dev/urandom，
+  无需新依赖）。
+- 任务相关消息（如确认用 elicitation）的 params 必须带 related-task 元数据；form 模式
+  elicitation 的请求/响应形状在 2025-11-25 无破坏性变更（新增的是 url 模式，本服务端不用）。
+- 进度（P4-03）：`notifications/progress{progressToken, progress, total?, message?}`，
+  progress 必须单调递增、total 未知可省略；无真实总量依据时只给耗时与阶段信息，
+  不得伪造百分比。Task 的 `statusMessage` 可承载同一份信息。
+- 协商：客户端请求 2025-11-25 / 2026-07-28 时回 2025-11-25 并开放上述能力；请求
+  2025-06-18 时维持现状（task 字段按普通请求处理）。集成测试
+  `server_negotiates_to_the_version_it_implements` 届时要同步更新降级目标。
+
+P4-01 + P4-03 实施要点（已设计，未写码）：
+
+- 新增 `mcp/tasks.rs`：TaskManager（BTreeMap 任务表 + Condvar + 出站通知队列 +
+  共享 limiter 的 Arc）；`begin`（purge 过期 + 表上限 256 防耗尽 + /dev/urandom 生成
+  taskId）→ 建 working 记录 → 确认门槛同步走既有 elicitation（请求带 related-task）→
+  拒绝路径全部在起子进程前：拒绝/无确认能力/用户拒绝 → 任务直接转 failed；
+  通过则 spawn 后台线程，线程内 `ToolCatalog::new(vec![tool 副本])` + 共享 limiter
+  走完整 `ToolGateway` 流水线（授权、名额、执行、限额、审计全复用）。
+- 取消：`tasks/cancel` 置共享 `Arc<AtomicBool>`，执行器的 pump 循环（50ms 一轮）见到
+  旗标即走既有 `terminate()`（进程组 SIGTERM → 2s 宽限 → SIGKILL），无孤儿子进程；
+  任务状态在响应前即转 `cancelled` 并保持不变。
+- `service/execution.rs` 加进度钩子：pump 循环 1s 节流回调 `ExecutionProgress{elapsed_ms,
+  message}`（ffmpeg 类 `JobEvent::Progress` 的键值作阶段信息），取消旗标在循环顶部检查；
+  `ToolGateway::call_with_hooks` 把钩子从服务端穿透到执行器。
+- 退出清理：stdio 主循环断开后置全部运行中任务的取消旗标，等待终态（上限 8s）再退出。
+- 测试面：创建/进度/完成/取消/无孤儿（真实子进程 + slow.sh 脚本 + marker 文件验证
+  进程组被杀）、并发拒绝（max_concurrent=1 时后台任务占满后同步调用 busy）、
+  进度形状断言（无 total 字段、无百分比）、协商双版本、task 字段在 2025-06-18 下被忽略。
+
+未做（记在这里，下批接手）：
+
+- P4-01 MCP Tasks 全部协议面（调研与设计已完成，见上）。
+- P4-03 实时进度通知（依赖 P4-01 的后台执行；同步调用在响应前无法排通知，
+  统一进度数据结构已定为 `TaskProgress{job_id,status,progress,current,total,message}`，
+  progress/current/total 仅在有真实总量依据时给值）。
+- 热更新的真实子进程集成测试（现有覆盖：指纹/信箱/watcher 真线程/服务端换入快照
+  四组单元测试；集成版要给 `Server` 助手加读取线程才能收 `list_changed` 通知）。
+- `mcp.toml` 模板补一段 max_concurrent 对后台任务同样生效的注释（模板已在 P2 有
+  max_concurrent = 2，语义未变，不改文件）。
+
+验证：
+
+- `cargo fmt --check` 通过；`clippy --all-targets`（`--all-features` 与
+  `--no-default-features` 两套，`-D warnings`）通过。
+- `cargo test --all-features` **670 passed / 16 ignored**（P3 后 663 + 新增 7）；
+  `cargo test --locked --no-default-features` **664 passed / 16 ignored**（657 + 7）。
+- `cargo +1.90.0 build --locked`（MSRV）通过。
+- `check registry/` 85 项通过（featured 1 警告为存量）、`recipe check` 35 条、
+  `python3 registry/build-featured.py --check`（35 条 / SHA-256）通过。
+
 ### 2026-11-07（P3：真正的 MCP stdio Server —— 入口 / 动态注册 / tools/call / 结构化输出 / 连接测试）
 
 按计划书 P3 与 [`p0-baseline-audit.md`](p0-baseline-audit.md) §9 白名单执行；安全面全部走 P2 的

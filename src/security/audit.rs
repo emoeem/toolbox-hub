@@ -27,7 +27,8 @@ pub struct AuditRecord {
     pub tool_id: String,
     /// 客户端标识（可用时；stdio 首期固定 `"stdio"`）。
     pub client: String,
-    /// `denied` / `completed`。
+    /// `denied` / `completed`；P4-05 起任务生命周期还有 `created` / `progress` /
+    /// `cancelled`（带 `task_id` 字段即为任务生命周期条目）。
     pub decision: String,
     /// 是否通过了服务端授权。
     pub authorized: bool,
@@ -38,6 +39,9 @@ pub struct AuditRecord {
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
+    /// 任务生命周期条目的任务 id（P4-05）；普通执行记录没有这一字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// 脱敏后的参数摘要（键 → 一行文字）。
     pub arguments: BTreeMap<String, String>,
 }
@@ -54,6 +58,7 @@ impl AuditRecord {
             exit_code: None,
             elapsed_ms: 0,
             success: None,
+            task_id: None,
             arguments: BTreeMap::new(),
         }
     }
@@ -73,10 +78,16 @@ pub fn redacted_arguments(
 }
 
 /// 审计写入器。
+///
+/// `task_tag` 是 P4-05 的任务生命周期机制：后台任务执行时持有一个
+/// [`Auditor::with_task_tag`] 出来的副本，它写下的每一条记录（包括网关的
+/// `completed` / `denied`）都自动带上 `task_id` —— 任务终态的执行证据因此
+/// 能和 `created` / `progress` / `cancelled` 条目串成一条生命周期链。
 #[derive(Clone, Debug)]
 pub struct Auditor {
     path: PathBuf,
     enabled: bool,
+    task_tag: Option<String>,
 }
 
 impl Auditor {
@@ -84,6 +95,15 @@ impl Auditor {
         Self {
             path: path.into(),
             enabled,
+            task_tag: None,
+        }
+    }
+
+    /// 带上任务 id 的副本：这个副本写的每条记录都携带 `task_id`。
+    pub fn with_task_tag(&self, task_id: &str) -> Self {
+        Self {
+            task_tag: Some(task_id.to_string()),
+            ..self.clone()
         }
     }
 
@@ -94,6 +114,11 @@ impl Auditor {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 把副本上的任务标记盖到记录上。
+    fn stamp(&self, record: &mut AuditRecord) {
+        record.task_id = self.task_tag.clone();
     }
 
     /// 授权被拒：进程根本没启动，也要记一条。
@@ -107,6 +132,7 @@ impl Auditor {
         let mut record = AuditRecord::now(tool_id, client, "denied");
         record.reason = Some(reason.to_string());
         record.arguments = arguments;
+        self.stamp(&mut record);
         let _ = self.record(&record);
     }
 
@@ -125,6 +151,32 @@ impl Auditor {
         record.elapsed_ms = elapsed_ms;
         record.success = Some(success);
         record.arguments = arguments;
+        self.stamp(&mut record);
+        let _ = self.record(&record);
+    }
+
+    /// P4-05 任务生命周期：任务已创建（尚未执行任何东西）。
+    pub fn task_created(&self, tool_id: &str, client: &str, arguments: BTreeMap<String, String>) {
+        let mut record = AuditRecord::now(tool_id, client, "created");
+        record.arguments = arguments;
+        self.stamp(&mut record);
+        let _ = self.record(&record);
+    }
+
+    /// P4-05 任务生命周期：一次进度上报（节流后）。`progress_json` 是统一进度
+    /// 数据的 JSON 串（job_id/status/progress/current/total/message，见 mcp::tasks）。
+    pub fn task_progress(&self, tool_id: &str, client: &str, progress_json: &str) {
+        let mut record = AuditRecord::now(tool_id, client, "progress");
+        record.reason = Some(progress_json.to_string());
+        self.stamp(&mut record);
+        let _ = self.record(&record);
+    }
+
+    /// P4-05 任务生命周期：任务被请求取消（取消即终态；进程组随后被终止）。
+    pub fn task_cancelled(&self, tool_id: &str, client: &str, arguments: BTreeMap<String, String>) {
+        let mut record = AuditRecord::now(tool_id, client, "cancelled");
+        record.arguments = arguments;
+        self.stamp(&mut record);
         let _ = self.record(&record);
     }
 
@@ -256,6 +308,44 @@ mod tests {
         auditor.completed("test:echo", "stdio", Some(0), 1, true, BTreeMap::new());
         assert!(Auditor::read_all(&file).is_empty());
         let _ = fs::remove_dir_all(file.parent().expect("parent"));
+    }
+
+    /// P4-05：任务生命周期条目（created / progress / completed / cancelled）都带
+    /// `task_id`，且与不带标记的普通记录互不混淆；敏感摘要纪律不变。
+    #[test]
+    fn task_lifecycle_entries_carry_the_task_id() {
+        let file = temp_file("task");
+        let base = Auditor::new(&file, true);
+        let tagged = base.with_task_tag("task_abc123");
+
+        tagged.task_created("test:echo", "stdio", BTreeMap::new());
+        tagged.task_progress("test:echo", "stdio", r#"{"job_id":"task_abc123"}"#);
+        tagged.completed("test:echo", "stdio", Some(0), 12, true, BTreeMap::new());
+        tagged.task_cancelled("test:echo", "stdio", BTreeMap::new());
+        // 无标记的普通记录不能带上 task_id。
+        base.completed("test:echo", "stdio", Some(0), 5, true, BTreeMap::new());
+
+        let records = Auditor::read_all(&file);
+        let decisions: Vec<(&str, Option<&String>)> = records
+            .iter()
+            .map(|record| (record.decision.as_str(), record.task_id.as_ref()))
+            .collect();
+        assert_eq!(
+            decisions,
+            vec![
+                ("created", Some(&String::from("task_abc123"))),
+                ("progress", Some(&String::from("task_abc123"))),
+                ("completed", Some(&String::from("task_abc123"))),
+                ("cancelled", Some(&String::from("task_abc123"))),
+                ("completed", None),
+            ]
+        );
+        assert_eq!(
+            records[1].reason.as_deref(),
+            Some(r#"{"job_id":"task_abc123"}"#)
+        );
+
+        fs::remove_dir_all(file.parent().expect("parent")).expect("cleanup");
     }
 
     #[test]

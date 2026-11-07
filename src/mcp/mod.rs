@@ -27,9 +27,11 @@
 //! | [`names`] | 内部 id → MCP 工具名（规范化 + 撞名消解） |
 //! | [`schema`] | 参数 Schema 生成与 JSON 取值转换 |
 //! | [`server`] | 消息分派、确认门槛、结果组装 |
+//! | [`reload`] | `tools.d/` / `tools/` / `mcp.toml` 热更新（mtime 轮询，P4-04） |
 
 pub mod names;
 pub mod protocol;
+pub mod reload;
 pub mod schema;
 pub mod server;
 
@@ -111,12 +113,21 @@ fn run_stdio() -> io::Result<()> {
     );
 
     let mut server = McpServer::new(catalog, policy, auditor);
+
+    // P4-04 热更新：独立线程按 mtime 轮询 tools.d/、tools/、mcp.toml；
+    // 变更产出完整快照，主循环在下一条消息前整体换入并按需发 list_changed。
+    let config_dir = config::config_dir();
+    reload::spawn_watcher(config_dir, bin_dir, server.reload_handle());
+
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
     loop {
+        // watcher 产出的快照在这里整体换入（原子重建；授权清单变了才发通知）。
+        server.apply_reload();
+
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
@@ -153,8 +164,26 @@ fn run_stdio() -> io::Result<()> {
         for response in server.handle(trimmed, &mut elicit) {
             writeln!(out, "{response}")?;
         }
+        // 服务端主动推的通知（热更新 list_changed 等）跟在响应后面排出。
+        drain_outgoing(&server, &mut out)?;
         out.flush()?;
     }
+    server.apply_reload();
+    drain_outgoing(&server, &mut out)?;
+    out.flush()?;
     eprintln!("toolbox-hub mcp: 客户端断开，退出");
+    Ok(())
+}
+
+/// 排空服务端待推送的通知队列，逐行写 stdout（stdout 只归协议，主线程独占写入）。
+fn drain_outgoing(server: &McpServer, out: &mut impl Write) -> io::Result<()> {
+    for line in server
+        .outgoing_handle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain(..)
+    {
+        writeln!(out, "{line}")?;
+    }
     Ok(())
 }

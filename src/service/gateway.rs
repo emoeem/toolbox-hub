@@ -33,13 +33,16 @@ use crate::{
 };
 
 /// 工具网关。借用目录、策略、审计器，本身不持有工具数据的副本。
+///
+/// 并发名额来自调用方传入的**共享** [`ConcurrencyLimiter`]（P4-02）：同一个
+/// 服务端里的同步调用与后台任务共用预算，超上限一律直接拒绝。
 pub struct ToolGateway<'a> {
     catalog: &'a ToolCatalog,
     policy: &'a SafetyPolicy,
     auditor: &'a Auditor,
     client: ClientCapabilities,
     client_name: String,
-    limiter: ConcurrencyLimiter,
+    limiter: std::sync::Arc<ConcurrencyLimiter>,
 }
 
 impl<'a> ToolGateway<'a> {
@@ -49,6 +52,7 @@ impl<'a> ToolGateway<'a> {
         auditor: &'a Auditor,
         client: ClientCapabilities,
         client_name: impl Into<String>,
+        limiter: std::sync::Arc<ConcurrencyLimiter>,
     ) -> Self {
         Self {
             catalog,
@@ -56,7 +60,7 @@ impl<'a> ToolGateway<'a> {
             auditor,
             client,
             client_name: client_name.into(),
-            limiter: ConcurrencyLimiter::new(policy.config.max_concurrent()),
+            limiter,
         }
     }
 
@@ -108,7 +112,7 @@ impl<'a> ToolGateway<'a> {
             self.denied(
                 id,
                 "busy",
-                format!("并发已达上限 {}", self.limiter.max),
+                format!("并发已达上限 {}", self.limiter.max()),
                 arguments.clone(),
             )
         })?;
@@ -164,24 +168,42 @@ fn truncate_utf8(text: &str, max: usize) -> String {
     text[..end].to_string()
 }
 
-/// P2-07 并发控制：超上限直接拒绝（不排队），避免多个 Agent 一起把机器压满。
-struct ConcurrencyLimiter {
+/// P2-07 / P4-02 并发控制：超上限直接拒绝（不排队），避免多个 Agent 一起把机器压满。
+///
+/// 整个服务端共享**一个**实例（MCP 层用 `Arc` 持有）：同步调用与后台任务共用同一份
+/// 名额预算，上限读取走 `AtomicUsize`，`mcp.toml` 热更新（P4-04）时可以原地改上限。
+pub struct ConcurrencyLimiter {
     active: AtomicUsize,
-    max: usize,
+    max: AtomicUsize,
 }
 
 impl ConcurrencyLimiter {
-    fn new(max: usize) -> Self {
+    pub fn new(max: usize) -> Self {
         Self {
             active: AtomicUsize::new(0),
-            max,
+            max: AtomicUsize::new(max.max(1)),
         }
     }
 
-    fn acquire(&self) -> Option<Permit<'_>> {
+    /// 当前上限（至少 1）。
+    pub fn max(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
+    }
+
+    /// 热更新上限；至少 1。
+    pub fn set_max(&self, max: usize) {
+        self.max.store(max.max(1), Ordering::SeqCst);
+    }
+
+    /// 当前占用的名额数（诊断用）。
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn acquire(&self) -> Option<Permit<'_>> {
         loop {
             let current = self.active.load(Ordering::SeqCst);
-            if current >= self.max {
+            if current >= self.max() {
                 return None;
             }
             if self
@@ -196,7 +218,7 @@ impl ConcurrencyLimiter {
 }
 
 /// RAII：调用结束（哪怕提前 return / panic）都要把名额还回去。
-struct Permit<'a>(&'a ConcurrencyLimiter);
+pub struct Permit<'a>(&'a ConcurrencyLimiter);
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
@@ -319,6 +341,7 @@ mod tests {
                 &self.auditor,
                 ClientCapabilities::headless(),
                 "test",
+                std::sync::Arc::new(ConcurrencyLimiter::new(2)),
             )
         }
 
@@ -463,6 +486,43 @@ mod tests {
         assert!(limiter.acquire().is_none(), "超过上限要拒绝而不是排队");
         drop(first);
         assert!(limiter.acquire().is_some(), "名额要还回来");
+    }
+
+    /// P4-02：名额是**跨网关实例共享**的 —— 服务端同步调用与后台任务共用一份预算，
+    /// 名额被占住时，另一个网关的调用同样直接拒绝（不排队）。
+    #[test]
+    fn the_shared_limiter_bounds_calls_across_gateway_instances() {
+        let limiter = std::sync::Arc::new(ConcurrencyLimiter::new(1));
+        let fixture = Fixture::new(vec![tool("test:echo", false)], config(""));
+        let _held = limiter.acquire().expect("占住唯一名额");
+
+        let mut values = TypedValues::new();
+        values.set_text("text", "hi");
+        let gateway = ToolGateway::new(
+            &fixture.catalog,
+            &fixture.policy,
+            &fixture.auditor,
+            ClientCapabilities::headless(),
+            "test",
+            std::sync::Arc::clone(&limiter),
+        );
+        let error = gateway
+            .call("test:echo", &values, Path::new("/tmp"))
+            .expect_err("名额被占住");
+        assert!(
+            matches!(error, ServiceError::PermissionDenied { reason: "busy", .. }),
+            "{error}"
+        );
+        assert!(
+            fixture.audit_text().contains("并发已达上限"),
+            "busy 拒绝要有审计记录"
+        );
+
+        // 热更新上限（P4-04 会改 mcp.toml 的 max_concurrent）：原地生效。
+        limiter.set_max(2);
+        assert_eq!(limiter.max(), 2);
+        let _second = limiter.acquire().expect("上限放宽后有名额");
+        assert_eq!(limiter.active(), 2);
     }
 
     #[test]

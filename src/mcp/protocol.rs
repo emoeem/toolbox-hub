@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 /// 本服务端实现的协议版本（2025-06-18 稳定版）。
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// `tools/listChanged` 变更通知（2025-06-18 与 2025-11-25 同名同义）。
+pub const LIST_CHANGED: &str = "notifications/tools/list_changed";
+
 pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -93,6 +96,11 @@ pub fn failure(id: Option<&Value>, code: i64, message: &str) -> String {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
 }
 
+/// 无参数的通知（如 `notifications/tools/list_changed`）。
+pub fn notification(method: &str) -> String {
+    json!({"jsonrpc": "2.0", "method": method}).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{failure, parse, success};
@@ -152,5 +160,15 @@ mod tests {
         let line = failure(None, INVALID_PARAMS, "解析失败");
         let parsed: Value = serde_json::from_str(&line).expect("合法 JSON");
         assert_eq!(parsed["id"], Value::Null, "没有 id 时用 null");
+    }
+
+    #[test]
+    fn notifications_have_no_id_and_no_params() {
+        let bare = super::notification(super::LIST_CHANGED);
+        assert!(!bare.contains('\n'));
+        let parsed: Value = serde_json::from_str(&bare).expect("合法 JSON");
+        assert_eq!(parsed["method"], super::LIST_CHANGED);
+        assert!(parsed.get("id").is_none(), "通知不能有 id");
+        assert!(parsed.get("params").is_none(), "无参数通知不带 params");
     }
 }
