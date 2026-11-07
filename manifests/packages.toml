@@ -78,6 +78,12 @@ output = "处理好的系统"
 features = "每项直接 `Enter` 处理；文件完整性要真跑 `pacman -Qk`（几秒），所以单独一项"
 
 # ── 查询：只有命令行能做、中心里没有的 ──────────────────────────────────────
+#
+# P5-03：下面五条只读查询带 `mcp = { … }` 声明（搜索 / 安装状态 / 包信息 /
+# 更新数量 / 维护状态），可以在 mcp.toml 里逐条放行给 AI；mcp.toml 模板的
+# allow 名单默认已含这五条。四个 `pkg-center*` 入口是 native 模式（界面里能
+# 装能卸），**没有** mcp 声明 —— MCP 只接受 capture，安装/卸载/更新/清理这些
+# 改系统的动作不进入暴露面。pkg-owner / pkg-files 不在那五类里，保持不声明。
 
 [[action]]
 id = "pkg-search"
@@ -92,6 +98,7 @@ install = "自带（pacman）"
 input = "关键词"
 output = "匹配的包"
 features = "官方源；**支持正则**；标出 [已安装]"
+mcp = { enabled = true, description = "用正则搜索官方源软件包（pacman -Ss，只读）" }
 
 [[action.argument]]
 key = "query"
@@ -100,6 +107,55 @@ kind = "text"
 flag = "-Ss"
 required = true
 help = "包名或描述里的词；支持正则，例如 ^fzf$"
+
+[[action]]
+id = "pkg-status"
+name = "查询安装状态"
+summary = "pacman -Q：一个包装没装、装的是哪个版本"
+domain = "包管理"
+tags = ["查询"]
+program = "pacman"
+base_argv = ["-Q"]
+mode = "capture"
+pin = 7
+danger = "safe"
+install = "自带（pacman）"
+input = "包名"
+output = "已安装的版本；未安装时 pacman 会在 stderr 说明"
+features = "退出码 1 = 没装（这就是查询结果，不算失败）"
+ok_exit_codes = [0, 1]
+mcp = { enabled = true, description = "查询软件包在本机的安装状态与版本（pacman -Q，只读）" }
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+required = true
+help = "精确包名，例如 fzf"
+
+[[action]]
+id = "pkg-info"
+name = "查询包信息"
+summary = "pacman -Si：仓库里这个包的版本、依赖、说明"
+domain = "包管理"
+tags = ["查询"]
+program = "pacman"
+base_argv = ["-Si"]
+mode = "capture"
+pin = 8
+danger = "safe"
+install = "自带（pacman）"
+input = "包名"
+output = "包的仓库信息"
+features = "读本地同步库，不联网；装没装都能查"
+mcp = { enabled = true, description = "查询软件包在仓库中的详细信息（pacman -Si，只读）" }
+
+[[action.argument]]
+key = "package"
+label = "包名"
+kind = "text"
+required = true
+help = "精确包名，例如 fzf"
 
 [[action]]
 id = "pkg-owner"
@@ -144,3 +200,40 @@ kind = "text"
 flag = "-Ql"
 required = true
 help = "必须是**已安装**的包"
+
+[[action]]
+id = "pkg-updates"
+name = "待更新数量"
+summary = "checkupdates：列出可升级的包（数量就是行数）"
+domain = "包管理"
+tags = ["维护"]
+program = "checkupdates"
+mode = "capture"
+pin = 9
+danger = "safe"
+install = "sudo pacman -S pacman-contrib"
+input = "无"
+output = "包名 当前版本 -> 新版本，每行一个"
+features = "在临时副本上比对，不碰系统数据库；没更新时退出码 2，算正常"
+ok_exit_codes = [0, 2]
+allow_empty = true
+mcp = { enabled = true, description = "列出系统待更新的软件包（checkupdates，只读）" }
+
+[[action]]
+id = "pkg-health"
+name = "依赖完整性巡检"
+summary = "pacman -Qk：全库检查有没有包缺依赖"
+domain = "包管理"
+tags = ["维护"]
+program = "pacman"
+base_argv = ["-Qk"]
+mode = "capture"
+pin = 10
+danger = "safe"
+install = "自带（pacman）"
+input = "无"
+output = "缺依赖的包与问题数"
+features = "退出码 1 = 发现问题（巡检结果，不算失败）；系统维护视图里的同一项检查"
+ok_exit_codes = [0, 1]
+allow_empty = true
+mcp = { enabled = true, description = "读取系统维护状态：全库依赖完整性巡检（pacman -Qk，只读）" }

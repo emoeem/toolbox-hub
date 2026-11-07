@@ -97,8 +97,17 @@ pub(crate) fn spawn_watcher(
                 for error in &report.errors {
                     eprintln!("toolbox-hub mcp reload: {error}");
                 }
+                // P5-01：Recipe 目录随 mcp.toml 一起重建 —— [recipes] 改了目录
+                // 清单，下一次热更新就换入新的 Recipe 工具集。
+                let (catalog, recipe_warnings) = crate::service::recipe::catalog_with_recipes(
+                    &registry,
+                    policy.config.recipe_dirs(),
+                );
+                for warning in &recipe_warnings {
+                    eprintln!("toolbox-hub mcp reload: {warning}");
+                }
                 sink.store(ReloadSnapshot {
-                    catalog: Arc::new(ToolCatalog::from_registry(&registry)),
+                    catalog: Arc::new(catalog),
                     policy,
                     problem,
                 });

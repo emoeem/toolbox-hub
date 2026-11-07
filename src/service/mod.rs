@@ -15,7 +15,9 @@
 
 pub mod argument;
 pub mod catalog;
+pub mod cli;
 pub mod error;
 pub mod execution;
 pub mod gateway;
+pub mod recipe;
 pub mod result;

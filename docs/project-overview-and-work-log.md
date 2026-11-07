@@ -180,6 +180,91 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 验证记录
 
+### 2026-11-07（P5：Recipe MCP 接入 / 只读 Resources / 包管理只读域 / CLI JSON）
+
+按计划书 P5 执行，白名单内动手（src/mcp、src/service、src/security、src/main.rs、
+manifests/packages.toml；未触碰 app/、ui/、ecosystem.rs、scripts/、registry/ 内容文件、
+src/model/、src/cli.rs）。P5-05 HTTP 首期不做（计划书原文）。
+
+交付：
+
+- **P5-01 Recipe 接入**（新增 `service/recipe.rs` Loader）：
+  - `mcp.toml` 新增 `[recipes] dirs`（缺省空 = 一条都不加载，fail-closed）；目录里按
+    `index.json` 逐条 SHA-256 校验 + 复用 `ecosystem::validate_recipe`，然后转换成普通
+    `ToolDefinition`（id `recipe:<名字>` → `toolbox_recipe_<名字>`）合并进目录 —— 此后
+    与 Manifest 工具走**完全相同**的名称规范化、Schema 生成、授权、参数校验、执行与审计。
+  - **无损转换**：只有能证明「生成的 argv 与 recipe run 逐元素相等」的形状才注册
+    （首段字面量进 base_argv；占位符之间的单个字面量成为下一参数的 flag；其余位置
+    参数按声明顺序排在末尾）。嵌入式占位符（`1,{count}p`）、占位符间多字面量
+    （find-files）、结尾字面量、一个占位符出现多次、声明了没用的参数 → 一律跳过并给
+    警告。真 featured 35 条注册 32 条，`sed-preview` / `find-files` 两条形状跳过
+    （警告可读），`archive-create` 用 flag 机制无损表达。
+  - **S-02 一并处理**：策略层对 provider 为 `Recipe` 的工具拒绝所有以 `-` 开头的参数值
+    （`option_like_value`），纯字符串替换的选项注入面清零；Loader 生成的参数声明让
+    未声明键 / 类型错误 / 必填缺失走与 Manifest 相同的 `service::argument` + `check_paths`。
+  - 安全检查不削弱：`Danger::Caution` 映射原样进策略（默认拒绝 + 确认门槛）；
+    `Destructive` 的 Recipe **不暴露**（工具模型携带不了那套审计语义，宁缺毋滥；
+    featured 35 条本来就没有 destructive）。副作用完全交给独立推断（effects 声明为
+    None），curl/tar 该标网络/写文件就是网络/写文件。
+- **P5-02 Resources**（`mcp/server.rs`）：`resources/list` + `resources/read`（2025-06-18
+  语义），能力声明 `resources: {}`。白名单三类 URI：`toolbox://catalog`（全部授权工具的
+  完整定义：用途/参数 Schema/依赖要求/执行方式/独立推断的副作用/只读提示）、
+  `toolbox://domains`（九域 + 计数）、`toolbox://tools/{id}`（单件详情）。未知 URI 与
+  `file://` 一律 -32602；资源只反映授权可见面（与 tools/list 同一判定），不提供任意
+  文件读取，不含执行历史。
+- **P5-03 包管理只读域**（`manifests/packages.toml`）：五类只读查询声明 mcp ——
+  `pkg-search`（既有，-Ss）、`pkg-status`（新增，pacman -Q，`ok_exit_codes=[0,1]`：
+  「没装」就是查询结果）、`pkg-info`（新增，-Si：装没装都能查）、`pkg-updates`（新增，
+  checkupdates，`ok_exit_codes=[0,2]`）、`pkg-health`（新增，pacman -Qk）。模板 allow
+  名单默认含这五条（4 → 9）。安装/卸载/更新/清理不暴露：四个 `pkg-center*` 入口是
+  native 模式，声明了 mcp 都过不了解析（「MCP 只接受 capture」），**不加声明** ——
+  用既有 policy 语义，没有新机制。`pkg-owner` / `pkg-files` 不在五类里，保持不声明。
+- **P5-04 CLI JSON**（新增 `service/cli.rs`，main.rs 动词分发接 `tools`）：
+  - `toolbox-hub tools list --json` / `tools show <id> --json` /
+    `tools run <id> --input-json '{…}' --output json`。条目/结果与 MCP 复用同一组
+    构造函数（`tool_entry` / `tool_resource_detail` / `execution_result` / `tool_error`），
+    两个入口的 JSON 不可能各改各的。
+  - 同一份 `mcp.toml` 策略 + 网关 + 审计（客户端记 `cli`），Recipe 工具同列表。
+    `isError` 时照常打印完整 JSON 但退出码 1；用法错误走 stderr。
+  - interactive / native / 未授权 / 参数不合法全部在子进程之前拒绝（JSON 模式无终端
+    可交接，绝不挂起）—— headless 客户端语义与 MCP 无 elicitation 客户端一致。
+  - `--config-dir` / `--data-dir` 与主 CLI 全局选项同一语义（放哪儿都认）。
+
+未做（记在这里）：
+
+- `sed-preview` / `find-files` 两条 Recipe 因形状无法无损表达而不进 MCP（CLI 的
+  `recipe run` 不受影响）；真要接入得给 `Action` 模型加「中间常量段」，那是
+  src/model/ 的改动，超出本批白名单。
+- Recipe 目录**不在热更新指纹范围内**（fingerprint 只盯 tools.d/、tools/、mcp.toml）：
+  改 mcp.toml 的 `[recipes]` 会触发重建；改 featured 目录内容不会。Recipe 属于仓库
+  内容而非用户配置，首期不监视。
+- index.json 行**缺 sha256 字段时跳过完整性比对**（只防损坏不防篡改 —— 真防线是
+  mcp.toml 白名单；featured 目录的哈希口径由 `recipe check` / `build-featured.py --check`
+  把守）。
+- `notifications/tasks/status`（P4 遗留）、热更新真实子进程集成测试（P4 遗留）不变。
+
+验证（六门禁全绿）：
+
+- `cargo fmt --all -- --check` 通过；`clippy --all-targets`（`--all-features` 与
+  `--no-default-features` 两套，`-D warnings`）通过。
+- `cargo test --all-features` **716 passed / 16 ignored**（P4b 后 693 + 新增 23：
+  recipe loader 10、policy 注入拒绝 1、resources 单元 2、tools 解析单元 3、
+  mcp_protocol 集成 2（resources + recipe 注入）、tools_cli 集成 5）；
+  `cargo test --locked --no-default-features` **710 passed / 16 ignored**（687 + 23）。
+- `cargo +1.90.0 build --locked`（MSRV）通过。
+- `check registry/` 85 项（featured 1 警告为存量）、`recipe check registry/featured`
+  35 条、`python3 registry/build-featured.py --check`（35 条 / SHA-256）通过。
+- 集成测试（真实子进程）新增覆盖：resources/list+read 三类 URI（含 `file://` 与未知
+  工具 -32602）、Recipe 工具全链路（tools/list 出现 → 正常调用执行 → `--version` 值
+  被拒 `不能以 - 开头` → 未声明键 -32602 → 审计 completed/denied）、CLI JSON 的
+  list/show/run 形状与退出码、interactive 拒绝不挂起（实测 < 10s）、Recipe 工具在
+  CLI 列表与注入拒绝与 MCP 同路径。
+- 真数据冒烟（本机实跑）：`[recipes] dirs = <repo>/registry/featured` 后
+  `tools list --json` 出现 `toolbox_recipe_kernel_version` / `toolbox_recipe_dns_lookup`
+  + 五个 `toolbox_manifest_pkg_*`；`tools run recipe:dns-lookup` 真跑 getent
+  （command 摘要 `/usr/sbin/getent ahosts localhost`），`{"host":"--help"}` 被拒；
+  两条跳过警告与单元测试的结论一致。
+
 ### 2026-11-07（P4-01 + P4-03：MCP Tasks 与实时进度，上一批「未做」全部交付）
 
 按上一条记录的实施要点执行，白名单不变（src/mcp、src/service、src/security，未触碰

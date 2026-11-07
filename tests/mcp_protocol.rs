@@ -29,6 +29,8 @@ struct Sandbox {
     config: std::path::PathBuf,
     data: std::path::PathBuf,
     root: std::path::PathBuf,
+    /// P5-01：精选 Recipe 目录（`write_recipes` 填充内容）。
+    recipes_dir: std::path::PathBuf,
 }
 
 impl Sandbox {
@@ -40,8 +42,10 @@ impl Sandbox {
         let root = std::env::temp_dir().join(format!("toolbox-hub-mcp-it-{tag}-{nanos}"));
         let config = root.join("config");
         let data = root.join("data");
+        let recipes_dir = root.join("recipes");
         std::fs::create_dir_all(config.join("tools.d")).expect("mkdir config/tools.d");
         std::fs::create_dir_all(&data).expect("mkdir data");
+        std::fs::create_dir_all(&recipes_dir).expect("mkdir recipes");
 
         // 一件 capture + safe 的 echo 动作，显式声明 mcp。
         std::fs::write(
@@ -123,7 +127,67 @@ max_timeout_secs = 30
         )
         .expect("写 mcp.toml");
 
-        Self { config, data, root }
+        Self {
+            config,
+            data,
+            root,
+            recipes_dir,
+        }
+    }
+
+    /// P5-01：往 Recipe 目录里写两条 Recipe + index.json。
+    ///
+    /// * `it-echo`（safe）：echo 一段文本 —— Loader 应把它注册成可调用工具；
+    /// * `it-caution`（caution，tar 写文件）：不进 allow，只用来验证默认拒绝。
+    ///
+    /// 索引行不带 sha256（Loader 对缺哈希的行跳过完整性比对；真 featured 目录
+    /// 的哈希口径由 `recipe check` / `build-featured.py --check` 把守）。
+    fn write_recipes(&self) {
+        let echo = serde_json::json!({
+            "id": "it-echo",
+            "title": "集成测试回显",
+            "description": "把参数原样 echo 回来",
+            "command": "echo",
+            "params": [{"name": "text", "description": "文本", "required": true}],
+            "args": ["{text}"],
+            "safety": "safe",
+            "source": "toolbox-hub/featured",
+            "tags": ["工具"],
+        });
+        let caution = serde_json::json!({
+            "id": "it-caution",
+            "title": "集成测试打包",
+            "description": "tar 打包一个目录（写文件，caution）",
+            "command": "tar",
+            "params": [
+                {"name": "output", "description": "输出", "required": true},
+                {"name": "parent", "description": "父目录", "required": true},
+                {"name": "name", "description": "名字", "required": true},
+            ],
+            "args": ["-czf", "{output}", "-C", "{parent}", "{name}"],
+            "safety": "caution",
+            "source": "toolbox-hub/featured",
+            "tags": ["工具"],
+        });
+        for (file, recipe) in [("it-echo.json", &echo), ("it-caution.json", &caution)] {
+            std::fs::write(
+                self.recipes_dir.join(file),
+                serde_json::to_string_pretty(recipe).expect("序列化 recipe"),
+            )
+            .expect("写 recipe");
+        }
+        std::fs::write(
+            self.recipes_dir.join("index.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "recipes": [
+                    {"id": "it-echo", "file": "it-echo.json"},
+                    {"id": "it-caution", "file": "it-caution.json"},
+                ],
+            })
+            .to_string(),
+        )
+        .expect("写 index");
     }
 
     /// 给慢任务放行（Tasks 用例用）。
@@ -705,6 +769,182 @@ fn mcp_tasks_ignored_for_2025_06_18_clients() {
     assert_eq!(unknown["error"]["code"], -32601, "{unknown}");
     let unknown = server.request("tasks/cancel", json!({"taskId": "x"}));
     assert_eq!(unknown["error"]["code"], -32601);
+
+    assert_eq!(server.shutdown(), 0);
+}
+
+/// P5-02：resources/list 与 resources/read 走真实 stdio。白名单三类 URI，
+/// 任意文件读取之类的 URI 一律 -32602。
+#[test]
+fn resources_list_and_read_over_stdio() {
+    let sandbox = Sandbox::new("resources");
+    let mut server = Server::spawn(&sandbox, "2025-06-18", json!({}));
+
+    let listed = server.request("resources/list", json!({}));
+    let resources = listed["result"]["resources"].as_array().expect("数组");
+    assert_eq!(resources[0]["uri"], "toolbox://catalog", "{listed}");
+    assert_eq!(resources[1]["uri"], "toolbox://domains");
+    assert!(
+        resources
+            .iter()
+            .any(|r| r["uri"] == "toolbox://tools/manifest:mcp-demo"),
+        "授权工具要有自己的资源：{listed}"
+    );
+    assert!(
+        !resources
+            .iter()
+            .any(|r| r["uri"].as_str().unwrap_or("").contains("mcp-slow")),
+        "未授权工具不该出现在资源里：{listed}"
+    );
+
+    let read = server.request("resources/read", json!({"uri": "toolbox://catalog"}));
+    let contents = &read["result"]["contents"];
+    assert_eq!(contents[0]["uri"], "toolbox://catalog");
+    assert_eq!(contents[0]["mimeType"], "application/json");
+    let body: Value =
+        serde_json::from_str(contents[0]["text"].as_str().expect("text")).expect("JSON 文本");
+    let tool = &body["tools"][0];
+    assert_eq!(tool["id"], "manifest:mcp-demo");
+    assert_eq!(tool["mcp_name"], "toolbox_manifest_mcp_demo");
+    assert_eq!(tool["execution_mode"], "capture");
+    assert_eq!(
+        tool["input_schema"]["properties"]["text"]["type"], "string",
+        "参数定义要在场：{tool}"
+    );
+    assert!(tool["requires"].is_array(), "依赖要求要在场：{tool}");
+    assert!(
+        tool["effects"]["filesystem_read"].is_boolean(),
+        "安全限制要在场"
+    );
+
+    let read = server.request(
+        "resources/read",
+        json!({"uri": "toolbox://tools/manifest:mcp-demo"}),
+    );
+    let detail: Value = serde_json::from_str(
+        read["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("详情是 JSON");
+    assert_eq!(detail["id"], "manifest:mcp-demo");
+
+    let read = server.request("resources/read", json!({"uri": "toolbox://domains"}));
+    let body: Value = serde_json::from_str(
+        read["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("domains 是 JSON");
+    assert_eq!(
+        body["domains"].as_array().expect("数组").len(),
+        9,
+        "九个域全列出来（计数可以为 0）：{body}"
+    );
+
+    // 白名单之外：任意文件读取与未知工具都 -32602。
+    for uri in [
+        "file:///etc/passwd",
+        "toolbox://tools/manifest:mcp-slow",
+        "toolbox://nope",
+    ] {
+        let denied = server.request("resources/read", json!({"uri": uri}));
+        assert_eq!(denied["error"]["code"], -32602, "{uri}: {denied}");
+    }
+
+    assert_eq!(server.shutdown(), 0);
+}
+
+/// P5-01：精选 Recipe 经 Loader 注册成独立 MCP 工具，走与 Manifest 相同的
+/// 网关路径；S-02 的选项注入（值以 `-` 开头）在子进程之前被拒。
+#[test]
+fn recipe_tools_run_through_the_gateway_and_reject_option_injection() {
+    let sandbox = Sandbox::new("recipe");
+    sandbox.write_recipes();
+    std::fs::write(
+        sandbox.config.join("mcp.toml"),
+        format!(
+            r#"[mcp]
+enabled = true
+
+[exposure]
+default = "deny"
+allow = ["recipe:it-echo"]
+deny = []
+
+[recipes]
+dirs = ["{}"]
+
+[limits]
+default_timeout_secs = 15
+max_timeout_secs = 30
+"#,
+            sandbox.recipes_dir.display()
+        ),
+    )
+    .expect("写 mcp.toml");
+    let mut server = Server::spawn(&sandbox, "2025-06-18", json!({}));
+
+    // tools/list：只出现被点名的 Recipe 工具；参数成为声明的 Schema。
+    let listed = server.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().expect("数组");
+    assert_eq!(tools.len(), 1, "caution 那条没被 allow：{listed}");
+    assert_eq!(tools[0]["name"], "toolbox_recipe_it_echo");
+    assert_eq!(
+        tools[0]["inputSchema"]["properties"]["text"]["type"], "string",
+        "Recipe 参数要有声明：{}",
+        tools[0]
+    );
+    assert_eq!(
+        tools[0]["inputSchema"]["additionalProperties"], false,
+        "多传字段要被 schema 拒"
+    );
+
+    // 正常调用：真执行，参数原样进 argv（经 Loader 转成声明参数）。
+    let called = server.request(
+        "tools/call",
+        json!({"name": "toolbox_recipe_it_echo", "arguments": {"text": "中文 参数"}}),
+    );
+    let result = &called["result"];
+    assert_eq!(result["isError"], false, "{called}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("中文 参数")
+    );
+    assert_eq!(result["structuredContent"]["tool_id"], "recipe:it-echo");
+
+    // S-02：值以 `-` 开头 → 选项注入被拒，进程没跑。（策略拒绝统一映射成
+    // permission_denied，稳定 reason 在消息里，与 busy 拒绝同一形状。）
+    let injected = server.request(
+        "tools/call",
+        json!({"name": "toolbox_recipe_it_echo", "arguments": {"text": "--version"}}),
+    );
+    assert_eq!(injected["result"]["isError"], true, "{injected}");
+    assert_eq!(
+        injected["result"]["structuredContent"]["error_kind"],
+        "permission_denied"
+    );
+    assert!(
+        injected["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("不能以 - 开头"),
+        "{injected}"
+    );
+    // 未声明的参数同样被拒（与 Manifest 工具同一条校验路径）。
+    let unknown_key = server.request(
+        "tools/call",
+        json!({"name": "toolbox_recipe_it_echo", "arguments": {"nope": "x"}}),
+    );
+    assert_eq!(unknown_key["error"]["code"], -32602, "{unknown_key}");
+
+    // 审计里两种决定都在场。
+    let audit = sandbox.audit_text();
+    assert!(audit.contains("\"decision\":\"completed\""));
+    assert!(audit.contains("\"decision\":\"denied\""));
+    assert!(audit.contains("不能以 - 开头"));
 
     assert_eq!(server.shutdown(), 0);
 }

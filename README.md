@@ -407,6 +407,16 @@ toolbox-hub history replay 1                      # 回放第 1 条执行记录
 toolbox-hub widget render git-log count=5         # → git log --oneline -n 5
 ```
 
+还有一组 JSON 子命令 `tools`：与 MCP 服务端走同一套策略与执行网关（`mcp.toml`
+决定谁能被调用），输出的就是 MCP 的结构化结果，可给脚本 / 其它 Agent 用，也是
+MCP 的独立测试入口。需要确认、要终端、未授权的工具一律当场拒绝，绝不挂起：
+
+```bash
+toolbox-hub tools list --json                              # 可调用工具清单（含参数 Schema）
+toolbox-hub tools show manifest:disk-space --json          # 单件工具的完整定义
+toolbox-hub tools run manifest:disk-space --input-json '{}' --output json
+```
+
 ## 给脚本用的界面组件（`ui …`）
 
 写脚本时缺的往往不是功能而是**界面**：挑一个输入文件、确认一次、翻一页长输出。

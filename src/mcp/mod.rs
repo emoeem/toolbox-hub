@@ -46,7 +46,6 @@ use crate::{
     config,
     registry::Registry,
     security::{audit::Auditor, policy::SafetyPolicy},
-    service::catalog::ToolCatalog,
 };
 
 use self::server::McpServer;
@@ -93,7 +92,9 @@ fn run_stdio() -> io::Result<()> {
     // 已存在则一个字节都不动。
     let created = crate::security::policy::McpConfig::ensure_template();
     if created {
-        eprintln!("toolbox-hub mcp: 已生成 mcp.toml 模板（默认只放行 4 个只读巡检动作）");
+        eprintln!(
+            "toolbox-hub mcp: 已生成 mcp.toml 模板（默认只放行 4 个系统巡检 + 5 个包管理只读查询）"
+        );
     }
 
     let (policy, problem) = SafetyPolicy::from_file();
@@ -107,7 +108,13 @@ fn run_stdio() -> io::Result<()> {
     // 工具发现与 TUI 同源：bin 目录决定本地脚本扫哪儿。
     let bin_dir = crate::resolve_bin_dir(None);
     let (registry, _report) = Registry::discover(&bin_dir);
-    let catalog = ToolCatalog::from_registry(&registry);
+    // P5-01：[recipes] dirs 点名的精选 Recipe 与 Manifest 工具合并成同一份目录，
+    // 走完全相同的授权与执行路径。
+    let (catalog, recipe_warnings) =
+        crate::service::recipe::catalog_with_recipes(&registry, policy.config.recipe_dirs());
+    for warning in &recipe_warnings {
+        eprintln!("toolbox-hub mcp: {warning}");
+    }
     let auditor = Auditor::new(policy.config.audit_path(), policy.config.audit.enabled);
     eprintln!(
         "toolbox-hub mcp: 就绪（目录 {} 件工具，授权由 mcp.toml 决定）",

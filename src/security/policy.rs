@@ -25,6 +25,14 @@ use crate::{
     security::{approval, effects},
 };
 
+/// P5-01：Recipe Loader 产出的工具在目录里的 provider 标签。
+///
+/// 策略层用它识别「参数是纯字符串替换进 argv 的 Recipe 工具」，对这类工具的
+/// **所有**参数值做选项注入拒绝（S-02）：值以 `-` 开头就可能被目标程序当成
+/// 选项解析，改变命令语义。误把自己标成这个标签只会让自己更受限（fail-safe），
+/// 所以拿 provider 当判别式是安全的。
+pub const RECIPE_PROVIDER: &str = "Recipe";
+
 /// 配置模板：第一次跑 MCP 时写出来，让人知道有这个文件。
 const MCP_TEMPLATE: &str = r#"# Toolbox Hub 的 MCP 权限配置。
 # 缺省全拒绝：这里点名的工具 + Manifest/脚本自己声明了 mcp，才会出现在 AI 的工具列表里。
@@ -40,6 +48,12 @@ allow = [
     "manifest:boot-errors",
     "manifest:block-devices",
     "manifest:pci-devices",
+    # 包管理域的只读查询（P5-03）；安装/卸载/更新等写动作没有 mcp 声明，不在暴露面里。
+    "manifest:pkg-search",
+    "manifest:pkg-status",
+    "manifest:pkg-info",
+    "manifest:pkg-updates",
+    "manifest:pkg-health",
 ]
 deny = []
 
@@ -64,6 +78,12 @@ max_concurrent = 2
 [paths]
 # 空 = 不限制工作目录和路径参数。填上以后，路径参数必须落在这些目录里。
 allowed_dirs = []
+
+# P5-01：精选 Recipe 目录（可选）。目录里要有 index.json（build-featured.py 产出的
+# 那份），每条 Recipe 按 SHA-256 校验、经 validate_recipe 后注册成 id 形如
+# recipe:<名字> 的工具——仍要在上面 [exposure] allow 里逐个点名才会真正暴露。
+# 填相对路径时相对服务端进程的启动目录；建议写绝对路径。
+# dirs = ["/home/me/code/toolbox-hub/registry/featured"]
 
 [audit]
 enabled = true
@@ -159,6 +179,17 @@ pub struct PathsSection {
     pub allowed_dirs: Vec<PathBuf>,
 }
 
+/// `[recipes]`（P5-01）：要加载精选 Recipe 的目录。
+///
+/// 空（缺省）＝ 一个 Recipe 都不加载。这里只是「来源」，真正的授权仍在
+/// `[exposure] allow` 里逐条点名 —— 和 Manifest 的 `mcp` 声明同一套语义，
+/// 不为 Recipe 造新机制。
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecipesSection {
+    pub dirs: Vec<PathBuf>,
+}
+
 /// `[audit]`
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -185,6 +216,7 @@ pub struct McpConfig {
     pub execution: ExecutionSection,
     pub limits: LimitsSection,
     pub paths: PathsSection,
+    pub recipes: RecipesSection,
     pub audit: AuditSection,
 }
 
@@ -261,6 +293,11 @@ impl McpConfig {
             .path
             .clone()
             .unwrap_or_else(|| config::data_dir().join("mcp-audit.jsonl"))
+    }
+
+    /// P5-01：要加载精选 Recipe 的目录（空 = 不加载任何 Recipe 工具）。
+    pub fn recipe_dirs(&self) -> &[PathBuf] {
+        &self.recipes.dirs
     }
 }
 
@@ -350,7 +387,7 @@ impl DenyReason {
                 format!("{tool_id} 的路径不在授权范围内：{path}")
             }
             DenyReason::OptionLikeValue(value) => {
-                format!("{tool_id} 的路径参数不能以 - 开头：{value}")
+                format!("{tool_id} 的参数值不能以 - 开头（疑似选项注入）：{value}")
             }
         }
     }
@@ -393,6 +430,13 @@ impl SafetyPolicy {
         let effects = self.common(tool, client)?;
         self.check_arguments(tool, values)?;
         self.check_paths(tool, values, cwd)?;
+        // S-02（P5-01 一并处理）：Recipe 工具的参数是纯字符串替换进 argv，
+        // 值以 `-` 开头就会被目标程序当成选项解析（参数注入，能改变命令语义）。
+        // 这类工具的所有参数值一律拒绝「长得像选项」的取值 —— 与路径参数的
+        // 选项注入检查同一套语义，只是范围扩大到 Recipe 的全部参数。
+        if tool.provider == RECIPE_PROVIDER {
+            self.check_recipe_values(values)?;
+        }
 
         Ok(Authorization {
             tool_id: tool.id.clone(),
@@ -517,12 +561,7 @@ impl SafetyPolicy {
             let Some(value) = values.get(&argument.key) else {
                 continue;
             };
-            let items: Vec<String> = match value {
-                ArgumentValue::Text(text) => vec![text.clone()],
-                ArgumentValue::List(items) => items.clone(),
-                ArgumentValue::Bool(_) => Vec::new(),
-            };
-            for raw in items {
+            for raw in value_strings(value) {
                 let raw = raw.trim();
                 if raw.is_empty() {
                     continue;
@@ -545,6 +584,34 @@ impl SafetyPolicy {
             }
         }
         Ok(())
+    }
+
+    /// S-02：Recipe 工具的全部参数值都不允许以 `-` 开头。
+    ///
+    /// Recipe 的参数声明由 Loader 生成（位置替换、没有 flag），一个值变成
+    /// 独立的 argv 元素后，目标程序分不清它是值还是选项。首期精选 Recipe
+    /// 的参数（路径、包名、数量、URL）没有一个需要以 `-` 开头，所以宁可
+    /// 全拒：这一类「改命令语义」的注入面直接清零。
+    fn check_recipe_values(&self, values: &TypedValues) -> Result<(), DenyReason> {
+        for (_, value) in values.iter() {
+            // 未声明的键由 check_arguments 拦截；这里只看取值本身。
+            for raw in value_strings(value) {
+                let raw = raw.trim();
+                if raw.starts_with('-') {
+                    return Err(DenyReason::OptionLikeValue(raw.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 一个参数取值里的全部字符串项（文本 → 单项；列表 → 逐项；开关 → 空）。
+fn value_strings(value: &ArgumentValue) -> Vec<String> {
+    match value {
+        ArgumentValue::Text(text) => vec![text.clone()],
+        ArgumentValue::List(items) => items.clone(),
+        ArgumentValue::Bool(_) => Vec::new(),
     }
 }
 
@@ -686,11 +753,27 @@ mod tests {
     }
 
     #[test]
-    fn the_template_parses_and_exposes_only_four_read_only_tools() {
+    fn the_template_parses_and_exposes_only_nine_read_only_tools() {
         let config: McpConfig = toml::from_str(super::MCP_TEMPLATE).expect("模板要能解析");
         assert!(config.mcp.enabled);
         assert_eq!(config.exposure.default, ExposureDefault::Deny);
-        assert_eq!(config.exposure.allow.len(), 4);
+        // 四个系统巡检 + P5-03 的五个包管理只读查询；写动作（pkg-center 等）没有
+        // mcp 声明，不在暴露面里。
+        assert_eq!(config.exposure.allow.len(), 9);
+        for id in [
+            "manifest:pkg-search",
+            "manifest:pkg-status",
+            "manifest:pkg-info",
+            "manifest:pkg-updates",
+            "manifest:pkg-health",
+        ] {
+            assert!(
+                config.exposure.allow.contains(&id.to_string()),
+                "模板缺 {id}: {:?}",
+                config.exposure.allow
+            );
+        }
+        assert!(config.recipes.dirs.is_empty(), "Recipe 目录缺省为空");
         assert!(!config.execution.allow_caution);
         assert!(!config.execution.allow_destructive);
         assert_eq!(config.timeout(), Some(std::time::Duration::from_secs(60)));
@@ -878,6 +961,64 @@ mod tests {
         assert_eq!(
             lexical_normalize(Path::new("/a/b/../c/./d")),
             PathBuf::from("/a/c/d")
+        );
+    }
+
+    /// S-02（P5-01）：Recipe 工具（provider = Recipe）的参数值不允许以 `-` 开头
+    /// —— 那是纯字符串替换进 argv 的注入面。Manifest 工具的普通文本参数不受影响。
+    #[test]
+    fn recipe_parameter_values_reject_option_like_strings() {
+        let policy = SafetyPolicy::new(config("[exposure]\ndefault = \"allow\"\n"));
+        let mut recipe = tool("recipe:dns-lookup");
+        recipe.provider = String::from(super::RECIPE_PROVIDER);
+        let action = recipe.action.as_mut().expect("action");
+        action.arguments[0].kind = ArgKind::Text;
+
+        let mut values = TypedValues::new();
+        values.set_text("path", "example.org");
+        assert!(
+            policy
+                .authorize(
+                    &recipe,
+                    &values,
+                    Path::new("/tmp"),
+                    ClientCapabilities::headless()
+                )
+                .is_ok(),
+            "正常值放行"
+        );
+
+        for nasty in ["--help", "-n", "-rf"] {
+            let mut values = TypedValues::new();
+            values.set_text("path", nasty);
+            let reason = policy
+                .authorize(
+                    &recipe,
+                    &values,
+                    Path::new("/tmp"),
+                    ClientCapabilities::headless(),
+                )
+                .expect_err("选项样式的值要被拒");
+            assert_eq!(reason.code(), "option_like_value", "{nasty}");
+        }
+
+        // 同样的值在 Manifest 工具（provider 不是 Recipe）的文本参数上不拦：
+        // 那条路上选项注入只在路径参数上拒绝，是既有语义，本批不改。
+        let mut manifest_tool = tool("manifest:demo");
+        let action = manifest_tool.action.as_mut().expect("action");
+        action.arguments[0].kind = ArgKind::Text;
+        let mut values = TypedValues::new();
+        values.set_text("path", "-n");
+        assert!(
+            policy
+                .authorize(
+                    &manifest_tool,
+                    &values,
+                    Path::new("/tmp"),
+                    ClientCapabilities::headless()
+                )
+                .is_ok(),
+            "Manifest 工具的文本参数维持既有语义"
         );
     }
 }

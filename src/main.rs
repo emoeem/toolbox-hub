@@ -27,9 +27,9 @@ mod providers;
 mod registry;
 mod repository;
 mod runtime;
-// 服务层：目前只有测试在调用，MCP 服务端（P3）接手后会成为主路径。
-// 在那之前显式允许「暂时没人用」，免得 `-D warnings` 把已经写好、测过的能力
-// 当成死代码删掉。
+// 服务层：P3 起 MCP 服务端在用，P5-04 起 `tools` JSON 子命令也走这里。
+// security 的多数入口仍只有测试与 service 间接调用，保留显式允许，
+// 免得 `-D warnings` 把已经写好、测过的能力当成死代码删掉。
 #[allow(dead_code)]
 mod security;
 #[allow(dead_code)]
@@ -79,6 +79,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MCP 服务端同样不进 TUI：stdout 只承载协议，诊断走 stderr（见 mcp 模块）。
     if raw_args.first().is_some_and(|arg| arg == "mcp") {
         if let Err(error) = mcp::run_cli(&raw_args) {
+            eprintln!("toolbox-hub: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // P5-04：tools JSON 子命令 —— 与 MCP 同一套 Service，stdout 只承载 JSON，
+    // 诊断走 stderr（见 service::cli 模块）。
+    if raw_args.first().is_some_and(|arg| arg == "tools") {
+        if let Err(error) = service::cli::run_cli(&raw_args) {
             eprintln!("toolbox-hub: {error}");
             std::process::exit(1);
         }

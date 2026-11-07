@@ -227,6 +227,10 @@ impl McpServer {
             "ping" if self.initialized => Ok(json!({})),
             "tools/list" if self.initialized => self.tools_list(),
             "tools/call" if self.initialized => self.call_tool(&incoming.params, elicit),
+            // P5-02：只读 Resources（2025-06-18 语义）。只有白名单里的三类
+            // URI，不提供任意本地文件读取。
+            "resources/list" if self.initialized => self.resources_list(),
+            "resources/read" if self.initialized => self.resources_read(&incoming.params),
             // Tasks 面只在 2025-11-25 协商生效；旧版本客户端按未知方法拒绝
             //（规范：能力未声明时请求方不得使用，接收端回 -32601）。
             "tasks/get" if self.initialized && self.negotiated == ProtocolVersion::V2025_11_25 => {
@@ -283,15 +287,20 @@ impl McpServer {
         // P4-04：热更新已实现，声明 listChanged 并在清单变化时发通知。
         // P4-01：Tasks 能力只在 2025-11-25 协商下声明；tasks.list 按规范的
         // 安全建议不声明（stdio 无法识别请求方，列表会把任务暴露给任何人）。
+        // P5-02：Resources 面只在白名单 URI 上实现，不声明 subscribe/listChanged。
         let capabilities = match self.negotiated {
             ProtocolVersion::V2025_11_25 => json!({
                 "tools": {"listChanged": true},
+                "resources": {},
                 "tasks": {
                     "cancel": {},
                     "requests": {"tools": {"call": {}}},
                 },
             }),
-            ProtocolVersion::V2025_06_18 => json!({"tools": {"listChanged": true}}),
+            ProtocolVersion::V2025_06_18 => json!({
+                "tools": {"listChanged": true},
+                "resources": {},
+            }),
         };
         Ok(json!({
             "protocolVersion": self.negotiated.as_str(),
@@ -304,6 +313,23 @@ impl McpServer {
     }
 
     fn tools_list(&mut self) -> Result<Value, (i64, String)> {
+        let tools: Vec<Value> = self
+            .authorized_tools()
+            .iter()
+            .map(|tool| {
+                let mut entry = tool_entry(&self.names, tool);
+                // P4-01 工具级协商：2025-11-25 下声明每件工具可按任务执行。
+                if self.negotiated == ProtocolVersion::V2025_11_25 {
+                    entry["execution"] = json!({"taskSupport": "optional"});
+                }
+                entry
+            })
+            .collect();
+        Ok(json!({"tools": tools}))
+    }
+
+    /// 本次连接可调用的工具（策略判定 + 当前能力），tools/list 与 resources 共用。
+    fn authorized_tools(&self) -> Vec<&ToolDefinition> {
         let caps = ClientCapabilities {
             confirmation: self.client_elicitation,
         };
@@ -315,49 +341,78 @@ impl McpServer {
             self.client_name.clone(),
             Arc::clone(&self.limiter),
         );
-        let tools: Vec<Value> = gateway
-            .list()
-            .iter()
-            .map(|tool| {
-                let mut entry = self.tool_entry(tool);
-                // P4-01 工具级协商：2025-11-25 下声明每件工具可按任务执行。
-                if self.negotiated == ProtocolVersion::V2025_11_25 {
-                    entry["execution"] = json!({"taskSupport": "optional"});
-                }
-                entry
-            })
-            .collect();
-        Ok(json!({"tools": tools}))
+        gateway.list()
     }
 
-    /// 一件授权工具的 MCP 描述。
-    fn tool_entry(&self, tool: &ToolDefinition) -> Value {
-        let effect = effects::infer(tool);
-        let description = tool
-            .mcp
-            .as_ref()
-            .and_then(|exposure| {
-                exposure
-                    .description
-                    .clone()
-                    .filter(|text| !text.trim().is_empty())
+    /// P5-02 `resources/list`：固定的两个信息资源 + 每件授权工具一个资源。
+    fn resources_list(&self) -> Result<Value, (i64, String)> {
+        let mut resources = vec![
+            json!({
+                "uri": CATALOG_URI,
+                "name": "工具目录",
+                "description": "全部可调用工具的清单：用途、参数定义、依赖要求、安全限制与执行方式",
+                "mimeType": "application/json",
+            }),
+            json!({
+                "uri": DOMAINS_URI,
+                "name": "域列表",
+                "description": "工具箱的域与每个域里的可调用工具数",
+                "mimeType": "application/json",
+            }),
+        ];
+        for tool in self.authorized_tools() {
+            resources.push(json!({
+                "uri": format!("{TOOLS_URI_PREFIX}{}", tool.id),
+                "name": tool.name,
+                "description": tool_description(tool),
+                "mimeType": "application/json",
+            }));
+        }
+        Ok(json!({ "resources": resources }))
+    }
+
+    /// P5-02 `resources/read`：只认三类白名单 URI；别的一律 -32602。
+    fn resources_read(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or((INVALID_PARAMS, String::from("缺少 uri")))?;
+        let body = if uri == CATALOG_URI {
+            json!({
+                "tools": self
+                    .authorized_tools()
+                    .iter()
+                    .map(|tool| tool_resource_detail(
+                        tool,
+                        self.names.name_of(&tool.id).unwrap_or(&tool.id),
+                    ))
+                    .collect::<Vec<_>>(),
             })
-            .unwrap_or_else(|| {
-                if tool.summary == "-" {
-                    tool.name.clone()
-                } else {
-                    tool.summary.clone()
+        } else if uri == DOMAINS_URI {
+            json!({ "domains": domain_summaries(&self.authorized_tools()) })
+        } else if let Some(id) = uri.strip_prefix(TOOLS_URI_PREFIX) {
+            match self
+                .authorized_tools()
+                .into_iter()
+                .find(|tool| tool.id == id)
+            {
+                Some(tool) => tool_resource_detail(tool, self.names.name_of(id).unwrap_or(id)),
+                None => {
+                    return Err((INVALID_PARAMS, format!("未知资源：{uri}")));
                 }
-            });
-        json!({
-            "name": self.names.name_of(&tool.id).unwrap_or(&tool.id),
-            "description": description,
-            "inputSchema": input_schema(tool),
-            "annotations": {
-                // readOnlyHint 只是**提示**（计划书 §5.1）：真正的授权在 mcp.toml。
-                "readOnlyHint": effect.read_only() && !tool.danger.needs_confirm(),
-            },
-        })
+            }
+        } else {
+            return Err((INVALID_PARAMS, format!("未知资源：{uri}")));
+        };
+        let text = serde_json::to_string_pretty(&body)
+            .map_err(|error| (INVALID_PARAMS, format!("资源内容序列化失败：{error}")))?;
+        Ok(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": text,
+            }],
+        }))
     }
 
     /// tools/call：名称 → 取值 →（task 字段 → 任务路径）→ 确认 → 网关。
@@ -637,13 +692,110 @@ pub(crate) fn execution_result(result: &ExecutionResult) -> Value {
 ///
 /// 按 MCP 规范，这类「工具自身的错误」用 result 报告，不用协议错误——
 /// 协议错误只留给坏消息本身（未知方法、参数形状不对）。
-/// `pub(crate)`：任务路径的门槛拒绝与执行失败用同一形状落终态。
+/// `pub(crate)`：任务路径的门槛拒绝与执行失败用同一形状落终态；
+/// CLI JSON（P5-04）也用它保持形状一致。
 pub(crate) fn tool_error(message: String, kind: &str) -> Value {
     json!({
         "content": [{"type": "text", "text": message}],
         "structuredContent": {"error_kind": kind, "error": message},
         "isError": true,
     })
+}
+
+/// P5-02 资源 URI（白名单三类，别的一律不读）。
+pub(crate) const CATALOG_URI: &str = "toolbox://catalog";
+pub(crate) const DOMAINS_URI: &str = "toolbox://domains";
+pub(crate) const TOOLS_URI_PREFIX: &str = "toolbox://tools/";
+
+/// 一件授权工具的 MCP 描述（`tools/list` 条目）。
+///
+/// `pub(crate)`：CLI JSON（P5-04）复用同一形状 —— 两个入口的 JSON 不会各改各的。
+pub(crate) fn tool_entry(names: &NameRegistry, tool: &ToolDefinition) -> Value {
+    let effect = effects::infer(tool);
+    json!({
+        "name": names.name_of(&tool.id).unwrap_or(&tool.id),
+        "description": tool_description(tool),
+        "inputSchema": input_schema(tool),
+        "annotations": {
+            // readOnlyHint 只是**提示**（计划书 §5.1）：真正的授权在 mcp.toml。
+            "readOnlyHint": effect.read_only() && !tool.danger.needs_confirm(),
+        },
+    })
+}
+
+/// 给 AI 看的一句话说明：作者声明优先，退化为 summary / 名称。
+fn tool_description(tool: &ToolDefinition) -> String {
+    tool.mcp
+        .as_ref()
+        .and_then(|exposure| {
+            exposure
+                .description
+                .clone()
+                .filter(|text| !text.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            if tool.summary == "-" {
+                tool.name.clone()
+            } else {
+                tool.summary.clone()
+            }
+        })
+}
+
+/// 一件工具的完整详情（`toolbox://tools/{id}` 资源与 CLI `tools show` 共用）。
+///
+/// 只含定义层元数据：用途、参数 Schema、依赖、执行方式、安全限制。
+/// 不含执行历史，也不含任何敏感值 —— Resources 不做个人执行历史的公开面。
+pub(crate) fn tool_resource_detail(tool: &ToolDefinition, mcp_name: &str) -> Value {
+    let effect = effects::infer(tool);
+    json!({
+        "id": tool.id,
+        "mcp_name": mcp_name,
+        "name": tool.name,
+        "provider": tool.provider,
+        "domain": tool.domain.label(),
+        "tags": tool.tags,
+        "description": tool_description(tool),
+        "input": tool.input,
+        "output": tool.output,
+        // 依赖要求：全量声明 + 当前缺失 + 安装提示。
+        "requires": tool.requires,
+        "missing_dependencies": tool.missing_deps,
+        "install_hint": tool.install_label(),
+        // 执行方式：capture 才会出现在可调用列表里（与策略一致）。
+        "execution_mode": crate::service::error::mode_name(tool.mode),
+        "danger": tool.danger.label(),
+        // 安全限制：独立推断的副作用 + 只读提示（真正的授权在 mcp.toml）。
+        "effects": {
+            "filesystem_read": effect.filesystem_read,
+            "filesystem_write": effect.filesystem_write,
+            "network_access": effect.network_access,
+            "system_mutation": effect.system_mutation,
+            "requires_privilege": effect.requires_privilege,
+            "interactive": effect.interactive,
+            "destructive": effect.destructive,
+            "arbitrary_command": effect.arbitrary_command,
+        },
+        "annotations": {
+            "readOnlyHint": effect.read_only() && !tool.danger.needs_confirm(),
+        },
+        "input_schema": input_schema(tool),
+    })
+}
+
+/// 域汇总：全部域 + 每个域里的可调用工具数（`toolbox://domains`）。
+fn domain_summaries(tools: &[&ToolDefinition]) -> Vec<Value> {
+    crate::model::Domain::ALL
+        .iter()
+        .map(|domain| {
+            json!({
+                "id": domain.id(),
+                "label": domain.label(),
+                "description": domain.description(),
+                "tool_count": tools.iter().filter(|tool| tool.domain == *domain).count(),
+            })
+        })
+        .collect()
 }
 
 /// 供测试用的取值转换再出口（schema 的语义校验在服务层，测试会用到）。
@@ -804,6 +956,11 @@ mod tests {
         assert_eq!(
             response["result"]["capabilities"]["tools"]["listChanged"], true,
             "P4-04 热更新已实现，要声明 listChanged"
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["resources"],
+            json!({}),
+            "P5-02：声明 resources（subscribe/listChanged 未实现，不声明）"
         );
         assert!(
             response["result"]["capabilities"].get("tasks").is_none(),
@@ -1263,11 +1420,130 @@ mod tests {
         assert_eq!(parsed["result"], json!({}));
 
         let responses = fixture.server.handle(
-            r#"{"jsonrpc":"2.0","id":11,"method":"resources/list"}"#,
+            r#"{"jsonrpc":"2.0","id":11,"method":"prompts/list"}"#,
             &mut no_elicit(),
         );
         let parsed: Value = serde_json::from_str(&responses[0]).expect("合法");
         assert_eq!(parsed["error"]["code"], -32601);
+        cleanup(&fixture);
+    }
+
+    /// P5-02：resources/list 列出两个固定资源 + 每件授权工具一个；
+    /// resources/read 三类白名单 URI 各自形状正确，未知 URI -32602。
+    #[test]
+    fn resources_cover_catalog_domains_and_tool_details() {
+        let mut fixture = Fixture::new(vec![tool("test:echo", false)], config(""));
+        initialize(&mut fixture.server, false);
+
+        let responses = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#,
+            &mut no_elicit(),
+        );
+        let listed: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        let resources = listed["result"]["resources"].as_array().expect("数组");
+        assert_eq!(resources.len(), 3, "catalog + domains + 1 件工具：{listed}");
+        assert_eq!(resources[0]["uri"], "toolbox://catalog");
+        assert_eq!(resources[1]["uri"], "toolbox://domains");
+        assert_eq!(resources[2]["uri"], "toolbox://tools/test:echo");
+        assert_eq!(resources[2]["mimeType"], "application/json");
+
+        // read catalog：内容是 pretty JSON，含那件工具的完整详情。
+        let responses = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"toolbox://catalog"}}"#,
+            &mut no_elicit(),
+        );
+        let read: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        let contents = &read["result"]["contents"];
+        assert_eq!(contents[0]["uri"], "toolbox://catalog");
+        assert_eq!(contents[0]["mimeType"], "application/json");
+        let body: Value = serde_json::from_str(contents[0]["text"].as_str().expect("text"))
+            .expect("catalog 内容是 JSON 文本");
+        assert_eq!(body["tools"][0]["id"], "test:echo");
+        assert_eq!(body["tools"][0]["execution_mode"], "capture");
+        assert_eq!(
+            body["tools"][0]["input_schema"]["properties"]["text"]["type"], "string",
+            "参数定义在场"
+        );
+        assert!(
+            body["tools"][0]["requires"].is_array(),
+            "依赖要求在场：{body}"
+        );
+        assert!(
+            body["tools"][0]["effects"]["filesystem_read"].is_boolean(),
+            "安全限制（副作用）在场"
+        );
+
+        // read 单件工具 + domains + 未知 URI。
+        let read_tool = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"toolbox://tools/test:echo"}}"#,
+            &mut no_elicit(),
+        );
+        let parsed: Value = serde_json::from_str(&read_tool[0]).expect("合法 JSON");
+        let detail: Value = serde_json::from_str(
+            parsed["result"]["contents"][0]["text"]
+                .as_str()
+                .expect("text"),
+        )
+        .expect("详情是 JSON");
+        assert_eq!(detail["id"], "test:echo");
+        assert_eq!(detail["mcp_name"], "toolbox_test_echo");
+
+        let read_domains = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"toolbox://domains"}}"#,
+            &mut no_elicit(),
+        );
+        let parsed: Value = serde_json::from_str(&read_domains[0]).expect("合法 JSON");
+        let body: Value = serde_json::from_str(
+            parsed["result"]["contents"][0]["text"]
+                .as_str()
+                .expect("text"),
+        )
+        .expect("domains 是 JSON");
+        let domains = body["domains"].as_array().expect("数组");
+        assert_eq!(domains.len(), crate::model::Domain::ALL.len());
+        assert!(
+            domains
+                .iter()
+                .any(|domain| domain["id"] == "system" && domain["tool_count"] == 1),
+            "{body}"
+        );
+
+        let unknown = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}"#,
+            &mut no_elicit(),
+        );
+        let parsed: Value = serde_json::from_str(&unknown[0]).expect("合法 JSON");
+        assert_eq!(parsed["error"]["code"], -32602, "任意文件读取不在白名单里");
+
+        let unknown_tool = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"toolbox://tools/test:nope"}}"#,
+            &mut no_elicit(),
+        );
+        let parsed: Value = serde_json::from_str(&unknown_tool[0]).expect("合法 JSON");
+        assert_eq!(parsed["error"]["code"], -32602);
+
+        cleanup(&fixture);
+    }
+
+    /// P5-02：未授权 / 未声明的工具不产生资源；resources 只反映授权可见面。
+    #[test]
+    fn resources_only_expose_authorized_tools() {
+        let mut fixture = Fixture::new(
+            vec![tool("test:echo", false), tool("test:hidden", false)],
+            config(""),
+        );
+        initialize(&mut fixture.server, false);
+        let responses = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#,
+            &mut no_elicit(),
+        );
+        let listed: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        let text = listed["result"]["resources"].to_string();
+        assert!(text.contains("test:echo"));
+        assert!(
+            !text.contains("test:hidden"),
+            "未授权工具不该出现在资源里：{text}"
+        );
         cleanup(&fixture);
     }
 
