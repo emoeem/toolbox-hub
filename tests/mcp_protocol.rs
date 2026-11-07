@@ -4,24 +4,31 @@
 //! 自写 Dispatcher」。这里把编译出来的二进制当黑盒启动（`mcp stdio`），按行
 //! 说 JSON-RPC，覆盖：
 //!
-//! 1. 协议协商（initialize / serverInfo）；
-//! 2. `tools/list`：只出现授权工具、Schema 正确；
+//! 1. 协议协商（initialize / serverInfo / 双版本降级与 Tasks 能力）；
+//! 2. `tools/list`：只出现授权工具、Schema 正确、taskSupport 协商；
 //! 3. `tools/call`：真执行、中文与特殊字符参数原样进 argv；
 //! 4. 未知工具 → JSON-RPC 错误；
 //! 5. 缺必填参数 → `isError` 结果，且程序没跑；
-//! 6. 客户端关 stdin 后服务端干净退出（无孤儿进程）。
+//! 6. MCP Tasks（P4-01）：创建 / 进度 / 完成 / 取消 / 终态不可再取消 /
+//!    related-task 元数据 / 并发预算占用 / 2025-06-18 客户端忽略 task 字段；
+//! 7. 无孤儿：取消与断开连接都把工具拉起的整个进程组收掉（marker 文件验证）。
 
 use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
+
+/// related-task 元数据键（与实现一致，这里独立写死防两边一起漂）。
+const RELATED_TASK: &str = "io.modelcontextprotocol/related-task";
 
 /// 临时配置目录（manifest + mcp.toml）与数据目录。
 struct Sandbox {
     config: std::path::PathBuf,
     data: std::path::PathBuf,
+    root: std::path::PathBuf,
 }
 
 impl Sandbox {
@@ -58,7 +65,47 @@ required = true
         )
         .expect("写 manifest");
 
-        // 白名单只放行这一件。
+        // P4-01 慢任务脚本：起一个 sleep 孙子进程并把它的 pid 写进文件（marker），
+        // 然后 wait —— 取消/断开时整个进程组要被收掉，用 /proc 验证 pid 消失。
+        let script = root.join("slowtask.sh");
+        let pid_file = root.join("slowtask.pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep \"$1\" &\nprintf '%s\\n' $! > {}\necho started\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .expect("写慢任务脚本");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 慢任务脚本");
+
+        std::fs::write(
+            config.join("tools.d/mcpslow.toml"),
+            format!(
+                r#"[[action]]
+id = "mcp-slow"
+name = "MCP 慢任务"
+summary = "睡上给定的秒数"
+domain = "系统"
+program = "{}"
+mode = "capture"
+danger = "safe"
+mcp = {{ enabled = true, description = "慢任务", effects = {{ filesystem_read = true }} }}
+
+[[action.argument]]
+key = "seconds"
+label = "秒数"
+kind = "text"
+required = true
+"#,
+                script.display()
+            ),
+        )
+        .expect("写慢任务 manifest");
+
+        // 白名单先只放行 echo；Tasks 用例自己改写 mcp.toml 放行慢任务。
         std::fs::write(
             config.join("mcp.toml"),
             r#"[mcp]
@@ -76,7 +123,31 @@ max_timeout_secs = 30
         )
         .expect("写 mcp.toml");
 
-        Self { config, data }
+        Self { config, data, root }
+    }
+
+    /// 给慢任务放行（Tasks 用例用）。
+    fn allow_slow(&self) {
+        std::fs::write(
+            self.config.join("mcp.toml"),
+            r#"[mcp]
+enabled = true
+
+[exposure]
+default = "deny"
+allow = ["manifest:mcp-demo", "manifest:mcp-slow"]
+deny = []
+
+[limits]
+default_timeout_secs = 15
+max_timeout_secs = 30
+"#,
+        )
+        .expect("改写 mcp.toml");
+    }
+
+    fn audit_text(&self) -> String {
+        std::fs::read_to_string(self.data.join("mcp-audit.jsonl")).unwrap_or_default()
     }
 }
 
@@ -94,7 +165,8 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(sandbox: &Sandbox, capabilities: Value) -> Self {
+    /// 启动服务端并按指定协议版本完成 initialize。
+    fn spawn(sandbox: &Sandbox, version: &str, capabilities: Value) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_toolbox-hub"))
             .arg("mcp")
             .arg("stdio")
@@ -120,12 +192,12 @@ impl Server {
         server.send(&json!({
             "jsonrpc": "2.0", "id": id, "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": version,
                 "clientInfo": {"name": "it-client", "version": "0"},
                 "capabilities": capabilities,
             }
         }));
-        let response = server.read_response();
+        let response = server.read_until_response().0;
         assert_eq!(response["id"], id, "initialize 要先得到响应");
         server.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         server
@@ -143,15 +215,48 @@ impl Server {
         line
     }
 
-    fn read_response(&mut self) -> Value {
-        serde_json::from_str(self.read_line().trim()).expect("响应是合法 JSON")
+    /// 读到下一条**响应**为止；沿途的通知（进度等）原样收集返回。
+    /// 服务端把通知排在响应之后写出，顺序无关紧要 —— 通知不会顶掉响应。
+    fn read_until_response(&mut self) -> (Value, Vec<Value>) {
+        let mut notifications = Vec::new();
+        loop {
+            let line = self.read_line();
+            let value: Value = serde_json::from_str(line.trim()).expect("消息是合法 JSON");
+            if value.get("method").is_some() {
+                notifications.push(value);
+                continue;
+            }
+            return (value, notifications);
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        self.request_collecting(method, params).0
+    }
+
+    /// 发请求并返回（响应，沿途通知）。通知由服务端排在响应之后写出，
+    /// 可能滞留到下一次读取 —— 这里一并收回来。
+    fn request_collecting(&mut self, method: &str, params: Value) -> (Value, Vec<Value>) {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        self.read_response()
+        self.read_until_response()
+    }
+
+    /// 轮询 tasks/get 直到任务到达期望状态（Tasks 的 get 是非阻塞轮询模型）。
+    fn poll_task_status(&mut self, task_id: &str, want: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = self.request("tasks/get", json!({"taskId": task_id}));
+            if response["result"]["status"] == want {
+                return response["result"].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "任务 {task_id} 没有在期限内到达 {want}：{response}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// 关 stdin 并等待退出；返回退出码。
@@ -168,9 +273,37 @@ impl Server {
     }
 }
 
+/// 这个 pid 还活着吗：/proc 不在即死；僵尸态（Z）视为已死（本测试进程
+/// 不充当 PID 1，别把被杀后没人收尸的僵尸当活口）。
+fn alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z"),
+        Err(_) => false,
+    }
+}
+
+/// 等慢任务把孙子进程 pid 写进 marker 文件（证明子进程真起来了）。
+fn wait_for_grandchild_pid(sandbox: &Sandbox) -> u32 {
+    let pid_file = sandbox.root.join("slowtask.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "慢任务没在期限内写出 pid marker");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn server_negotiates_to_the_version_it_implements() {
     let sandbox = Sandbox::new("negotiate");
+    // 2026-07-28 客户端 → 降到 2025-11-25（Tasks 版本），并声明 Tasks 能力。
     let mut child = Command::new(env!("CARGO_BIN_EXE_toolbox-hub"))
         .arg("mcp")
         .arg("stdio")
@@ -203,18 +336,40 @@ fn server_negotiates_to_the_version_it_implements() {
     let response: Value = serde_json::from_str(&line).expect("合法 JSON");
     assert_eq!(response["id"], 1, "{response}");
     assert_eq!(
-        response["result"]["protocolVersion"], "2025-06-18",
-        "不支持客户端请求的更高版本时必须回自支持版本：{response}"
+        response["result"]["protocolVersion"], "2025-11-25",
+        "请求 2026-07-28 时回自支持的 Tasks 版本：{response}"
+    );
+    let capabilities = &response["result"]["capabilities"];
+    assert_eq!(capabilities["tasks"]["cancel"], json!({}), "{response}");
+    assert_eq!(
+        capabilities["tasks"]["requests"]["tools"]["call"],
+        json!({}),
+        "{response}"
+    );
+    assert!(
+        capabilities["tasks"].get("list").is_none(),
+        "stdio 无法识别请求方，不声明 tasks.list：{response}"
     );
     drop(stdin);
     let _ = child.wait();
+
+    // 2025-06-18 客户端 → 维持现状，不声明 Tasks 能力。
+    let mut server = Server::spawn(&sandbox, "2025-06-18", json!({}));
+    let listed = server.request("tools/list", json!({}));
+    for tool in listed["result"]["tools"].as_array().expect("数组") {
+        assert!(
+            tool.get("execution").is_none(),
+            "旧版本客户端不认 execution.taskSupport：{tool}"
+        );
+    }
+    assert_eq!(server.shutdown(), 0);
 }
 
 #[test]
 fn full_stdio_conversation() {
     let sandbox = Sandbox::new("full");
 
-    let mut server = Server::spawn(&sandbox, json!({}));
+    let mut server = Server::spawn(&sandbox, "2025-06-18", json!({}));
 
     // tools/list：只有授权的那一件，名字是规范化后的 MCP 工具名。
     let listed = server.request("tools/list", json!({}));
@@ -287,7 +442,7 @@ fn disabled_mcp_lists_nothing() {
     std::fs::write(sandbox.config.join("mcp.toml"), "[mcp]\nenabled = false\n")
         .expect("写 mcp.toml");
 
-    let mut server = Server::spawn(&sandbox, json!({}));
+    let mut server = Server::spawn(&sandbox, "2025-06-18", json!({}));
     let listed = server.request("tools/list", json!({}));
     assert_eq!(
         listed["result"]["tools"].as_array().expect("数组").len(),
@@ -295,4 +450,312 @@ fn disabled_mcp_lists_nothing() {
         "未启用 = 什么都没有（fail-closed）"
     );
     assert_eq!(server.shutdown(), 0);
+}
+
+/// P4-01 + P4-03 全链路：创建（CreateTaskResult）→ 完成后 tasks/result 带
+/// related-task → 慢任务创建 → 1 秒节流的 notifications/progress（无 total、
+/// 单调递增）→ tasks/cancel 立即转 cancelled → 终态再取消 -32602 → marker
+/// 文件证明进程组被收掉 → 取消后的 tasks/result 是 isError 的底层响应。
+#[test]
+fn mcp_tasks_lifecycle_with_progress_and_cancel() {
+    let sandbox = Sandbox::new("tasks");
+    sandbox.allow_slow();
+    let mut server = Server::spawn(&sandbox, "2025-11-25", json!({}));
+
+    // ── 1. echo 任务：创建 → completed → 结果带 related-task ──────────────
+    let created = server.request(
+        "tools/call",
+        json!({
+            "name": "toolbox_manifest_mcp_demo",
+            "arguments": {"text": "任务回显"},
+            "task": {},
+            "_meta": {"progressToken": "tok-echo"},
+        }),
+    );
+    let task = &created["result"]["task"];
+    assert_eq!(task["status"], "working", "{created}");
+    let task_id = task["taskId"].as_str().expect("taskId").to_string();
+    assert_eq!(task_id.len(), 32, "不可猜测的 id：{task_id}");
+    assert_eq!(task["createdAt"].as_str().map(str::len), Some(20));
+    assert_eq!(task["ttl"], Value::Null, "未限时 → null");
+    assert_eq!(task["pollInterval"], 1000);
+    assert!(
+        created["result"].get("content").is_none(),
+        "CreateTaskResult 不含工具结果：{created}"
+    );
+
+    let finished = server.poll_task_status(&task_id, "completed");
+    assert_eq!(finished["taskId"], task_id.as_str());
+
+    let result = server.request("tasks/result", json!({"taskId": task_id}));
+    let payload = &result["result"];
+    assert_eq!(payload["isError"], false, "{result}");
+    assert!(
+        payload["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("任务回显")
+    );
+    assert_eq!(
+        payload["_meta"][RELATED_TASK]["taskId"],
+        task_id.as_str(),
+        "tasks/result 必须带 related-task：{result}"
+    );
+
+    // ── 2. 慢任务：创建 → 等它真跑起来（marker）→ 进度 → 取消 ─────────────
+    let created = server.request(
+        "tools/call",
+        json!({
+            "name": "toolbox_manifest_mcp_slow",
+            "arguments": {"seconds": "30"},
+            "task": {"ttl": 60000},
+            "_meta": {"progressToken": "tok-slow"},
+        }),
+    );
+    let slow_task = &created["result"]["task"];
+    assert_eq!(slow_task["status"], "working", "{created}");
+    let slow_id = slow_task["taskId"].as_str().expect("taskId").to_string();
+    assert_eq!(slow_task["ttl"], 60000, "客户端要的 ttl 原样带回");
+
+    // marker：脚本已起 sleep 孙子进程（并发名额也已被占住）。
+    let grandchild = wait_for_grandchild_pid(&sandbox);
+    assert!(
+        alive(grandchild),
+        "取消前孙子进程该活着（pid {grandchild}）"
+    );
+
+    // 等过 1 秒进度节流，再取消。进度通知由服务端排在响应之后写出，
+    // 会滞留到下一次读取 —— 取消响应之后再用一个 ping 把它们收回来。
+    std::thread::sleep(Duration::from_millis(1300));
+    server.next_id += 1;
+    let cancel_id = server.next_id;
+    server.send(&json!({
+        "jsonrpc": "2.0", "id": cancel_id, "method": "tasks/cancel",
+        "params": {"taskId": slow_id},
+    }));
+    let (cancelled, _leftovers) = server.read_until_response();
+    assert_eq!(cancelled["id"], cancel_id);
+    assert_eq!(
+        cancelled["result"]["status"], "cancelled",
+        "取消必须在响应前落终态：{cancelled}"
+    );
+    assert_eq!(cancelled["result"]["taskId"], slow_id.as_str());
+
+    let (_, pending) = server.request_collecting("ping", json!({}));
+    let progress_lines: Vec<Value> = _leftovers
+        .into_iter()
+        .chain(pending)
+        .filter(|line| line["method"] == "notifications/progress")
+        .collect();
+    assert!(!progress_lines.is_empty(), "1 秒节流下至少应有一条进度通知");
+    let mut last = 0;
+    for line in &progress_lines {
+        assert_eq!(line["params"]["progressToken"], "tok-slow", "{line}");
+        let progress = line["params"]["progress"].as_u64().expect("progress");
+        assert!(progress > last, "progress 单调递增：{progress_lines:?}");
+        last = progress;
+        assert!(line["params"]["message"].is_string());
+        assert!(
+            line["params"].get("total").is_none(),
+            "没有真实总量就不给 total：{line}"
+        );
+        assert!(
+            !line["params"]["message"]
+                .as_str()
+                .expect("message")
+                .contains('%'),
+            "不伪造百分比：{line}"
+        );
+    }
+
+    // 终态再取消 → -32602。
+    let again = server.request("tasks/cancel", json!({"taskId": slow_id}));
+    assert_eq!(again["error"]["code"], -32602, "{again}");
+
+    // 状态停在 cancelled，不再变。
+    let status = server.poll_task_status(&slow_id, "cancelled");
+    assert_eq!(status["taskId"], slow_id.as_str());
+
+    // marker 验证：孙子进程（sleep 30）已随进程组被收掉。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(grandchild) {
+        assert!(
+            Instant::now() < deadline,
+            "取消后孙子进程 {grandchild} 还活着 —— 进程组没被带走"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 取消后的 tasks/result：底层响应（isError）+ related-task。
+    let result = server.request("tasks/result", json!({"taskId": slow_id}));
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert_eq!(
+        result["result"]["_meta"][RELATED_TASK]["taskId"],
+        slow_id.as_str(),
+        "{result}"
+    );
+
+    // 审计生命周期链：created + progress + cancelled + completed 都带 task_id。
+    let audit = sandbox.audit_text();
+    for decision in ["created", "progress", "cancelled", "completed"] {
+        assert!(
+            audit.contains(&format!("\"decision\":\"{decision}\"")),
+            "审计缺 {decision}：{audit}"
+        );
+    }
+    assert!(audit.contains(&format!("\"task_id\":\"{slow_id}\"")));
+
+    assert_eq!(server.shutdown(), 0, "干净退出");
+}
+
+/// P4-01：并发预算共享 —— 后台任务占住名额（max_concurrent=1）后，同步调用
+/// 直接被拒（busy），拒绝发生在子进程之前。
+#[test]
+fn mcp_tasks_rejected_when_concurrency_budget_is_exhausted() {
+    let sandbox = Sandbox::new("busy");
+    sandbox.allow_slow();
+    std::fs::write(
+        sandbox.config.join("mcp.toml"),
+        r#"[mcp]
+enabled = true
+
+[exposure]
+default = "deny"
+allow = ["manifest:mcp-demo", "manifest:mcp-slow"]
+deny = []
+
+[limits]
+default_timeout_secs = 15
+max_timeout_secs = 30
+max_concurrent = 1
+"#,
+    )
+    .expect("写 mcp.toml");
+    let mut server = Server::spawn(&sandbox, "2025-11-25", json!({}));
+
+    let created = server.request(
+        "tools/call",
+        json!({
+            "name": "toolbox_manifest_mcp_slow",
+            "arguments": {"seconds": "30"},
+            "task": {},
+        }),
+    );
+    let slow_id = created["result"]["task"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+
+    // marker 出现 = 后台任务已拿到唯一名额并真的跑起来了。
+    let _grandchild = wait_for_grandchild_pid(&sandbox);
+
+    let busy = server.request(
+        "tools/call",
+        json!({"name": "toolbox_manifest_mcp_demo", "arguments": {"text": "hi"}}),
+    );
+    assert_eq!(busy["result"]["isError"], true, "{busy}");
+    assert_eq!(
+        busy["result"]["structuredContent"]["error_kind"], "permission_denied",
+        "{busy}"
+    );
+    assert!(
+        busy["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("并发已达上限"),
+        "{busy}"
+    );
+    assert!(sandbox.audit_text().contains("\"decision\":\"denied\""));
+
+    // 收尾：取消慢任务再退出。
+    let cancelled = server.request("tasks/cancel", json!({"taskId": slow_id}));
+    assert_eq!(cancelled["result"]["status"], "cancelled");
+    assert_eq!(server.shutdown(), 0);
+}
+
+/// P4-01：2025-06-18 客户端的 task 字段按普通请求处理（规范：未声明能力时
+/// 忽略任务增强元数据）；tasks/* 是未知方法（-32601）。
+#[test]
+fn mcp_tasks_ignored_for_2025_06_18_clients() {
+    let sandbox = Sandbox::new("oldversion");
+    let mut server = Server::spawn(&sandbox, "2025-06-18", json!({}));
+
+    let called = server.request(
+        "tools/call",
+        json!({
+            "name": "toolbox_manifest_mcp_demo",
+            "arguments": {"text": "同步路径"},
+            "task": {"ttl": 60000},
+        }),
+    );
+    let result = &called["result"];
+    assert_eq!(result["isError"], false, "{called}");
+    assert!(
+        result.get("task").is_none(),
+        "同步响应不该有 task 字段：{called}"
+    );
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("同步路径")
+    );
+
+    let unknown = server.request("tasks/get", json!({"taskId": "x"}));
+    assert_eq!(unknown["error"]["code"], -32601, "{unknown}");
+    let unknown = server.request("tasks/cancel", json!({"taskId": "x"}));
+    assert_eq!(unknown["error"]["code"], -32601);
+
+    assert_eq!(server.shutdown(), 0);
+}
+
+/// P4-01 退出清理：客户端断开（关 stdin）后，运行中的任务被置取消旗标，
+/// 整个进程组被收掉（marker 验证），服务端在 8 秒上限内干净退出。
+#[test]
+fn client_disconnect_cancels_running_tasks_without_orphans() {
+    let sandbox = Sandbox::new("disconnect");
+    sandbox.allow_slow();
+    let mut server = Server::spawn(&sandbox, "2025-11-25", json!({}));
+
+    let created = server.request(
+        "tools/call",
+        json!({
+            "name": "toolbox_manifest_mcp_slow",
+            "arguments": {"seconds": "30"},
+            "task": {},
+        }),
+    );
+    let slow_id = created["result"]["task"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+    let grandchild = wait_for_grandchild_pid(&sandbox);
+    assert!(alive(grandchild));
+
+    // 不发 cancel，直接断开：退出清理要接手。
+    let started = Instant::now();
+    let code = server.shutdown();
+    let waited = started.elapsed();
+    assert_eq!(code, 0, "断开后干净退出");
+    assert!(
+        waited < Duration::from_secs(12),
+        "退出清理上限 8 秒 + 收尾，不该等满 30 秒：{waited:?}"
+    );
+
+    // 孙子进程必须已经死了（没有孤儿在闷头睡 30 秒）。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(grandchild) {
+        assert!(
+            Instant::now() < deadline,
+            "断开后孙子进程 {grandchild} 还活着"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 断开前的任务被退出清理转成 cancelled 并记审计。
+    let audit = sandbox.audit_text();
+    assert!(
+        audit.contains(&format!("\"task_id\":\"{slow_id}\"")),
+        "{audit}"
+    );
 }

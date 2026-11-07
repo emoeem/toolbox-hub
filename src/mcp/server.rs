@@ -19,6 +19,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -41,10 +42,15 @@ use crate::{
 
 use super::{
     names::NameRegistry,
-    protocol::{self, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PROTOCOL_VERSION},
+    protocol::{self, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, ProtocolVersion},
     reload::HotReload,
     schema::{input_schema, values_from_json},
+    tasks::{GateRejection, RELATED_TASK, TaskManager, TaskPayload},
 };
+
+/// 退出清理（P4-01）等待任务终态的上限：执行器取消的最坏路径是
+/// SIGTERM → 2s 宽限 → SIGKILL → 1s 收尾，8 秒绰绰有余。
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
 
 /// 一台 MCP 服务端。状态只有连接本身的那点：协商出来的能力、名称表、请求计数。
 ///
@@ -54,15 +60,19 @@ pub struct McpServer {
     catalog: Arc<ToolCatalog>,
     policy: SafetyPolicy,
     auditor: Arc<Auditor>,
-    /// 同步调用与（将来的）后台任务共享的并发预算（P4-02）；上限可热更新。
+    /// 同步调用与后台任务共享的并发预算（P4-02）；上限可热更新。
     limiter: Arc<ConcurrencyLimiter>,
+    /// MCP Tasks 任务表（P4-01）：后台执行、进度通知、取消、退出清理。
+    tasks: Arc<TaskManager>,
     /// 热更新信箱（与 watcher 线程共享）。
     reload: Arc<HotReload>,
-    /// 服务端要主动推给客户端的通知行（list_changed 等），主循环在写完当前
-    /// 请求的响应后统一排空。
+    /// 服务端要主动推给客户端的通知行（list_changed、进度等），主循环在
+    /// 写完当前请求的响应后统一排空。
     outgoing: Arc<Mutex<Vec<String>>>,
     names: NameRegistry,
     initialized: bool,
+    /// 本次连接协商出的协议版本（ADR-001：双版本，Tasks 只在 2025-11-25 生效）。
+    negotiated: ProtocolVersion,
     client_name: String,
     /// 客户端是否声明了 `elicitation` 能力（initialize 时读一次）。
     client_elicitation: bool,
@@ -78,15 +88,23 @@ pub type Elicit<'a> = &'a mut dyn FnMut(u64, &str, Value) -> Option<Value>;
 
 impl McpServer {
     pub fn new(catalog: ToolCatalog, policy: SafetyPolicy, auditor: Auditor) -> Self {
+        let limiter = Arc::new(ConcurrencyLimiter::new(policy.config.max_concurrent()));
+        let outgoing = Arc::new(Mutex::new(Vec::new()));
+        let tasks = Arc::new(TaskManager::new(
+            Arc::clone(&outgoing),
+            Arc::clone(&limiter),
+        ));
         Self {
             catalog: Arc::new(catalog),
             policy: policy.clone(),
             auditor: Arc::new(auditor),
-            limiter: Arc::new(ConcurrencyLimiter::new(policy.config.max_concurrent())),
+            limiter,
+            tasks,
             reload: Arc::new(HotReload::new()),
-            outgoing: Arc::new(Mutex::new(Vec::new())),
+            outgoing,
             names: NameRegistry::default(),
             initialized: false,
+            negotiated: ProtocolVersion::V2025_06_18,
             client_name: String::from("unknown"),
             client_elicitation: false,
             next_request_id: 1_000_000,
@@ -101,6 +119,18 @@ impl McpServer {
     /// 待推送通知队列的把手（主循环排空后写 stdout）。
     pub fn outgoing_handle(&self) -> Arc<Mutex<Vec<String>>> {
         Arc::clone(&self.outgoing)
+    }
+
+    /// 任务表把手（测试用；运行期退出清理走 [`McpServer::shutdown_tasks`]）。
+    #[allow(dead_code)]
+    pub fn tasks_handle(&self) -> Arc<TaskManager> {
+        Arc::clone(&self.tasks)
+    }
+
+    /// 退出清理：stdio 断开后把全部运行中任务置取消旗标（进程组 SIGTERM →
+    /// 2s 宽限 → SIGKILL），等它们到终态，上限 8 秒。
+    pub fn shutdown_tasks(&self) {
+        self.tasks.shutdown(SHUTDOWN_WAIT);
     }
 
     /// 换入 watcher 产出的新快照（P4-04）。快照是整体构建好的，换入即生效；
@@ -197,6 +227,21 @@ impl McpServer {
             "ping" if self.initialized => Ok(json!({})),
             "tools/list" if self.initialized => self.tools_list(),
             "tools/call" if self.initialized => self.call_tool(&incoming.params, elicit),
+            // Tasks 面只在 2025-11-25 协商生效；旧版本客户端按未知方法拒绝
+            //（规范：能力未声明时请求方不得使用，接收端回 -32601）。
+            "tasks/get" if self.initialized && self.negotiated == ProtocolVersion::V2025_11_25 => {
+                self.tasks_get(&incoming.params)
+            }
+            "tasks/result"
+                if self.initialized && self.negotiated == ProtocolVersion::V2025_11_25 =>
+            {
+                self.tasks_result(&incoming.params)
+            }
+            "tasks/cancel"
+                if self.initialized && self.negotiated == ProtocolVersion::V2025_11_25 =>
+            {
+                self.tasks_cancel(&incoming.params)
+            }
             _ if !self.initialized => Err((
                 INVALID_REQUEST,
                 String::from("先发 initialize 再发其它请求"),
@@ -229,13 +274,28 @@ impl McpServer {
         self.rebuild_names();
         self.initialized = true;
 
-        // 协议版本：只实现 2025-06-18。规范要求不支持客户端请求的版本时
-        // 必须回自己支持的版本，由客户端决定是否继续；盲目回显更高版本
-        // 等于宣称实现了未实现的语义（如 2025-11-25 起的 Tasks）。
+        // 协议版本协商（ADR-001）：请求 2025-11-25 / 2026-07-28 → 回
+        // 2025-11-25 并开放 Tasks；请求 2025-06-18（或更老/未知版本）→ 维持
+        // 2025-06-18。规范要求不支持客户端请求的版本时必须回自己支持的版本，
+        // 由客户端决定是否继续；盲目回显等于宣称实现了未实现的语义。
+        self.negotiated =
+            ProtocolVersion::negotiate(params.get("protocolVersion").and_then(Value::as_str));
+        // P4-04：热更新已实现，声明 listChanged 并在清单变化时发通知。
+        // P4-01：Tasks 能力只在 2025-11-25 协商下声明；tasks.list 按规范的
+        // 安全建议不声明（stdio 无法识别请求方，列表会把任务暴露给任何人）。
+        let capabilities = match self.negotiated {
+            ProtocolVersion::V2025_11_25 => json!({
+                "tools": {"listChanged": true},
+                "tasks": {
+                    "cancel": {},
+                    "requests": {"tools": {"call": {}}},
+                },
+            }),
+            ProtocolVersion::V2025_06_18 => json!({"tools": {"listChanged": true}}),
+        };
         Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            // P4-04：热更新已实现，声明 listChanged 并在清单变化时发通知。
-            "capabilities": {"tools": {"listChanged": true}},
+            "protocolVersion": self.negotiated.as_str(),
+            "capabilities": capabilities,
             "serverInfo": {
                 "name": "toolbox-hub",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -258,7 +318,14 @@ impl McpServer {
         let tools: Vec<Value> = gateway
             .list()
             .iter()
-            .map(|tool| self.tool_entry(tool))
+            .map(|tool| {
+                let mut entry = self.tool_entry(tool);
+                // P4-01 工具级协商：2025-11-25 下声明每件工具可按任务执行。
+                if self.negotiated == ProtocolVersion::V2025_11_25 {
+                    entry["execution"] = json!({"taskSupport": "optional"});
+                }
+                entry
+            })
             .collect();
         Ok(json!({"tools": tools}))
     }
@@ -293,7 +360,7 @@ impl McpServer {
         })
     }
 
-    /// tools/call：名称 → 取值 → 确认 → 网关。
+    /// tools/call：名称 → 取值 →（task 字段 → 任务路径）→ 确认 → 网关。
     fn call_tool(&mut self, params: &Value, elicit: Elicit<'_>) -> Result<Value, (i64, String)> {
         let name = params
             .get("name")
@@ -309,6 +376,13 @@ impl McpServer {
 
         let values = values_from_json(&tool, params.get("arguments"))
             .map_err(|message| (INVALID_PARAMS, message))?;
+
+        // P4-01：2025-11-25 协商下 params 带 task 字段 → 按任务执行。
+        // 2025-06-18 客户端的 task 字段按规范忽略（未声明能力时按普通请求处理）。
+        if self.negotiated == ProtocolVersion::V2025_11_25 && params.get("task").is_some() {
+            return self.call_tool_as_task(params, &tool, values, elicit);
+        }
+
         let audit_arguments = redacted_arguments(tool.action.as_ref(), &values);
 
         // 第二层确认：需要人工确认时，先走 elicitation。客户端没这个能力就让
@@ -373,6 +447,118 @@ impl McpServer {
             Err(error) => Ok(tool_error(error.to_string(), error.kind())),
         }
     }
+
+    /// 任务路径（P4-01）：建任务 → 确认门槛（同步，拒绝即 failed）→ 后台
+    /// 执行 → 立即回 CreateTaskResult。协议级错误（未知工具、参数形状）在
+    /// 任务创建之前就已被拒绝，不会产生任务。
+    fn call_tool_as_task(
+        &mut self,
+        params: &Value,
+        tool: &ToolDefinition,
+        values: TypedValues,
+        elicit: Elicit<'_>,
+    ) -> Result<Value, (i64, String)> {
+        let id = tool.id.clone();
+        let task_params = params.get("task").cloned().unwrap_or(Value::Null);
+        let ttl = task_params.get("ttl").and_then(Value::as_u64);
+        // progressToken：客户端在 _meta 里索要了才发 notifications/progress
+        //（字符串或数字，规范允许两种）。
+        let progress_token = params
+            .get("_meta")
+            .and_then(|meta| meta.get("progressToken"))
+            .filter(|token| token.is_string() || token.is_number())
+            .cloned();
+
+        let tasks = Arc::clone(&self.tasks);
+        let audit_arguments = redacted_arguments(tool.action.as_ref(), &values);
+        let payload = TaskPayload {
+            tool: tool.clone(),
+            values,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            client_name: self.client_name.clone(),
+            policy: self.policy.clone(),
+            auditor: (*self.auditor).clone(),
+            audit_arguments: audit_arguments.clone(),
+        };
+
+        // 确认门槛与同步路径同一套判定，差别只有两处：审计带 task_id 标记、
+        // elicitation 请求带 related-task 元数据（规范要求任务相关消息必须可关联）。
+        let mut gate = |task_id: &str| -> Result<(), GateRejection> {
+            let effect = effects::infer(tool);
+            if approval::requirement(tool, effect) != approval::Requirement::Confirmation {
+                return Ok(());
+            }
+            if !self.client_elicitation {
+                (*self.auditor).with_task_tag(task_id).denied(
+                    &id,
+                    &self.client_name,
+                    "confirmation_unsupported",
+                    audit_arguments.clone(),
+                );
+                return Err(GateRejection {
+                    kind: "confirmation_unsupported",
+                    message: format!("{id} 需要人工确认，但客户端不支持确认能力（elicitation）"),
+                });
+            }
+            self.next_request_id += 1;
+            let request_id = self.next_request_id;
+            let request = json!({
+                "mode": "form",
+                "message": confirmation_message(tool, &effect),
+                "requestedSchema": {"type": "object", "properties": {}, "required": []},
+                "_meta": { RELATED_TASK: {"taskId": task_id} },
+            });
+            match elicit(request_id, "elicitation/create", request) {
+                Some(result) if result.get("action").and_then(Value::as_str) == Some("accept") => {
+                    Ok(())
+                }
+                _ => {
+                    (*self.auditor).with_task_tag(task_id).denied(
+                        &id,
+                        &self.client_name,
+                        "declined_by_user",
+                        audit_arguments.clone(),
+                    );
+                    Err(GateRejection {
+                        kind: "declined_by_user",
+                        message: format!("{id} 未获用户确认，没有执行"),
+                    })
+                }
+            }
+        };
+
+        Ok(tasks.begin(ttl, progress_token, payload, &mut gate))
+    }
+
+    /// `tasks/get`：当前任务状态（轮询模型，不阻塞）；未知/过期 → -32602。
+    fn tasks_get(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let task_id = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .ok_or((INVALID_PARAMS, String::from("缺少 taskId")))?;
+        self.tasks.get(task_id)
+    }
+
+    /// `tasks/result`：阻塞到终态，回底层请求本该返回的结果 + related-task。
+    fn tasks_result(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let task_id = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .ok_or((INVALID_PARAMS, String::from("缺少 taskId")))?;
+        // 等待上限 = 策略最大超时 + 收尾宽限：任务线程最坏情况是执行超时
+        // 再走两段终止宽限，不会超过它。
+        let cap = Duration::from_secs(self.policy.config.limits.max_timeout_secs.max(1) + 15);
+        self.tasks.wait_result(task_id, cap)
+    }
+
+    /// `tasks/cancel`：响应前转 cancelled 终态并置取消旗标；终态再取消 → -32602。
+    fn tasks_cancel(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let task_id = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .ok_or((INVALID_PARAMS, String::from("缺少 taskId")))?;
+        self.tasks.cancel(task_id)
+    }
 }
 
 /// 需要确认时的 elicitation 文案：把副作用说清楚，别只写「要执行一条命令」。
@@ -411,7 +597,8 @@ fn confirmation_message(tool: &ToolDefinition, effect: &crate::model::ToolEffect
 }
 
 /// 执行成功/失败（程序真的跑过了）→ MCP result。
-fn execution_result(result: &ExecutionResult) -> Value {
+/// `pub(crate)`：任务线程（mcp::tasks）落终态结果用同一形状。
+pub(crate) fn execution_result(result: &ExecutionResult) -> Value {
     let mut text = format!("$ {}\n", result.command);
     if !result.stdout.is_empty() {
         text.push_str("\n--- stdout ---\n");
@@ -450,7 +637,8 @@ fn execution_result(result: &ExecutionResult) -> Value {
 ///
 /// 按 MCP 规范，这类「工具自身的错误」用 result 报告，不用协议错误——
 /// 协议错误只留给坏消息本身（未知方法、参数形状不对）。
-fn tool_error(message: String, kind: &str) -> Value {
+/// `pub(crate)`：任务路径的门槛拒绝与执行失败用同一形状落终态。
+pub(crate) fn tool_error(message: String, kind: &str) -> Value {
     json!({
         "content": [{"type": "text", "text": message}],
         "structuredContent": {"error_kind": kind, "error": message},
@@ -617,6 +805,162 @@ mod tests {
             response["result"]["capabilities"]["tools"]["listChanged"], true,
             "P4-04 热更新已实现，要声明 listChanged"
         );
+        assert!(
+            response["result"]["capabilities"].get("tasks").is_none(),
+            "2025-06-18 协商不声明 Tasks：{response}"
+        );
+        cleanup(&fixture);
+    }
+
+    /// P4-01：请求 2025-11-25（或 2026-07-28）→ 服务端回 2025-11-25 并开放
+    /// Tasks 能力（cancel + requests.tools.call）；tasks.list 按规范安全建议
+    /// 不声明；tools/list 每件工具带 execution.taskSupport = "optional"。
+    #[test]
+    fn a_2025_11_25_client_gets_the_tasks_capability() {
+        let mut fixture = Fixture::new(vec![tool("test:echo", false)], config(""));
+        let line = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "clientInfo": {"name": "tester", "version": "0"},
+                "capabilities": {},
+            }
+        });
+        let responses = fixture.server.handle(&line.to_string(), &mut no_elicit());
+        let response: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+        let capabilities = &response["result"]["capabilities"];
+        assert_eq!(capabilities["tools"]["listChanged"], true);
+        assert_eq!(capabilities["tasks"]["cancel"], json!({}));
+        assert_eq!(
+            capabilities["tasks"]["requests"]["tools"]["call"],
+            json!({})
+        );
+        assert!(
+            capabilities["tasks"].get("list").is_none(),
+            "stdio 无法识别请求方，不声明 tasks.list：{capabilities}"
+        );
+
+        let responses = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut no_elicit(),
+        );
+        let listed: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        assert_eq!(
+            listed["result"]["tools"][0]["execution"]["taskSupport"], "optional",
+            "{listed}"
+        );
+        cleanup(&fixture);
+    }
+
+    /// P4-01 全链路（单元级）：task 字段 → CreateTaskResult(working) →
+    /// tasks/get 到 completed → tasks/result 带 related-task 且 isError=false；
+    /// 审计的 created/completed 都带 task_id。
+    #[test]
+    fn a_task_augmented_call_round_trips_through_begin_get_and_result() {
+        let mut fixture = Fixture::new(vec![tool("test:echo", false)], config(""));
+        // Tasks 只在 2025-11-25 协商下生效：先以该版本 initialize。
+        let line = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "clientInfo": {"name": "tester", "version": "0"},
+                "capabilities": {},
+            }
+        });
+        fixture.server.handle(&line.to_string(), &mut no_elicit());
+        let line = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "toolbox_test_echo",
+                "arguments": {"text": "任务回显"},
+                "task": {},
+            }
+        });
+        let responses = fixture.server.handle(&line.to_string(), &mut no_elicit());
+        assert_eq!(responses.len(), 1);
+        let created: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        let task = &created["result"]["task"];
+        assert_eq!(task["status"], "working", "{created}");
+        let task_id = task["taskId"].as_str().expect("taskId").to_string();
+        assert_eq!(task["createdAt"].as_str().map(str::len), Some(20));
+        assert_eq!(task["pollInterval"], 1000);
+
+        // tasks/get：轮询到 completed（echo 任务很快，个别慢机器上多试几次）。
+        let mut status = String::new();
+        for _ in 0..50 {
+            let responses = fixture.server.handle(
+                &json!({"jsonrpc": "2.0", "id": 4, "method": "tasks/get",
+                        "params": {"taskId": task_id}})
+                .to_string(),
+                &mut no_elicit(),
+            );
+            let got: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+            status = got["result"]["status"]
+                .as_str()
+                .expect("status")
+                .to_string();
+            if status == "completed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(status, "completed");
+
+        // tasks/result：底层请求的结果 + related-task 元数据。
+        let responses = fixture.server.handle(
+            &json!({"jsonrpc": "2.0", "id": 5, "method": "tasks/result",
+                    "params": {"taskId": task_id}})
+            .to_string(),
+            &mut no_elicit(),
+        );
+        let result: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        assert_eq!(
+            result["result"]["structuredContent"]["success"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["result"]["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
+            task_id.as_str(),
+            "{result}"
+        );
+        let audit = fixture.audit_text();
+        assert!(audit.contains("\"decision\":\"created\""));
+        assert!(audit.contains("\"decision\":\"completed\""));
+        assert!(audit.contains(&format!("\"task_id\":\"{task_id}\"")));
+        cleanup(&fixture);
+    }
+
+    /// 2025-06-18 客户端：task 字段按普通请求处理（规范：未声明能力时忽略
+    /// 任务增强元数据），响应是普通 CallToolResult；tasks/get 是未知方法。
+    #[test]
+    fn a_2025_06_18_client_gets_task_fields_ignored() {
+        let mut fixture = Fixture::new(vec![tool("test:echo", false)], config(""));
+        initialize(&mut fixture.server, false);
+        let line = json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {
+                "name": "toolbox_test_echo",
+                "arguments": {"text": "同步"},
+                "task": {"ttl": 60000},
+            }
+        });
+        let responses = fixture.server.handle(&line.to_string(), &mut no_elicit());
+        let called: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        assert_eq!(called["result"]["isError"], false, "{called}");
+        assert!(
+            called["result"].get("task").is_none(),
+            "同步路径不该有 task 字段：{called}"
+        );
+        assert_eq!(called["result"]["structuredContent"]["success"], true);
+
+        let responses = fixture.server.handle(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tasks/get","params":{"taskId":"x"}}"#,
+            &mut no_elicit(),
+        );
+        let unknown: Value = serde_json::from_str(&responses[0]).expect("合法 JSON");
+        assert_eq!(unknown["error"]["code"], -32601);
         cleanup(&fixture);
     }
 

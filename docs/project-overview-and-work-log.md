@@ -180,6 +180,78 @@ Toolbox Hub 是一个面向 Linux 命令行工具的统一入口，提供 TUI �
 
 ## 验证记录
 
+### 2026-11-07（P4-01 + P4-03：MCP Tasks 与实时进度，上一批「未做」全部交付）
+
+按上一条记录的实施要点执行，白名单不变（src/mcp、src/service、src/security，未触碰
+app/、ui/、ecosystem.rs、registry/、scripts/）。协议事实来源
+modelcontextprotocol.io/specification/2025-11-25（basic/utilities/tasks、/basic/lifecycle、
+/server/tools），实现前对官方页面做了二次核对，两处比上批调研摘要更精确：`tasks/get`
+是**非阻塞轮询**（阻塞到终态是 `tasks/result` 的规范要求）；get/cancel/list 的结果
+**不带** related-task 元数据（taskId 已在响应结构里，只有 `tasks/result` 的响应必须带）。
+
+交付：
+
+- **P4-01 MCP Tasks**（新增 `mcp/tasks.rs`，server.rs 接入）：
+  - TaskManager：BTreeMap 任务表 + Condvar（tasks/result 阻塞等待与退出清理共用）+
+    出站通知队列 + 与同步调用共享的 limiter Arc；`begin` 带 purge 过期（ttl 自创建起算，
+    只对终态生效，运行中的任务必须留住取消把手）与表上限 256（满则先逐出最老终态）；
+    taskId 用 /dev/urandom 生成 128 位熵的 32 字符十六进制串（规范：无授权上下文必须
+    加密安全随机，防猜测）。
+  - `tools/call` params 带 task 字段：建任务 → 确认门槛**同步**走既有 elicitation
+    （请求带 `io.modelcontextprotocol/related-task` 元数据，拒绝审计带 task_id）→
+    全部拒绝路径在起子进程之前，拒绝即任务转 failed（结果就是同步路径那条 isError
+    CallToolResult）→ 通过则起后台线程：`ToolCatalog::new(vec![工具副本])` + 共享
+    limiter 走完整 `ToolGateway` 流水线（授权、名额、执行、限额、审计全复用），并立即回
+    `CreateTaskResult{task:{taskId,status:"working",createdAt,lastUpdatedAt,ttl,pollInterval}}`。
+  - `tasks/get`：非阻塞回当前状态，未知 / 已过期清理回 -32602；`tasks/result`：阻塞到
+    终态，回底层请求本该返回的结果并必带 related-task 元数据；`tasks/cancel`：响应前转
+    cancelled 终态 + 置共享 `Arc<AtomicBool>`，执行器 pump 循环见旗标即走既有
+    terminate()（进程组 SIGTERM，2s 宽限后不肯退再 SIGKILL，与超时路径同一套先礼后兵），
+    终态不可再变，终态再取消回 -32602。
+  - 能力声明：`capabilities.tasks = {cancel:{}, requests:{tools:{call:{}}}}`；
+    `tasks.list` 按规范安全建议不声明（stdio 无法识别请求方）；tools/list 每件工具带
+    `execution.taskSupport: "optional"`。
+  - 退出清理：stdio 断开后全部运行中任务置取消旗标并转 cancelled（逐条记审计），
+    等终态上限 8 秒再退出，无孤儿进程（集成测试用脚本拉起的孙子进程 pid 验证）。
+- **协商双版本**（ADR-001 修订，见该文档）：客户端请求 2025-11-25 / 2026-07-28 →
+  回 2025-11-25 并开放 Tasks；请求 2025-06-18（或更老 / 未知）→ 维持 2025-06-18 现状，
+  task 字段按规范忽略，tasks/* 回 -32601。集成测试
+  `server_negotiates_to_the_version_it_implements` 同步更新。
+- **P4-03 实时进度**：`service/execution.rs` 加进度钩子，pump 循环 1 秒节流回调
+  `ExecutionProgress{elapsed_ms, message}`（ffmpeg 类 `JobEvent::Progress` 键值取最新值作
+  阶段信息），取消旗标在循环顶部检查；`ToolGateway::call_with_hooks` 把钩子从服务端
+  穿透到执行器，`call()` 原样委托，同步路径行为零变化。任务线程把同一份信息写进
+  Task 的 `statusMessage`、审计 progress 条目（统一进度数据
+  `TaskProgress{job_id,status,progress,message}`，current/total 无真实总量依据恒缺省）
+  与 `notifications/progress`（客户端在 `_meta.progressToken` 索要过才发；progress 计数
+  单调递增，计数递增与通知入队同锁保证顺序；无真实总量不给 total、不伪造百分比）。
+- **审计**：任务生命周期链 created → progress → completed / cancelled 全部经
+  `Auditor::with_task_tag` 副本自动携带 task_id（网关的 completed / denied 也在内，
+  P4-05 的机制本批真正用上）；纪律不变，只记元数据与脱敏摘要。
+
+验证：
+
+- `cargo fmt --check` 通过；`clippy --all-targets`（`--all-features` 与
+  `--no-default-features` 两套，`-D warnings`）通过。
+- `cargo test --all-features` **693 passed / 16 ignored**（上批 670 + 新增 23：tasks 10、
+  protocol 2、execution 2、gateway 2、server 3、集成 4）；
+  `cargo test --locked --no-default-features` **687 passed / 16 ignored**（664 + 23）。
+- `cargo +1.90.0 build --locked`（MSRV）通过。
+- `check registry/` 85 项（featured 1 警告为存量）、`recipe check registry/featured` 35 条、
+  `python3 registry/build-featured.py --check`（35 条 / SHA-256）通过。
+- 集成测试（真实子进程对话）覆盖：创建 / 进度 / 完成 / 取消 / 终态再取消拒绝 /
+  无孤儿（慢脚本 marker pid 文件验证进程组被收掉）/ 并发拒绝（max_concurrent=1 时
+  后台任务占满后同步调用 busy）/ 进度形状（无 total、无百分比、单调递增）/
+  协商双版本 / 2025-06-18 客户端下 task 字段被忽略。
+
+未做（记在这里，下批接手）：
+
+- 热更新的真实子进程集成测试（现有覆盖：指纹/信箱/watcher 真线程/服务端换入快照
+  四组单元测试；集成版要给 `Server` 助手加读取线程才能收 `list_changed` 通知）。
+- `mcp.toml` 模板补一段 max_concurrent 对后台任务同样生效的注释（模板已在 P2 有
+  max_concurrent = 2，语义未变，不改文件）。
+- `notifications/tasks/status` 状态变更通知（规范标可选；轮询模型已覆盖，本批未加）。
+
 ### 2026-11-07（P4：MCP 并发预算共享 / 工具目录热更新 / 任务生命周期审计 —— Tasks 调研完成、实现留待下批）
 
 按计划书 P4 与 [`p0-baseline-audit.md`](p0-baseline-audit.md) §9 白名单执行（src/mcp、src/service、
@@ -264,10 +336,10 @@ P4-01 + P4-03 实施要点（已设计，未写码）：
 
 未做（记在这里，下批接手）：
 
-- P4-01 MCP Tasks 全部协议面（调研与设计已完成，见上）。
-- P4-03 实时进度通知（依赖 P4-01 的后台执行；同步调用在响应前无法排通知，
-  统一进度数据结构已定为 `TaskProgress{job_id,status,progress,current,total,message}`，
-  progress/current/total 仅在有真实总量依据时给值）。
+- P4-01 MCP Tasks 全部协议面、P4-03 实时进度通知：已在同日的下一批交付（见上一条
+  记录），实施要点按本条原样落地；协议细节二次核对有两处按规范精确化（tasks/get
+  是非阻塞轮询、其结果不带 related-task，阻塞与 related-task 元数据是 tasks/result
+  的要求）。
 - 热更新的真实子进程集成测试（现有覆盖：指纹/信箱/watcher 真线程/服务端换入快照
   四组单元测试；集成版要给 `Server` 助手加读取线程才能收 `list_changed` 通知）。
 - `mcp.toml` 模板补一段 max_concurrent 对后台任务同样生效的注释（模板已在 P2 有

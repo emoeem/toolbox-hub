@@ -12,8 +12,13 @@
 //! 两条路都只传 argv、都不经 shell、都不占用终端。
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::mpsc::RecvTimeoutError,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::RecvTimeoutError,
+    },
     time::{Duration, Instant},
 };
 
@@ -39,6 +44,24 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 const KILL_GRACE: Duration = Duration::from_secs(1);
 /// 轮询事件通道的间隔：够短（取消/超时反应快），又不烧 CPU。
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// P4-03 进度上报的节流间隔：1 秒一条，够实时又不刷屏。
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 一次执行过程中的进度快照（P4-03）。
+///
+/// 服务端拿它去发 `notifications/progress` 与更新 Task 的 `statusMessage`。
+/// 这里没有、也不该有「百分比」：`elapsed_ms` 是真实耗时，`message` 是
+/// 阶段信息（ffmpeg 类工具的结构化进度键值），总量未知就不编。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProgress {
+    /// 自执行开始的毫秒数。
+    pub elapsed_ms: u64,
+    /// 给人看的阶段信息（无结构化进度时是「运行中」）。
+    pub message: String,
+}
+
+/// 进度回调。1 秒节流一次，在执行器的事件循环里同步调用。
+pub type ProgressHook<'a> = &'a mut dyn FnMut(ExecutionProgress);
 
 /// 一次执行请求。
 ///
@@ -145,6 +168,21 @@ fn merge_defaults(action: &crate::model::Action, values: &TypedValues) -> TypedV
 
 /// 执行一次请求。阻塞到进程结束、超时或通道断开。
 pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, ServiceError> {
+    execute_with_hooks(request, None, &mut |_| {})
+}
+
+/// 带取消旗标与进度钩子的执行（P4-01 / P4-03）。
+///
+/// * `cancel`：外部（`tasks/cancel`）持有的共享旗标。事件循环每轮（50ms）在
+///   顶部检查：见旗标即走既有的 `terminate()`（进程组 SIGTERM），SIGTERM 后
+///   `TERM_GRACE` 还不肯退就 `cancel()`（SIGKILL）—— 与超时路径同一套「先礼
+///   后兵」，被杀的进程组里不含孤儿。
+/// * `on_progress`：1 秒节流的进度回调；没有结构化进度时也按时上报耗时。
+pub fn execute_with_hooks(
+    request: &ExecutionRequest,
+    cancel: Option<&Arc<AtomicBool>>,
+    on_progress: ProgressHook<'_>,
+) -> Result<ExecutionResult, ServiceError> {
     let job = spawn_captured(
         &request.program,
         &request.argv,
@@ -155,19 +193,28 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, ServiceErr
 
     let started = Instant::now();
     let deadline = request.timeout.map(|timeout| started + timeout);
+    let mut hook = PumpHook {
+        cancel,
+        on_progress,
+        started,
+        next_emit: started + PROGRESS_INTERVAL,
+        stage: BTreeMap::new(),
+        terminated_at: None,
+        killed: false,
+    };
 
-    if let Some(captured) = pump(&job, deadline)? {
+    if let Some(captured) = pump(&job, deadline, &mut hook)? {
         return Ok(result_from(captured, request, false));
     }
 
     // 超时：先 SIGTERM（脚本/ffmpeg 有机会把输出文件收尾），再 SIGKILL。
     job.terminate();
-    if let Some(captured) = pump(&job, Some(Instant::now() + TERM_GRACE))? {
+    if let Some(captured) = pump(&job, Some(Instant::now() + TERM_GRACE), &mut hook)? {
         return Ok(result_from(captured, request, true));
     }
 
     job.cancel();
-    if let Some(captured) = pump(&job, Some(Instant::now() + KILL_GRACE))? {
+    if let Some(captured) = pump(&job, Some(Instant::now() + KILL_GRACE), &mut hook)? {
         return Ok(result_from(captured, request, true));
     }
 
@@ -177,12 +224,61 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, ServiceErr
     )))
 }
 
+/// 事件循环期间要携带的可变状态：取消旗标、进度节流、阶段信息。
+struct PumpHook<'a> {
+    cancel: Option<&'a Arc<AtomicBool>>,
+    on_progress: ProgressHook<'a>,
+    started: Instant,
+    /// 下一次允许发进度的时间点。
+    next_emit: Instant,
+    /// ffmpeg 类 `JobEvent::Progress` 的最新键值（同键覆盖）。
+    stage: BTreeMap<String, String>,
+    /// 首次见到取消旗标并发出 SIGTERM 的时刻；`None` = 还没见过旗标。
+    terminated_at: Option<Instant>,
+    /// 已经升级到 SIGKILL。
+    killed: bool,
+}
+
 /// 收事件，直到 `Done` 或 `deadline` 到点。
 ///
 /// `Ok(None)` 表示超时；`Ok(Some(captured))` 表示正常收尾。
 /// 到点时先做一次零等待的 `recv_timeout`：刚好压在截止时间上的 `Done` 不该被丢掉。
-fn pump(job: &RunningJob, deadline: Option<Instant>) -> Result<Option<Captured>, ServiceError> {
+///
+/// 每轮循环顶部（P4-01）先看取消旗标，再看进度节流（P4-03）。
+fn pump(
+    job: &RunningJob,
+    deadline: Option<Instant>,
+    hook: &mut PumpHook<'_>,
+) -> Result<Option<Captured>, ServiceError> {
     loop {
+        // 取消：见旗标先 SIGTERM 整个进程组，宽限期过了还活着就 SIGKILL。
+        if let Some(flag) = hook.cancel
+            && flag.load(Ordering::SeqCst)
+        {
+            if hook.terminated_at.is_none() {
+                job.terminate();
+                hook.terminated_at = Some(Instant::now());
+            } else if !hook.killed
+                && hook
+                    .terminated_at
+                    .is_some_and(|at| at.elapsed() >= TERM_GRACE)
+            {
+                job.cancel();
+                hook.killed = true;
+            }
+        }
+
+        // 进度：1 秒节流；阶段信息来自执行器吐的结构化进度键值（同键取最新）。
+        let now = Instant::now();
+        if now >= hook.next_emit {
+            hook.next_emit = now + PROGRESS_INTERVAL;
+            let message = progress_message(&hook.stage);
+            (hook.on_progress)(ExecutionProgress {
+                elapsed_ms: hook.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                message,
+            });
+        }
+
         let wait = match deadline {
             Some(deadline) => {
                 let now = Instant::now();
@@ -197,6 +293,9 @@ fn pump(job: &RunningJob, deadline: Option<Instant>) -> Result<Option<Captured>,
 
         match job.events.recv_timeout(wait) {
             Ok(JobEvent::Done(captured)) => return Ok(Some(*captured)),
+            Ok(JobEvent::Progress { key, value }) => {
+                hook.stage.insert(key, value);
+            }
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -210,6 +309,18 @@ fn pump(job: &RunningJob, deadline: Option<Instant>) -> Result<Option<Captured>,
             }
         }
     }
+}
+
+/// 进度消息：只有耗时与真实拿到的阶段键值，不编百分比。
+fn progress_message(stage: &BTreeMap<String, String>) -> String {
+    if stage.is_empty() {
+        return String::from("运行中");
+    }
+    let pairs: Vec<String> = stage
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    format!("运行中 · {}", pairs.join(" "))
 }
 
 /// 生成「给人/给 AI 看」的命令摘要：敏感值换成 `***`。
@@ -474,5 +585,74 @@ mod tests {
         .expect_err("必填项没给");
         assert_eq!(error.kind(), "invalid_arguments");
         assert!(error.to_string().contains("必填项"), "{error}");
+    }
+
+    /// P4-03：进度钩子按 1 秒节流；消息只有耗时与阶段键值，没有百分比可编。
+    #[test]
+    fn progress_hooks_fire_throttled_with_stage_info_but_no_percentage() {
+        let ticks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&ticks);
+        let request = shell(
+            &[
+                "-c",
+                "echo frame=7; echo out_time=00:00:02; sleep 1.4; echo done",
+            ],
+            vec![0],
+            None,
+        );
+        let result = super::execute_with_hooks(&request, None, &mut |progress| {
+            sink.lock().expect("锁").push(progress);
+        })
+        .expect("执行");
+        assert!(result.success);
+
+        let ticks = ticks.lock().expect("锁").clone();
+        assert!(!ticks.is_empty(), "1.4 秒的进程至少有一条进度：{ticks:?}");
+        // 节流：两条相邻上报至少隔 ~1 秒。
+        for pair in ticks.windows(2) {
+            assert!(
+                pair[1].elapsed_ms.saturating_sub(pair[0].elapsed_ms) >= 900,
+                "进度要按 1 秒节流：{ticks:?}"
+            );
+        }
+        // 阶段信息：ffmpeg 类键值进了 message；没有 total / 百分比。
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| tick.message.contains("out_time=00:00:02")),
+            "阶段键值要出现在 message：{ticks:?}"
+        );
+        for tick in &ticks {
+            assert!(
+                !tick.message.contains('%'),
+                "不伪造百分比：{}",
+                tick.message
+            );
+            assert!(tick.elapsed_ms > 0);
+        }
+    }
+
+    /// P4-01：外部取消旗标一立，执行循环立刻走 terminate()，结果标为
+    /// cancelled，进程组被带走，不会等到超时。
+    #[test]
+    fn an_external_cancel_flag_terminates_the_run_promptly() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let request = shell(&["-c", "sleep 30"], vec![0], None);
+        let started = std::time::Instant::now();
+        // 起一个线程稍后立旗标（模拟 tasks/cancel 在执行中途到达）。
+        let setter = std::sync::Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            setter.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let result = super::execute_with_hooks(&request, Some(&flag), &mut |_| {}).expect("执行");
+        assert!(result.cancelled, "要标成被取消：{:?}", result.summary());
+        assert!(!result.success);
+        assert!(!result.timed_out, "取消不是超时：{:?}", result.summary());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "旗标生效要远早于 30 秒：{:?}",
+            started.elapsed()
+        );
     }
 }

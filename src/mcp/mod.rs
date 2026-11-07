@@ -23,10 +23,11 @@
 //!
 //! | 文件 | 职责 |
 //! | --- | --- |
-//! | [`protocol`] | JSON-RPC 行协议（解析、响应、错误码） |
+//! | [`protocol`] | JSON-RPC 行协议（解析、响应、错误码、版本协商） |
 //! | [`names`] | 内部 id → MCP 工具名（规范化 + 撞名消解） |
 //! | [`schema`] | 参数 Schema 生成与 JSON 取值转换 |
 //! | [`server`] | 消息分派、确认门槛、结果组装 |
+//! | [`tasks`] | MCP Tasks 任务表与后台执行（2025-11-25，P4-01） |
 //! | [`reload`] | `tools.d/` / `tools/` / `mcp.toml` 热更新（mtime 轮询，P4-04） |
 
 pub mod names;
@@ -34,6 +35,7 @@ pub mod protocol;
 pub mod reload;
 pub mod schema;
 pub mod server;
+pub mod tasks;
 
 use std::io::{self, BufRead, Write};
 
@@ -131,6 +133,10 @@ fn run_stdio() -> io::Result<()> {
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
+            // P4-01 退出清理：客户端断开后，运行中的后台任务全部置取消旗标
+            // （进程组 SIGTERM → 2s 宽限 → SIGKILL），等它们到终态（上限 8 秒）
+            // 再退出，不留孤儿进程。
+            server.shutdown_tasks();
             break; // 客户端关了 stdin：正常退出。
         }
         let trimmed = line.trim();

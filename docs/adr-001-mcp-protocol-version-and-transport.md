@@ -1,6 +1,6 @@
 # ADR-001：MCP 协议版本与传输实现方式
 
-> 状态：Accepted | 日期：2026-11-07 | 关联：P0-08（基线审计遗留）、P3（stdio Server）
+> 状态：Accepted（2026-11-07 因 P4-01 MCP Tasks 修订协商策略） | 日期：2026-11-07 | 关联：P0-08（基线审计遗留）、P3（stdio Server）、P4-01/P4-03
 
 ## 背景
 
@@ -14,12 +14,13 @@ P0 审计（`p0-baseline-audit.md` §遗留）明确 P0-08 留待 P3 前补：�
 
 ## 决策
 
-1. **协议版本钉在 2025-06-18**，协商时永远回该版本。P3 所需面（initialize / tools/list / tools/call / elicitation 确认 / ping / notifications）在该版本内完整可用。
+1. **协议版本支持两个**：2025-06-18（基线）与 2025-11-25（Tasks）。协商规则：
+   - 客户端请求 **2025-11-25 或 2026-07-28** → 回 **2025-11-25**，开放 Tasks 能力（`capabilities.tasks = {cancel:{}, requests:{tools:{call:{}}}}`，`tasks.list` 按规范安全建议不声明），`tools/list` 带 `execution.taskSupport: "optional"`；
+   - 客户端请求 **2025-06-18**（或更老 / 未知版本）→ 回 **2025-06-18**，维持 P3 现状；这些连接里 task 字段按普通请求处理（规范：未声明能力时忽略任务增强元数据），tasks/* 方法回 -32601。
 2. **传输与协议层自研**（`src/mcp/protocol.rs` + `server.rs`，行分隔 JSON over stdio），不引入 `rmcp`。
 3. **升级触发条件**（满足其一即重开本 ADR）：
-   - P4 接入 MCP Tasks（Tasks 是 2025-11-25 起的规范能力，届时需把实现升级到该版本并扩展协商）；
    - P5-05 HTTP/SSE 传输立项（stdio 行协议的代码不适用）；
-   - 客户端生态普遍要求更高版本才可用。
+   - 客户端生态普遍要求 2026-07-28 语义才可用。
 
 ## 理由
 
@@ -30,10 +31,12 @@ P0 审计（`p0-baseline-audit.md` §遗留）明确 P0-08 留待 P3 前补：�
 ## 后果
 
 - 必须自行跟踪规范修订（见上面升级触发条件），不能依赖 SDK 升级带来兼容。
-- 对请求 2025-11-25 / 2026-07-28 的客户端，服务端按规范降级协商到 2025-06-18（集成测试 `server_negotiates_to_the_version_it_implements` 覆盖）；这些客户端若不接受降级则连接失败，属预期行为。
-- Elicitation（确认流程）按 2025-06-18 语义实现；若升级到 2025-11-25+，需核对确认相关字段是否有破坏性变更。
+- 请求 2026-07-28 的客户端被协商到 2025-11-25（其 Tasks 语义与 2025-11-25 兼容）；本服务端未实现的 2026-07-28 新语义不声明、不回应，属规范允许的协商行为。集成测试 `server_negotiates_to_the_version_it_implements` 覆盖双版本协商。
+- Elicitation（确认流程）按 2025-06-18 语义实现；实现 2025-11-25 时已核对确认相关字段无破坏性变更（新增的是本服务端不用的 url 模式）。Tasks 相关消息（确认用 elicitation）按规范带 related-task 元数据。
+- Tasks（2025-11-25）当前是实验性能力：若后续版本改动其行为，`src/mcp/tasks.rs` 是唯一需要跟改的实现点。
 
 ## 参考
 
-- 规范版本历史：modelcontextprotocol.io/specification（2025-06-18 与 2026-07-28 页面）
+- 规范版本历史：modelcontextprotocol.io/specification（2025-06-18、2025-11-25 与 2026-07-28 页面）
+- Tasks 协议面：modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks
 - 官方 Rust SDK：github.com/modelcontextprotocol/rust-sdk

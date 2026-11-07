@@ -14,7 +14,10 @@
 
 use std::{
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use crate::{
@@ -27,7 +30,7 @@ use crate::{
     service::{
         catalog::ToolCatalog,
         error::ServiceError,
-        execution::{ExecutionRequest, execute},
+        execution::{ExecutionRequest, ProgressHook, execute_with_hooks},
         result::ExecutionResult,
     },
 };
@@ -80,6 +83,19 @@ impl<'a> ToolGateway<'a> {
         values: &TypedValues,
         cwd: &Path,
     ) -> Result<ExecutionResult, ServiceError> {
+        self.call_with_hooks(id, values, cwd, None, &mut |_| {})
+    }
+
+    /// 带取消旗标与进度钩子的调用（P4-01 / P4-03）：授权、名额、输出限额、
+    /// 审计与 [`Self::call`] 完全一致，只是把两个钩子穿透到执行器。
+    pub fn call_with_hooks(
+        &self,
+        id: &str,
+        values: &TypedValues,
+        cwd: &Path,
+        cancel: Option<&Arc<AtomicBool>>,
+        on_progress: ProgressHook<'_>,
+    ) -> Result<ExecutionResult, ServiceError> {
         let Some(tool) = self.catalog.get(id) else {
             return Err(ServiceError::UnknownTool(id.to_string()));
         };
@@ -117,7 +133,7 @@ impl<'a> ToolGateway<'a> {
             )
         })?;
 
-        let mut result = execute(&request)?;
+        let mut result = execute_with_hooks(&request, cancel, on_progress)?;
         limit_output(&mut result, authorization.max_output_bytes);
         self.auditor.completed(
             id,
@@ -523,6 +539,76 @@ mod tests {
         assert_eq!(limiter.max(), 2);
         let _second = limiter.acquire().expect("上限放宽后有名额");
         assert_eq!(limiter.active(), 2);
+    }
+
+    /// 一件真正跑 `/bin/sleep <text>` 的工具（穿透测试用）。
+    fn sleeper() -> ToolDefinition {
+        let mut tool = tool("test:echo", false);
+        let action = tool.action.as_mut().expect("action");
+        action.program = String::from("sleep");
+        tool.path = PathBuf::from("/bin/sleep");
+        tool
+    }
+
+    /// P4-01：取消旗标从网关穿透到执行器 —— 名额、审计等流水线行为不变。
+    #[test]
+    fn call_with_hooks_passes_the_cancel_flag_through_the_pipeline() {
+        let fixture = Fixture::new(vec![sleeper()], config(""));
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let mut values = TypedValues::new();
+        values.set_text("text", "30");
+        let result = fixture
+            .gateway()
+            .call_with_hooks(
+                "test:echo",
+                &values,
+                Path::new("/tmp"),
+                Some(&flag),
+                &mut |_| {},
+            )
+            .expect("旗标已立：执行立刻被取消");
+
+        assert!(result.cancelled, "{:?}", result.summary());
+        assert!(!result.success);
+        assert!(
+            fixture.audit_text().contains("\"decision\":\"completed\""),
+            "取消也是一次完成记录（被取消的结果）"
+        );
+        cleanup(&fixture);
+    }
+
+    /// P4-03：进度钩子从网关穿透到执行器（1 秒节流下，慢任务至少一条）。
+    #[test]
+    fn call_with_hooks_passes_progress_through_the_pipeline() {
+        let fixture = Fixture::new(vec![sleeper()], config(""));
+        let mut ticks = Vec::new();
+
+        let mut values = TypedValues::new();
+        values.set_text("text", "1.4");
+        let result = fixture
+            .gateway()
+            .call_with_hooks(
+                "test:echo",
+                &values,
+                Path::new("/tmp"),
+                None,
+                &mut |progress: crate::service::execution::ExecutionProgress| {
+                    ticks.push(progress);
+                },
+            )
+            .expect("执行");
+
+        assert!(result.success, "{:?}", result.summary());
+        assert!(!ticks.is_empty(), "进度钩子要被调用过：{ticks:?}");
+        for tick in &ticks {
+            assert!(
+                !tick.message.contains('%'),
+                "不伪造百分比：{}",
+                tick.message
+            );
+        }
+        cleanup(&fixture);
     }
 
     #[test]
