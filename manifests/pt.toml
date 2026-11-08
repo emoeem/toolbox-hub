@@ -1,0 +1,234 @@
+# 渗透测试域：常用侦察与扫描动作（单程序封装，参数经 Schema 校验）。
+#
+# 安全口径：
+# - 所有动作都会主动访问目标网络，effects 均含 network_access，经 MCP 调用时
+#   需要客户端支持确认（elicitation），由使用者在每次调用前确认目标与范围。
+# - 重扫描类（端口 / 服务 / 漏洞 / 目录爆破）danger = caution：TUI 里多一次确认。
+# - 仅对**已授权**的目标使用；engagement 范围以外一律不要运行。
+#
+# 下面 mcp 声明同样只是「作者声明」，真正暴露还要 ~/.config/toolbox-hub/mcp.toml 放行。
+
+[[action]]
+id = "subdomain-enum"
+name = "子域枚举（被动）"
+summary = "subfinder 被动收集目标域的子域"
+domain = "网络"
+tags = ["渗透", "侦察", "子域"]
+program = "subfinder"
+base_argv = ["-d"]
+mode = "capture"
+danger = "safe"
+install = "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+input = "目标主域"
+output = "子域列表（每行一个）"
+mcp = { enabled = true, name = "pt_subdomain_enum", description = "subfinder 被动枚举目标域的子域（仅 DNS 数据源，不主动探测）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "domain"
+label = "目标主域（example.com）"
+kind = "text"
+required = true
+help = "只填主域，不带协议与路径"
+
+[[action]]
+id = "dns-records"
+name = "DNS 记录查询"
+summary = "查询域名的 A / AAAA / MX / NS / TXT / CNAME 记录"
+domain = "网络"
+tags = ["渗透", "侦察", "dns"]
+program = "dig"
+mode = "capture"
+danger = "safe"
+install = "自带（bind）"
+input = "域名 + 记录类型"
+output = "DNS 应答记录"
+mcp = { enabled = true, name = "pt_dns_records", description = "dig 查询域名 DNS 记录（类型可选）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "domain"
+label = "域名"
+kind = "text"
+required = true
+
+[[action.argument]]
+key = "rtype"
+label = "记录类型"
+kind = "choice"
+choices = [
+      { label = "A（IPv4）", value = "A" },
+      { label = "AAAA（IPv6）", value = "AAAA" },
+      { label = "MX（邮件）", value = "MX" },
+      { label = "NS（域名服务器）", value = "NS" },
+      { label = "TXT（文本）", value = "TXT" },
+      { label = "CNAME", value = "CNAME" },
+      { label = "SOA", value = "SOA" },
+      { label = "ANY（全部）", value = "ANY" },
+    ]
+default = "A"
+
+[[action]]
+id = "http-probe"
+name = "HTTP 探活"
+summary = "httpx 探测目标 Web 服务：状态码、标题、技术栈、CDN"
+domain = "网络"
+tags = ["渗透", "探测", "httpx"]
+program = "httpx"
+base_argv = ["-silent", "-title", "-tech-detect", "-status-code", "-cdn", "-web-server"]
+mode = "capture"
+danger = "safe"
+install = "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
+input = "URL 或主机"
+output = "探活结果表"
+mcp = { enabled = true, name = "pt_http_probe", description = "httpx 探测目标 Web 服务（状态码/标题/技术栈/CDN）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "target"
+label = "目标（host 或 URL）"
+kind = "text"
+required = true
+help = "单个目标；批量请走 TUI 传文件"
+
+[[action]]
+id = "port-scan-top"
+name = "端口扫描（Top 1000）"
+summary = "naabu 快速扫描常见 1000 端口"
+domain = "网络"
+tags = ["渗透", "端口", "naabu"]
+program = "naabu"
+base_argv = ["-top-ports", "1000", "-silent"]
+mode = "capture"
+danger = "caution"
+install = "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+input = "主机（IP 或域名）"
+output = "开放端口列表"
+mcp = { enabled = true, name = "pt_port_scan_top", description = "naabu 扫描目标常见 1000 个端口（需确认）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "host"
+label = "目标主机"
+kind = "text"
+required = true
+
+[[action]]
+id = "service-scan"
+name = "服务识别（nmap）"
+summary = "nmap 对最常见 100 端口做服务与版本识别"
+domain = "网络"
+tags = ["渗透", "端口", "nmap"]
+program = "nmap"
+base_argv = ["-sV", "--top-ports", "100", "--open"]
+mode = "capture"
+danger = "caution"
+install = "sudo pacman -S nmap"
+input = "主机（IP 或域名）"
+output = "端口 / 服务 / 版本"
+mcp = { enabled = true, name = "pt_service_scan", description = "nmap 服务与版本识别（top 100 端口，需确认）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "host"
+label = "目标主机"
+kind = "text"
+required = true
+
+[[action]]
+id = "nuclei-scan"
+name = "漏洞模板扫描（nuclei）"
+summary = "nuclei 按严重度过滤跑模板扫描"
+domain = "网络"
+tags = ["渗透", "漏洞", "nuclei"]
+program = "nuclei"
+base_argv = ["-silent", "-nc"]
+mode = "capture"
+danger = "caution"
+install = "go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest"
+input = "URL + 严重度过滤"
+output = "命中的漏洞发现"
+mcp = { enabled = true, name = "pt_nuclei_scan", description = "nuclei 模板漏洞扫描（按严重度过滤，需确认）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "target"
+label = "目标 URL"
+kind = "text"
+required = true
+help = "例如 https://example.com"
+
+[[action.argument]]
+key = "severity"
+label = "严重度过滤"
+kind = "choice"
+choices = [
+      { label = "仅 critical", value = "critical" },
+      { label = "critical + high", value = "critical,high" },
+      { label = "medium 及以上（默认）", value = "medium,high,critical" },
+      { label = "全部（含 low/info）", value = "low,medium,high,critical" },
+    ]
+default = "medium,high,critical"
+
+[[action]]
+id = "dir-fuzz"
+name = "目录发现（feroxbuster）"
+summary = "feroxbuster 递归目录与文件爆破（深度可调）"
+domain = "网络"
+tags = ["渗透", "目录", "feroxbuster"]
+program = "feroxbuster"
+base_argv = ["-s", "200,204,301,302,307,401,403"]
+mode = "capture"
+danger = "caution"
+install = "cargo install feroxbuster 或 pacman -S feroxbuster"
+input = "基础 URL + 深度"
+output = "发现的路径"
+mcp = { enabled = true, name = "pt_dir_fuzz", description = "feroxbuster 目录发现（需确认；仅对授权目标使用）", effects = { network_access = true } }
+
+[[action.argument]]
+key = "url"
+label = "基础 URL"
+kind = "text"
+required = true
+help = "例如 https://example.com"
+
+[[action.argument]]
+key = "depth"
+label = "递归深度"
+kind = "text"
+default = "2"
+
+[[action]]
+id = "tech-fingerprint"
+name = "Web 指纹识别"
+summary = "whatweb 识别目标的技术栈与框架"
+domain = "网络"
+tags = ["渗透", "指纹", "whatweb"]
+program = "whatweb"
+base_argv = ["-a", "3", "--color=never"]
+mode = "capture"
+danger = "safe"
+install = "sudo pacman -S whatweb 或 gem install whatweb"
+input = "URL 或主机"
+output = "技术栈指纹"
+mcp = { enabled = true, name = "pt_tech_fingerprint", description = "whatweb 识别目标技术栈与框架", effects = { network_access = true } }
+
+[[action.argument]]
+key = "target"
+label = "目标（host 或 URL）"
+kind = "text"
+required = true
+
+[[action]]
+id = "waf-detect"
+name = "WAF 检测"
+summary = "wafw00f 探测目标前置的 WAF 产品"
+domain = "网络"
+tags = ["渗透", "waf"]
+program = "wafw00f"
+mode = "capture"
+danger = "safe"
+install = "pip install wafw00f"
+input = "URL"
+output = "WAF 识别结果"
+mcp = { enabled = true, name = "pt_waf_detect", description = "wafw00f 探测目标是否存在 WAF", effects = { network_access = true } }
+
+[[action.argument]]
+key = "target"
+label = "目标 URL"
+kind = "text"
+required = true

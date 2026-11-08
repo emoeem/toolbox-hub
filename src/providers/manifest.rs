@@ -50,6 +50,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ),
     ("pandoc.toml", include_str!("../../manifests/pandoc.toml")),
     ("jq.toml", include_str!("../../manifests/jq.toml")),
+        ("pt.toml", include_str!("../../manifests/pt.toml")),
     ("7zip.toml", include_str!("../../manifests/7zip.toml")),
     ("aria2c.toml", include_str!("../../manifests/aria2c.toml")),
     ("ffmpeg.toml", include_str!("../../manifests/ffmpeg.toml")),
@@ -177,7 +178,7 @@ impl ManifestProvider {
         let parsed: ManifestFile = match toml::from_str(text) {
             Ok(parsed) => parsed,
             Err(error) => {
-                discovery.warnings.push(format!("{source}: {error}"));
+                        discovery.warnings.push(format!("{source}: {error}"));
                 return;
             }
         };
