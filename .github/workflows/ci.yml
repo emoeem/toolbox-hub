@@ -35,8 +35,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 装工具链
-        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa fish
+      # pacman 的公网镜像偶尔抖（实测：check job 曾因 fastly 镜像超时整条红，
+      # 代码没问题重跑就绿）—— 失败退避 10 秒重试，最多 3 次。
+      - name: 装工具链（镜像抖动时自动重试）
+        run: |
+          ok=false
+          for attempt in 1 2 3; do
+            if pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa fish; then
+              ok=true
+              break
+            fi
+            echo "::warning::pacman 第 ${attempt} 次失败（多半是镜像抖动），10 秒后重试"
+            sleep 10
+          done
+          [ "$ok" = true ] || { echo "::error::pacman 连续 3 次失败"; exit 1; }
         # chafa：ratatui-image 的**可选**图像后端。当前 feature 只用 crossterm
         # （chafa 的探测在 chafa-dyn / chafa-static 里被 cfg 掉，实测 ldd 里没有
         # libchafa），所以构建其实不需要它；这里仍装上是为了和 packaging/PKGBUILD
@@ -143,8 +155,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 系统依赖（libalpm / pkgconf / chafa）
-        run: pacman -Syu --noconfirm --needed base-devel git pkgconf chafa
+      - name: 系统依赖（libalpm / pkgconf / chafa；镜像抖动时自动重试）
+        run: |
+          ok=false
+          for attempt in 1 2 3; do
+            if pacman -Syu --noconfirm --needed base-devel git pkgconf chafa; then
+              ok=true
+              break
+            fi
+            echo "::warning::pacman 第 ${attempt} 次失败（多半是镜像抖动），10 秒后重试"
+            sleep 10
+          done
+          [ "$ok" = true ] || { echo "::error::pacman 连续 3 次失败"; exit 1; }
 
       - name: 装 MSRV 工具链（Cargo.toml 声明的 1.90）
         uses: dtolnay/rust-toolchain@1.90.0
@@ -174,12 +196,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 装工具链与冒烟要用到的 CLI
-        run: >-
-          pacman -Syu --noconfirm --needed
-          base-devel git rust pkgconf chafa
-          ffmpeg p7zip jq pandoc perl-image-exiftool imagemagick
-          fzf
+      - name: 装工具链与冒烟要用到的 CLI（镜像抖动时自动重试）
+        run: |
+          pkgs="base-devel git rust pkgconf chafa ffmpeg p7zip jq pandoc perl-image-exiftool imagemagick fzf"
+          ok=false
+          for attempt in 1 2 3; do
+            if pacman -Syu --noconfirm --needed $pkgs; then
+              ok=true
+              break
+            fi
+            echo "::warning::pacman 第 ${attempt} 次失败（多半是镜像抖动），10 秒后重试"
+            sleep 10
+          done
+          [ "$ok" = true ] || { echo "::error::pacman 连续 3 次失败"; exit 1; }
         # fzf：`smoke_search_both_sources` 里有「装了 fzf 就该标成已安装」这条断言，
         # 容器里必须真装着它 —— 否则那条断言测的是「没装」这件事，必红。
 
@@ -244,3 +273,26 @@ jobs:
         run: cargo build --locked --no-default-features
       - name: 无包管理功能测试
         run: cargo test --locked --no-default-features
+
+  # Windows / macOS 只跑核心版（libalpm、/proc、进程组这些是 Linux 的东西）。
+  # 目标是「这两个平台编得过、lint 干净」—— 测试不放进来：集成测试依赖
+  # /bin/sh、/proc 与进程组语义，那是另一档移植工作；manifest 动作跑的
+  # 外部命令在用户真机上照样验得到。clippy 不带 --all-targets：集成测试
+  # 文件里有 Unix 专属 API（PermissionsExt），Windows 上编不过属预期。
+  portability:
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 编译（核心版，无包管理功能）
+        run: cargo build --locked --no-default-features
+      - name: lint（警告即错误）
+        run: cargo clippy --no-default-features -- -D warnings

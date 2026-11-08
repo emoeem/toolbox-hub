@@ -33,15 +33,17 @@ git add packaging/minisign.pub && git commit -m "chore(release): 加上签名公
 
 ## 发布时发生了什么
 
-`release.yml` 的构建 job 在打包之后、上传之前：
+`release.yml` 的构建 job（六个目标：Linux 双架构核心版、Windows、macOS 双架构、
+Arch 容器里的全功能版）各自打包并算 `.sha256`；然后 **publish job 在 ubuntu 上集中签名**：
 
 1. 装 minisign；
 2. 没有 `MINISIGN_SECRET_KEY` 或仓库里没有 `packaging/minisign.pub` → **直接失败**；
 3. 把 secret 写进 `$RUNNER_TEMP` 的临时文件（`umask 077`，退出时 `trap` 删除）；
-4. 对每个 tarball 签名，签名里带一行 trusted comment：`toolbox-hub <版本> <仓库> <tag>`；
+4. 对每个产物（`*.tar.gz` 与 Windows 的 `*.zip`）签名，签名里带一行 trusted
+   comment：`toolbox-hub <版本> <仓库> <tag>`；
 5. **立刻用仓库里的公钥自验一遍** —— 签错了当场红，而不是等用户来报。
 
-产物一共三个：`*.tar.gz`、`*.tar.gz.sha256`、`*.tar.gz.minisig`。
+每个产物三个文件：archive 本体（`.tar.gz` / `.zip`）+ `.sha256` + `.minisig`。
 
 ## 用户怎么验
 

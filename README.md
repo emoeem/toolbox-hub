@@ -50,6 +50,27 @@ cargo build --release && ./target/release/toolbox-hub    # 更快
 
 可选：`toolbox-hub [脚本目录]`（默认 `$FZF_FFTOOLS_BIN_DIR`，再默认 `~/.local/bin`）。
 
+### 不装 Rust：直接下载现成的二进制
+
+每个版本（`v*` tag）在 [GitHub Releases](https://github.com/emoeem/toolbox-hub/releases) 里挂六个平台的产物，文件名后缀一目了然：
+
+| 文件后缀 | 适用 |
+| --- | --- |
+| `-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64（核心版） |
+| `-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64（核心版） |
+| `-x86_64-unknown-linux-gnu-arch.tar.gz` | **Arch Linux x86_64 全功能版**（链接 libalpm，包管理域可用） |
+| `-x86_64-pc-windows-msvc.zip` | Windows x86_64（核心版） |
+| `-x86_64-apple-darwin.tar.gz` | macOS Intel（核心版） |
+| `-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon（核心版） |
+
+下载后先验签再装（sha256 + minisign，公钥与验签脚本都在仓库 `packaging/` 下，raw 地址也能拿）：
+
+```bash
+bash packaging/verify-release.sh toolbox-hub-<版本>-<架构>.tar.gz
+```
+
+解压出来的 `toolbox-hub`（Windows 是 `toolbox-hub.exe`）放进 `PATH`（比如 `~/.local/bin`）。核心版没有包管理域 —— 那是 Arch + libalpm 的地盘，其余能力一样。
+
 ## 按键（进界面按 `?` 看全部）
 
 | 场景 | 键 |

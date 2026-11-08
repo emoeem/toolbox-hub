@@ -1,6 +1,6 @@
 [package]
 name = "toolbox-hub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # MSRV：实际依赖里要得最高的是 ratatui-image → icy_sixel → quantette 0.6 /
 # ordered-float 5.5（1.90）。edition 2024 本身只要 1.85，ratatui 0.30.2 要 1.88，

@@ -9,6 +9,10 @@ permissions:
   contents: write
 
 jobs:
+  # 核心版：--no-default-features，不链接 libalpm，谁都能跑（见 README「跑起来」）。
+  # Windows 产物打 zip，其余打 tar.gz；校验和随包生成，签名统一在 publish 里做 ——
+  # 六个产物逐个签一遍只需要一台机器，每个 runner 都装一遍 minisign 是多余的坑
+  # （windows 上连现成的 apt 包都没有）。
   build:
     strategy:
       fail-fast: false
@@ -18,6 +22,14 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          # 两个 macOS 目标都跑在 arm 机型上：x86_64 是同一套 clang 换 -arch，
+          # 不需要额外工具链。
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +37,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: 构建核心版（二进制不链接 libalpm）
         run: cargo build --locked --release --no-default-features --target ${{ matrix.target }}
       - name: 打包并计算 SHA-256
@@ -34,12 +48,88 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           name="toolbox-hub-${version}-${{ matrix.target }}"
           mkdir -p dist
-          install -Dm755 "target/${{ matrix.target }}/release/toolbox-hub" "dist/${name}/toolbox-hub"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            mkdir -p "dist/${name}"
+            cp "target/${{ matrix.target }}/release/toolbox-hub.exe" "dist/${name}/toolbox-hub.exe"
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${name}/toolbox-hub.exe' -DestinationPath 'dist/${name}.zip' -Force"
+            ext=zip
+          else
+            install -Dm755 "target/${{ matrix.target }}/release/toolbox-hub" "dist/${name}/toolbox-hub"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            ext=tar.gz
+          fi
           # 校验和里**只写文件名**（所以先 cd 进 dist）。写成 `dist/xxx.tar.gz` 的话，
           # 用户下载到本地后 `sha256sum -c` 会去找一个不存在的 dist/ 目录 —— 白白
           # 让人觉得文件坏了。
+          ( cd dist && sha256sum "${name}.${ext}" > "${name}.${ext}.sha256" )
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Arch 全功能版：默认 features，链接 libalpm（包管理域直连 pacman 数据库）。
+  # GitHub 托管 runner 没有 Arch 系机型，用 archlinux 容器装 rust 再编 ——
+  # 和 ci.yml 的 check job 同一个理由：ubuntu 上没有 libalpm，连编译都过不去。
+  # 只出 x86_64：aarch64 的 Arch 用户走 PKGBUILD/AUR 源码构建（packaging/）。
+  build-arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装工具链（镜像抖动时自动重试）
+        run: |
+          ok=false
+          for attempt in 1 2 3; do
+            if pacman -Syu --noconfirm --needed base-devel git rust pkgconf chafa; then
+              ok=true
+              break
+            fi
+            echo "::warning::pacman 第 ${attempt} 次失败（多半是镜像抖动），10 秒后重试"
+            sleep 10
+          done
+          [ "$ok" = true ] || { echo "::error::pacman 连续 3 次失败"; exit 1; }
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-arch-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 构建全功能版（默认 features，链接 libalpm）
+        run: cargo build --locked --release
+
+      - name: 打包并计算 SHA-256
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="toolbox-hub-${version}-x86_64-unknown-linux-gnu-arch"
+          mkdir -p dist
+          install -Dm755 "target/release/toolbox-hub" "dist/${name}/toolbox-hub"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-arch
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [build, build-arch]
+    runs-on: ubuntu-latest
+    steps:
+      # 签名要验回仓库里的公钥，checkout 一份进来。
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
 
       # Ubuntu 24.04 的 universe 里是 minisign 0.11（和上游 0.11 同版本）。
       - name: 装 minisign
@@ -59,7 +149,6 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          name="toolbox-hub-${version}-${{ matrix.target }}"
 
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
             echo "::error::没有配置 MINISIGN_SECRET_KEY —— 拒绝发布未签名的产物。见 packaging/release-signing.md"
@@ -75,28 +164,17 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
           trap 'rm -f "$key"' EXIT
 
-          minisign -S -W -s "$key" -m "dist/${name}.tar.gz" \
-            -t "toolbox-hub ${version} ${{ github.repository }} ${GITHUB_REF_NAME}"
+          shopt -s nullglob
+          for archive in dist/*.tar.gz dist/*.zip; do
+            minisign -S -W -s "$key" -m "$archive" \
+              -t "toolbox-hub ${version} ${{ github.repository }} ${GITHUB_REF_NAME}"
 
-          # 立刻自检：签完自己验一遍，签错了现在就知道，而不是等用户来报。
-          minisign -V -p packaging/minisign.pub -m "dist/${name}.tar.gz" -x "dist/${name}.tar.gz.minisig"
+            # 立刻自检：签完自己验一遍，签错了现在就知道，而不是等用户来报。
+            minisign -V -p packaging/minisign.pub -m "$archive" -x "${archive}.minisig"
+          done
           rm -f "$key"
           ls -l dist/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: error
 
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: dist
-          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -105,7 +183,7 @@ jobs:
           body: |
             ## 校验下载到的产物
 
-            每个 `*.tar.gz` 都带一个 `.tar.gz.minisig`（minisign 签名）和一个 `.tar.gz.sha256`。
+            每个 `*.tar.gz` / `*.zip` 都带一个 `.minisig`（minisign 签名）和一个 `.sha256`。
 
             ```bash
             # 1) 校验和
@@ -122,3 +200,13 @@ jobs:
             ```
 
             签名密钥的生成与轮换见 `packaging/release-signing.md`。
+
+            ## 产物一览
+
+            | 文件后缀 | 适用 | 说明 |
+            | --- | --- | --- |
+            | `-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 | 核心版 |
+            | `-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 | 核心版 |
+            | `-x86_64-unknown-linux-gnu-arch.tar.gz` | Arch Linux x86_64 | 全功能版（链接 libalpm，包管理域可用） |
+            | `-x86_64-pc-windows-msvc.zip` | Windows x86_64 | 核心版 |
+            | `-macos…tar.gz` | macOS（x86_64 / arm64） | 核心版 |

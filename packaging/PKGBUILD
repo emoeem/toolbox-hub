@@ -7,7 +7,7 @@
 # 维护者: emoeem <3353745917@qq.com>
 
 pkgname=toolbox-hub
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Linux CLI 工具箱：工具发现 + 表单执行 + 原生包管理（直连 libalpm）"
 arch=('x86_64' 'aarch64')
