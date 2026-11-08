@@ -3,6 +3,9 @@
 # 下面几条的 `mcp = { … }` 只是「作者声明这个动作可以被 AI 调用」，**不是授权**：
 # 还得在 ~/.config/toolbox-hub/mcp.toml 的 [exposure] allow 里逐个点名才会真正暴露。
 # 没写 mcp 的动作一律不进入 MCP 工具列表（默认拒绝）。
+#
+# 审计类动作（lynis / linpeas）的输出可能包含凭据线索、环境变量等敏感信息，
+# 执行历史会留存 stdout —— 报告按私有材料保管，别贴到公开渠道。
 
 [[action]]
 id = "disk-space"
@@ -105,3 +108,38 @@ install = "sudo pacman -S pciutils"
 input = "无"
 output = "PCI 设备与驱动列表"
 mcp = { enabled = true, name = "pci_devices", description = "列出 PCI 设备及当前绑定的内核驱动" }
+
+# 审计类：只读体检为主。lynis 会往 /var/log/lynis.log 写日志，effects 如实声明
+# filesystem_write；非 root 跑只能出部分结果，想要全量用 sudo 在 TUI 里跑。
+[[action]]
+id = "security-audit"
+name = "安全基线审计（Lynis）"
+summary = "lynis audit system 本机安全体检：配置、权限、服务、加固建议"
+domain = "系统"
+tags = ["审计", "安全", "lynis"]
+program = "lynis"
+base_argv = ["audit", "system", "--quick"]
+mode = "capture"
+danger = "safe"
+install = "sudo pacman -S lynis"
+input = "无"
+output = "审计发现与加固建议（warning / suggestion 汇总）"
+mcp = { enabled = true, name = "security_audit", description = "Lynis 本机安全基线审计（会写 /var/log/lynis.log）", effects = { filesystem_read = true, filesystem_write = true } }
+
+# LinPEAS（PEASS-ng）的许可证区分「执行并展示原始输出」与「解析输出」：
+# 这里是 capture 原样展示，不做结构化解析 —— 保持在许可范围内。
+# 输出含敏感信息，见文件头部说明。
+[[action]]
+id = "local-privilege-check"
+name = "本地权限检查（LinPEAS）"
+summary = "linpeas 枚举本机错误权限配置、危险服务与提权线索"
+domain = "系统"
+tags = ["审计", "提权", "linpeas"]
+program = "linpeas"
+allow_empty = true
+mode = "capture"
+danger = "safe"
+install = "paru -S linpeas（AUR）或从 PEASS-ng Releases 下载 linpeas.sh"
+input = "无"
+output = "提权风险清单（原样输出，含敏感信息）"
+mcp = { enabled = true, name = "local_privilege_check", description = "LinPEAS 本地权限配置检查（输出含敏感信息）", effects = { filesystem_read = true } }

@@ -1097,6 +1097,127 @@ mode = "capture"
         );
     }
 
+    /// 渗透 / 审计动作的 argv 形状。目标一律走旗标（nuclei / naabu / httpx /
+    /// feroxbuster / katana / ffuf 的上游都不收位置参数），速率、深度、超时给保守默认值。
+    #[test]
+    fn pt_and_audit_actions_bind_targets_through_flags() {
+        let discovery = bundled_discovery();
+
+        // —— 渗透域新增五动作 ——
+        let tls = by_id(&discovery, "manifest:tls-audit");
+        let action = tls.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("target", "example.com:443");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["--quiet", "--warnings", "batch", "--color", "0", "example.com:443"],
+            "testssl.sh 的目标跟在固定旗标后面"
+        );
+
+        let katana = by_id(&discovery, "manifest:web-crawl");
+        let action = katana.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("url", "https://example.com");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["-silent", "-u", "https://example.com", "-d", "2", "-rl", "100"],
+            "katana 目标走 -u；深度与速率默认保守"
+        );
+
+        let ffuf = by_id(&discovery, "manifest:param-fuzz");
+        let action = ffuf.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("url", "https://example.com/FUZZ");
+        values.set("wordlist", "/tmp/words.txt");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec![
+                "-s",
+                "-mc",
+                "200,204,301,302,307,401,403",
+                "-t",
+                "20",
+                "-timeout",
+                "10",
+                "-u",
+                "https://example.com/FUZZ",
+                "-w",
+                "/tmp/words.txt",
+                "-rate",
+                "100"
+            ],
+            "ffuf 必须有 -u 与 -w，默认限速 100"
+        );
+
+        let rustscan = by_id(&discovery, "manifest:fast-port-scan");
+        let action = rustscan.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("host", "example.com");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["-a", "example.com", "-p", "1-65535"],
+            "rustscan 目标走 -a，端口范围默认全端口"
+        );
+
+        let autorecon = by_id(&discovery, "manifest:auto-recon");
+        let action = autorecon.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("target", "10.0.0.1");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["-t", "10.0.0.1", "-o", "results"],
+            "autorecon 目标走 -t，结果目录默认 results"
+        );
+
+        // —— 系统域审计两动作 ——
+        let lynis = by_id(&discovery, "manifest:security-audit");
+        let action = lynis.action.as_ref().expect("带动作");
+        let values = action.default_values();
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["audit", "system", "--quick"],
+            "--quick 防止 lynis 等待交互输入卡住 capture 模式"
+        );
+
+        let linpeas = by_id(&discovery, "manifest:local-privilege-check");
+        let action = linpeas.action.as_ref().expect("带动作");
+        let values = action.default_values();
+        assert!(
+            action.build_argv(&values).expect("应能构建").is_empty(),
+            "linpeas 无参运行（原样输出，不做解析）"
+        );
+
+        // —— 渗透域既有动作抽测 ——
+        let subfinder = by_id(&discovery, "manifest:subdomain-enum");
+        let action = subfinder.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("domain", "example.com");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec!["-d", "example.com"],
+            "subfinder -d 收主域"
+        );
+
+        let nuclei = by_id(&discovery, "manifest:nuclei-scan");
+        let action = nuclei.action.as_ref().expect("带动作");
+        let mut values = action.default_values();
+        values.set("target", "https://example.com");
+        assert_eq!(
+            action.build_argv(&values).expect("应能构建"),
+            vec![
+                "-silent",
+                "-nc",
+                "-etags",
+                "dos",
+                "-u",
+                "https://example.com",
+                "-severity",
+                "medium,high,critical"
+            ],
+            "nuclei 目标走 -u、严重度走 -severity，默认排除 dos 模板"
+        );
+    }
+
     #[test]
     fn every_argument_has_a_label_and_choices_carry_both_label_and_value() {
         let discovery = bundled_discovery();
