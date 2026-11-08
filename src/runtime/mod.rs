@@ -13,6 +13,8 @@ pub use exec::{
 // 复用同一份而不是在 components.rs 里另写一份 —— 解析规则只能有一个出处。
 pub(crate) use exec::{default_argv, find_on_path, parse_chooser_file, parse_cwd_file};
 // 后台任务队列取消时也发进程组信号：同一个 `signal_group`，不各写一套。
+// （Windows 没有进程组信号，队列那边整条路都是 Unix 专属的。）
+#[cfg(unix)]
 pub(crate) use exec::signal_group;
 // 「等子进程，超时就杀」：探时长与缩略图共用一份（原先各写了一轮 try_wait 轮询）。
 pub(crate) use exec::{WaitOutcome, wait_with_timeout};

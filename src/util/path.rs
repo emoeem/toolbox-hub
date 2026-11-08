@@ -12,22 +12,42 @@
 //! * [`find_on_path`] —— 只在 `PATH` 里找，返回第一个命中的路径；
 //! * [`command_available`] —— 命令名能不能用：带 `/` 的按路径判，其余走 `PATH`。
 //!
-//! 只跑 Linux，没有 `.exe` / `PATHEXT` 之类的分支 —— 用不上的分支就是以后
-//! 没人敢删的假代码。
+//! 「可执行」在 Windows 上没有执行位可看，改判后缀（`.exe` / `.bat` / `.cmd`，
+//! 和 CreateProcess 认的那套一致）；分叉压在 [`is_executable`] 一处 ——
+//! 这里是全项目唯一一份，要改就改这里。
 
 use std::path::{Path, PathBuf};
 
 /// 这个路径是不是「可执行文件」。
 ///
-/// 三条一起成立才算：存在、是普通文件、带执行位。
+/// 三条一起成立才算：存在、是普通文件、可执行（Unix 看执行位，Windows 看后缀）。
 ///
 /// 中间的「是普通文件」不能省：目录几乎总是带执行位（`drwxr-xr-x`），
 /// 少这一条的话，`PATH` 上随便一个与命令同名的目录都会被当成命令存在。
 pub fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    metadata.is_file() && is_executable_marker(path)
+}
+
+/// Unix 的「可执行」就是执行位（owner / group / other 任一）。
+#[cfg(unix)]
+fn is_executable_marker(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Windows 没有执行位：按扩展名判断。没有后缀的可执行在这套口径下「不存在」
+/// —— Windows 的 `PATH` 上本来也不会放无后缀脚本。
+#[cfg(windows)]
+fn is_executable_marker(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| matches!(extension.as_str(), "exe" | "bat" | "cmd"))
 }
 
 /// 在 `PATH` 的各个目录里找 `program`，返回第一个命中的路径。

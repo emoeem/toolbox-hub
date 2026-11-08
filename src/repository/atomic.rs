@@ -80,6 +80,11 @@ fn write_atomic(
                 fs::set_permissions(&temp, fs::Permissions::from_mode(mode))
                     .map_err(|error| format!("设不了权限位 {}：{error}", temp.display()))?;
             }
+            // Windows 没有执行位可设（「可执行」按后缀判），mode 直接丢弃。
+            #[cfg(not(unix))]
+            {
+                let _ = mode;
+            }
         }
         Ok(())
     };

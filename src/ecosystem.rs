@@ -1,4 +1,5 @@
 //! Ecosystem helpers: Recipe validation/import, presets, replay and argv queue.
+#[cfg(unix)]
 use crate::runtime::signal_group;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -686,11 +687,13 @@ pub fn replay_values(
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// SIGINT 的处理器。**只写一个原子变量** —— 信号处理器里只能做异步信号安全的事。
+#[cfg(unix)]
 extern "C" fn note_interrupt(_signal: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 /// 装上 Ctrl-C 处理（只对队列生效，不碰其它子命令的信号处置）。
+#[cfg(unix)]
 fn install_interrupt_handler() {
     // SAFETY: 处理器只做一次原子写；`signal()` 只改这一个信号的处置。
     unsafe {
@@ -702,6 +705,11 @@ fn install_interrupt_handler() {
         );
     }
 }
+
+/// Windows 控制台的 Ctrl+C 由系统直接终止整棵进程树，没有可装的信号转换 ——
+/// 队列任务跟着宿主一起停，语义等同。
+#[cfg(not(unix))]
+fn install_interrupt_handler() {}
 
 /// `queue run` 不带 `--jobs` 时的并发数。
 ///

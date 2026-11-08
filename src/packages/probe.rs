@@ -156,6 +156,9 @@ pub fn last_upgrade() -> Option<u64> {
 pub fn open_in_browser(url: &str) -> Result<(), String> {
     let opener = if cfg!(target_os = "macos") {
         "open"
+    } else if cfg!(windows) {
+        // explorer 带一个 URL 会交给默认浏览器开，不需要走 cmd /c start。
+        "explorer"
     } else {
         "xdg-open"
     };

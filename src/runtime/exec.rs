@@ -483,6 +483,8 @@ impl RunningJob {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         // 先整组 SIGKILL（子进程也别漏），再退回 Child::kill 兜底。
+        // Windows 没有进程组信号，直接走 Child::kill（只杀直接子进程）。
+        #[cfg(unix)]
         if let Some(pid) = self.pid() {
             let _ = signal_group(pid, libc::SIGKILL);
         }
@@ -500,9 +502,17 @@ impl RunningJob {
 ///
 /// `pub(crate)`：后台任务队列（[`crate::ecosystem`]）取消任务时用的是同一个函数 ——
 /// 「怎么把一个进程组叫停」只该有一处实现，各写一份迟早会分叉。
+#[cfg(unix)]
 pub(crate) fn signal_group(pid: u32, signal: libc::c_int) -> bool {
     // SAFETY: `kill` 是纯系统调用，参数就是 pid 与信号号；负号表示「进程组」。
     unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
+}
+
+/// Windows 没有进程组：恒返回 false，让调用方走 `Child::kill()` 兜底 ——
+/// 只杀直接子进程，孙进程交给各工具自己的清理逻辑，行为退化可接受。
+#[cfg(not(unix))]
+pub(crate) fn signal_group(_pid: u32, _signal: libc::c_int) -> bool {
+    false
 }
 
 /// 这一行是不是 ffmpeg `-progress` 吐的进度键。

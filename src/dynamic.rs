@@ -347,6 +347,8 @@ fn resolve_with(
 /// 杀掉这条命令（整个进程组），并把它收掉。
 fn stop(child: &mut Child) {
     // 整组 SIGKILL：命令自己拉起来的子进程也不该留下（和 runtime::exec 一个做法）。
+    // Windows 没有进程组信号，直接 Child::kill，只杀直接子进程。
+    #[cfg(unix)]
     let _ = signal_group(child.id(), libc::SIGKILL);
     let _ = child.kill();
     // kill 之后还要 wait 一次，否则它会挂在进程表里当僵尸。
@@ -354,6 +356,8 @@ fn stop(child: &mut Child) {
 }
 
 /// 给「进程组」发信号（`kill(-pgid)`）。失败返回 false，调用方自己兜底。
+/// 只在 Unix 上存在：Windows 走不到这一行（见 [`stop`]）。
+#[cfg(unix)]
 fn signal_group(pid: u32, signal: libc::c_int) -> bool {
     // SAFETY: `kill` 是纯系统调用，参数就是 pid 与信号号；负号表示「进程组」。
     unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }

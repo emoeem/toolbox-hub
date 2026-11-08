@@ -240,7 +240,6 @@ impl Service {
     /// 单个文件的指纹：(mtime 纳秒, 字节数, inode)。带 inode 是因为
     /// 原子写是 rename 换文件，新文件的 mtime/size 都可能恰好和旧的相同。
     fn file_stamp(path: &Path) -> Option<FileStamp> {
-        use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::metadata(path).ok()?;
         let nanos = metadata
             .modified()
@@ -248,7 +247,20 @@ impl Service {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        Some((nanos, metadata.len(), metadata.ino()))
+        Some((nanos, metadata.len(), Self::file_inode(&metadata)))
+    }
+
+    /// inode 那一栏抓的是「原子写 rename 换了文件、mtime/size 都恰好没变」的窗口；
+    /// Windows 没有这个概念，记 0 —— 那边一样走 rename 原子写，窗口足够小。
+    #[cfg(unix)]
+    fn file_inode(metadata: &std::fs::Metadata) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
+    }
+
+    #[cfg(not(unix))]
+    fn file_inode(_metadata: &std::fs::Metadata) -> u64 {
+        0
     }
 
     fn indexes_fingerprint(&self) -> Vec<RepoFingerprint> {

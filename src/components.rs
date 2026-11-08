@@ -753,6 +753,7 @@ impl Drop for Session {
 ///
 /// `cmd | toolbox-hub ui pager` 时 stdin 是管道，内容已经从里面读完了，
 /// 剩下的按键得另外找地方读 —— `/dev/tty` 就是那个地方。
+#[cfg(unix)]
 fn attach_tty_to_stdin() -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
@@ -767,6 +768,13 @@ fn attach_tty_to_stdin() -> Result<(), String> {
         return Err(format!("接管不了 /dev/tty：{}", io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Windows 没有 `/dev/tty` 这套 fd 概念：原样报错，上层按「接管失败」降级 ——
+/// 和 Unix 上打不开 tty 是同一条路。
+#[cfg(not(unix))]
+fn attach_tty_to_stdin() -> Result<(), String> {
+    Err("Windows 上没有 /dev/tty 可接管".to_string())
 }
 
 /// 翻页器的键位（它没有输入框，`j`/`k`/`h`/`l` 可以放心用）。
