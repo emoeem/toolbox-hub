@@ -54,7 +54,12 @@ jobs:
             powershell -NoProfile -Command "Compress-Archive -Path 'dist/${name}/toolbox-hub.exe' -DestinationPath 'dist/${name}.zip' -Force"
             ext=zip
           else
-            install -Dm755 "target/${{ matrix.target }}/release/toolbox-hub" "dist/${name}/toolbox-hub"
+            # 不用 `install -D`：那是 GNU 专有的写法，macOS 的 BSD install 不认
+            # （实测在 build job 里炸了 exit 71，目标目录根本没建出来）。
+            # mkdir + cp + chmod 三件套两边平台行为一致。
+            mkdir -p "dist/${name}"
+            cp "target/${{ matrix.target }}/release/toolbox-hub" "dist/${name}/toolbox-hub"
+            chmod 755 "dist/${name}/toolbox-hub"
             tar -C dist -czf "dist/${name}.tar.gz" "${name}"
             ext=tar.gz
           fi
