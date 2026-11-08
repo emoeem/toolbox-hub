@@ -37,7 +37,12 @@ pub enum Request {
     /// 升级：重新取计划再装（不要拿界面里那份可能已经过期的计划）。
     Upgrade { id: String, allow_unverified: bool },
     /// 服务换新了（改过仓库配置）：后台线程别再用启动时那份旧的。
-    SetService(Service),
+    ///
+    /// 装箱和 [`Response::Planned`] 同一个理由：`Service` 比其余变体大一个数量级
+    /// （Windows 上实测 232B 对 25B），不装的话每条 Request 都按它算大小。
+    /// clippy 的 `large_enum_variant` 在 Windows 上拦下了这一条 —— Linux 上
+    /// `Service` 小一些没触发，但装箱两端平台都该做。
+    SetService(Box<Service>),
 }
 
 /// 后台线程的回应。
@@ -120,7 +125,7 @@ impl RepositoryWorker {
     }
 
     pub fn set_service(&self, service: Service) -> Result<(), String> {
-        self.send(Request::SetService(service))
+        self.send(Request::SetService(Box::new(service)))
     }
 
     pub fn install(&self, plan: InstallPlan, allow_unverified: bool) -> Result<(), String> {
@@ -173,7 +178,7 @@ fn run(mut service: Service, requests: Receiver<Request>, responses: Sender<Resp
     while let Ok(request) = requests.recv() {
         let sent = match request {
             Request::SetService(updated) => {
-                service = updated;
+                service = *updated;
                 Ok(())
             }
             Request::Refresh(id) => {
